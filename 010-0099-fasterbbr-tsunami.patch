@@ -1,0 +1,32 @@
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index f4f477a..aec864a 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -181,7 +181,7 @@ struct bbr_context {
+ };
+ 
+ /* Window length of min_rtt filter (in sec): */
+-static const u32 bbr_min_rtt_win_sec = 10;
++static const u32 bbr_min_rtt_win_sec = 20;
+ /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
+ static const u32 bbr_probe_rtt_mode_ms = 200;
+ /* Window length of probe_rtt_min_us filter (in ms), and consequently the
+@@ -218,15 +218,15 @@ static const int bbr_startup_cwnd_gain = BBR_UNIT * 2;
+ /* The pacing gain in BBR_DRAIN is calculated to typically drain
+  * the queue created in BBR_STARTUP in a single round:
+  */
+-static const int bbr_drain_gain = BBR_UNIT * 1000 / 2885;
++static const int bbr_drain_gain = BBR_UNIT * 1200 / 2885;
+ /* The gain for deriving steady-state cwnd tolerates delayed/stretched ACKs: */
+ static const int bbr_cwnd_gain  = BBR_UNIT * 2;
+ /* The pacing_gain values for the PROBE_BW gain cycle, to discover/share bw: */
+ static const int bbr_pacing_gain[] = {
+ 	BBR_UNIT * 5 / 4,	/* UP: probe for more available bw */
+ 	BBR_UNIT * 91 / 100,	/* DOWN: drain queue and/or yield bw */
+-	BBR_UNIT,		/* CRUISE: try to use pipe w/ some headroom */
+-	BBR_UNIT,		/* REFILL: refill pipe to estimated 100% */
++	BBR_UNIT * 9 / 8,		/* CRUISE: try to use pipe w/ some headroom */
++	BBR_UNIT * 9 / 8,		/* REFILL: refill pipe to estimated 100% */
+ };
+ enum bbr_pacing_gain_phase {
+ 	BBR_BW_PROBE_UP		= 0,  /* push up inflight to probe for bw/vol */
