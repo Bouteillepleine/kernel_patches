@@ -1,0 +1,18 @@
+--- ./kernel/kernel_compat.c	2025-07-18 00:29:24.730715000 -0400
++++ ./kernel/kernel_compat.c	2025-07-18 03:17:03.154143274 -0400
+@@ -184,15 +184,6 @@
+ }
+ #endif
+ 
+-static inline int ksu_access_ok(const void *addr, unsigned long size)
+-{
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+-	return access_ok(addr, size);
+-#else
+-	return access_ok(VERIFY_READ, addr, size);
+-#endif
+-}
+-
+ long ksu_strncpy_from_user_retry(char *dst, const void __user *unsafe_addr,
+ 				   long count)
+ {
