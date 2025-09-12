@@ -1,8 +1,8 @@
 diff --git a/kernel/core_hook.c b/kernel/core_hook.c
-index c1e803d7..1e8f98e6 100644
+index edb2e17f..3bedb0da 100644
 --- a/kernel/core_hook.c
 +++ b/kernel/core_hook.c
-@@ -648,16 +1116,48 @@
+@@ -1116,16 +1116,48 @@ static void try_umount(const char *mnt, bool check_mnt, int flags)
  	if (check_mnt && !should_umount(&path)) {
  		path_put(&path);
  		return;
@@ -51,7 +51,7 @@ index c1e803d7..1e8f98e6 100644
  	// this hook is used for umounting overlayfs for some uid, if there isn't any module mounted, just ignore it!
  	if (!ksu_module_mounted) {
  		return 0;
-@@ -725,11 +1297,11 @@
+@@ -1226,11 +1258,11 @@ out_susfs_try_umount_all:
  	try_umount("/system/etc/hosts", false, MNT_DETACH);
  
  	// try umount lsposed dex2oat bins

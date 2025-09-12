@@ -1,6 +1,10 @@
---- ./kernel/kernel_compat.c	2025-07-18 00:29:24.730715000 -0400
-+++ ./kernel/kernel_compat.c	2025-07-18 03:17:03.154143274 -0400
-@@ -184,15 +184,6 @@
+diff --git a/kernel/kernel_compat.c b/kernel/kernel_compat.c
+index 873da944..267d150c 100644
+--- ./kernel/kernel_compat.c
++++ ./kernel/kernel_compat.c
+@@ -182,19 +182,10 @@ long ksu_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr,
+ 
+ 	return ret;
  }
  #endif
  
@@ -16,3 +20,5 @@
  long ksu_strncpy_from_user_retry(char *dst, const void __user *unsafe_addr,
  				   long count)
  {
+ 	long ret = ksu_strncpy_from_user_nofault(dst, unsafe_addr, count);
+ 	if (likely(ret >= 0))
