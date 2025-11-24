@@ -1,0 +1,15 @@
+mkdir -p patches/hide_stuff
+cat > patches/hide_stuff/5.10.209.patch << 'EOF'
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -320,6 +320,9 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+ 	dev_t dev = 0;
+ 	const char *name = NULL;
+ 
++	if (ksu_is_hidden_uid(current_uid().val))
++		return 0;
++
+ 	if (file) {
+ 		struct inode *inode = file_inode(vma->vm_file);
+ 		dev = inode->i_sb->s_dev;
+EOF
