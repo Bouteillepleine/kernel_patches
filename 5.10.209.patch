@@ -1,6 +1,3 @@
-cd kernel_patches
-
-cat > 5.10.209.patch << 'EOPATCH'
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
 @@ -1,6 +1,7 @@
@@ -41,18 +38,3 @@ cat > 5.10.209.patch << 'EOPATCH'
  
  	state = *get_task_state(task);
  	vsize = eip = esp = 0;
-EOPATCH
-
-git add 5.10.209.patch
-git commit -m "fix: adapt 5.10.209 patch for void show_map_vma()
-
-- Add #include <linux/ksu.h> to both files
-- Change show_map_vma() return from 'return 0' to 'return' (void function)
-- Keep do_task_stat() unchanged (returns int)
-- Adjust line numbers to match OnePlus 10 Pro kernel
-
-Fixes: implicit declaration of ksu_is_hidden_uid
-Fixes: void function returning value error
-Refs: https://github.com/Bouteillepleine/kernel_patches/issues/1"
-
-git push origin main
