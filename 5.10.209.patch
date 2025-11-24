@@ -1,25 +1,37 @@
 cd kernel_patches
 
-# Backup de l'ancien patch
-cp 5.10.209.patch 5.10.209.patch.backup
-
-# Créer le nouveau patch
 cat > 5.10.209.patch << 'EOPATCH'
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -317,6 +317,9 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/pagewalk.h>
+ #include <linux/mm_inline.h>
++#include <linux/ksu.h>
+ #include <linux/hugetlb.h>
+ #include <linux/huge_mm.h>
+ #include <linux/mount.h>
+@@ -317,6 +318,9 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
  	unsigned long ino = 0;
  	dev_t dev = 0;
  	const char *name = NULL;
 +
 +	if (ksu_is_hidden_uid(current_uid().val))
-+		return 0;
++		return;
  
  	if (file) {
  		struct inode *inode = file_inode(vma->vm_file);
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
-@@ -3100,6 +3100,9 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
+@@ -95,6 +95,7 @@
+ #include <linux/time_namespace.h>
+ #include <linux/resctrl.h>
+ #include <linux/cn_proc.h>
++#include <linux/ksu.h>
+ #include <trace/events/oom.h>
+ #include "internal.h"
+ #include "fd.h"
+@@ -3100,6 +3101,9 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
  	u64 cutime, cstime, utime, stime;
  	unsigned long cmin_flt = 0, cmaj_flt = 0;
  	unsigned long  min_flt = 0,  maj_flt = 0;
@@ -31,17 +43,16 @@ cat > 5.10.209.patch << 'EOPATCH'
  	vsize = eip = esp = 0;
 EOPATCH
 
-# Commit et push
 git add 5.10.209.patch
-git commit -m "fix: correct 5.10.209 patch for OnePlus 10 Pro
+git commit -m "fix: adapt 5.10.209 patch for void show_map_vma()
 
-- Remove problematic show_smap() patch (line 1849)
-- Adjust show_map_vma() to line 317 (was 320)
-- Adjust do_task_stat() to line 3100 (was 3103)
-- Simplify to 2 functions for better compatibility
-- Tested against OnePlus 10 Pro kernel sources
+- Add #include <linux/ksu.h> to both files
+- Change show_map_vma() return from 'return 0' to 'return' (void function)
+- Keep do_task_stat() unchanged (returns int)
+- Adjust line numbers to match OnePlus 10 Pro kernel
 
-Fixes: hide_stuff patch application failure
+Fixes: implicit declaration of ksu_is_hidden_uid
+Fixes: void function returning value error
 Refs: https://github.com/Bouteillepleine/kernel_patches/issues/1"
 
 git push origin main
