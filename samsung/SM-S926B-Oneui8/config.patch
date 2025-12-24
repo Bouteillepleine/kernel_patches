@@ -1,13 +1,14 @@
 --- a/arch/arm64/configs/gki_defconfig
 +++ b/arch/arm64/configs/gki_defconfig
-@@ -955,4 +955,42 @@
- 
- CONFIG_SECURITY_KUMIHO=y
- 
+@@ -774,3 +774,42 @@
+ CONFIG_KUNIT_DEBUGFS=y
+ # CONFIG_KUNIT_DEFAULT_ENABLED is not set
+ # CONFIG_RUNTIME_TESTING_MENU is not set
++
 +# KSU NEXT
 +CONFIG_KSU=y
 +CONFIG_KSU_KPROBES_HOOK=n
- 
++
 +# Mountify Support
 +CONFIG_TMPFS_XATTR=y
 +CONFIG_TMPFS_POSIX_ACL=y
@@ -42,4 +43,3 @@
 +
 +# add baseband guard
 +CONFIG_BBG=y
-+

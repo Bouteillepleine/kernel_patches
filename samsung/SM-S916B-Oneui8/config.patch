@@ -1,6 +1,6 @@
 --- a/arch/arm64/configs/gki_defconfig
 +++ b/arch/arm64/configs/gki_defconfig
-@@ -955,4 +955,42 @@
+@@ -961,4 +961,42 @@
  
  CONFIG_SECURITY_KUMIHO=y
  
