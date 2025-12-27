@@ -1,0 +1,101 @@
+diff --git a/fs/susfs.c b/fs/susfs.c
+index b1b52fae1ba8..6272f775e72c 100644
+--- a/fs/susfs.c
++++ b/fs/susfs.c
+@@ -834,30 +834,6 @@ void susfs_add_sus_map(void __user **user_info) {
+ }
+ #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 
+-/* susfs avc log spoofing */
+-static DEFINE_SPINLOCK(susfs_spin_lock_set_avc_log_spoofing);
+-extern bool susfs_is_avc_log_spoofing_enabled;
+-
+-void susfs_set_avc_log_spoofing(void __user **user_info) {
+-	struct st_susfs_avc_log_spoofing info = {0};
+-
+-	if (copy_from_user(&info, (struct st_susfs_avc_log_spoofing __user*)*user_info, sizeof(info))) {
+-		info.err = -EFAULT;
+-		goto out_copy_to_user;
+-	}
+-
+-	spin_lock(&susfs_spin_lock_set_avc_log_spoofing);
+-	susfs_is_avc_log_spoofing_enabled = info.enabled;
+-	spin_unlock(&susfs_spin_lock_set_avc_log_spoofing);
+-	SUSFS_LOGI("susfs_is_avc_log_spoofing_enabled: %d\n", info.enabled);
+-	info.err = 0;
+-out_copy_to_user:
+-	if (copy_to_user(&((struct st_susfs_avc_log_spoofing __user*)*user_info)->err, &info.err, sizeof(info.err))) {
+-		info.err = -EFAULT;
+-	}
+-	SUSFS_LOGI("CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING -> ret: %d\n", info.err);
+-}
+-
+ /* get susfs enabled features */
+ static int copy_config_to_buf(const char *config_string, char *buf_ptr, size_t *copied_size, size_t bufsize) {
+ 	size_t tmp_size = strlen(config_string);
+diff --git a/include/linux/susfs.h b/include/linux/susfs.h
+index f4abf88e8d0e..57dae8f3a45c 100644
+--- a/include/linux/susfs.h
++++ b/include/linux/susfs.h
+@@ -209,8 +209,6 @@ struct filename* susfs_get_redirected_path(unsigned long ino);
+ void susfs_add_sus_map(void __user **user_info);
+ #endif
+ 
+-void susfs_set_avc_log_spoofing(void __user **user_info);
+-
+ void susfs_get_enabled_features(void __user **user_info);
+ void susfs_show_variant(void __user **user_info);
+ void susfs_show_version(void __user **user_info);
+diff --git a/include/linux/susfs_def.h b/include/linux/susfs_def.h
+index 9f59691acba1..0639ed830006 100644
+--- a/include/linux/susfs_def.h
++++ b/include/linux/susfs_def.h
+@@ -29,7 +29,6 @@
+ #define CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE 0x555e4 /* deprecated */
+ #define CMD_SUSFS_IS_SUS_SU_READY 0x555f0 /* deprecated */
+ #define CMD_SUSFS_SUS_SU 0x60000 /* deprecated */
+-#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x60010
+ #define CMD_SUSFS_ADD_SUS_MAP 0x60020
+ 
+ #define SUSFS_MAX_LEN_PATHNAME 256 // 256 should address many paths already unless you are doing some strange experimental stuff, then set your own desired length
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index 35e45b968cd2..2ee2c8a315e7 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -47,12 +47,6 @@
+ #undef CREATE_TRACE_POINTS
+ #include <trace/hooks/avc.h>
+ 
+-#ifdef CONFIG_KSU_SUSFS
+-extern u32 susfs_ksu_sid;
+-extern u32 susfs_priv_app_sid;
+-bool susfs_is_avc_log_spoofing_enabled = false;
+-#endif
+-
+ struct avc_entry {
+ 	u32			ssid;
+ 	u32			tsid;
+@@ -736,22 +730,11 @@ static void avc_audit_post_callback(struct audit_buffer *ab, void *a)
+ 
+ 	rc = security_sid_to_context(sad->state, sad->tsid, &tcontext,
+ 				     &tcontext_len);
+-#ifdef CONFIG_KSU_SUSFS
+-	if (unlikely(sad->tsid == susfs_ksu_sid && susfs_is_avc_log_spoofing_enabled)) {
+-		if (rc)
+-			audit_log_format(ab, " tsid=%d", susfs_priv_app_sid);
+-		else
+-			audit_log_format(ab, " tcontext=%s", "u:r:priv_app:s0:c512,c768");
+-		goto bypass_orig_flow;
+-	}
+-#endif
+ 	if (rc)
+ 		audit_log_format(ab, " tsid=%d", sad->tsid);
+ 	else
+ 		audit_log_format(ab, " tcontext=%s", tcontext);
+-#ifdef CONFIG_KSU_SUSFS
+-bypass_orig_flow:
+-#endif
++
+ 	tclass = secclass_map[sad->tclass-1].name;
+ 	audit_log_format(ab, " tclass=%s", tclass);
+ 
