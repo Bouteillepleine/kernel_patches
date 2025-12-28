@@ -1,5 +1,5 @@
 diff --git a/kernel/Kbuild b/kernel/Kbuild
-index e9155526..b43cdfa5 100644
+index 1d7d0d335..7f1b2edfe 100644
 --- a/kernel/Kbuild
 +++ b/kernel/Kbuild
 @@ -3,7 +3,6 @@ kernelsu-objs += allowlist.o
@@ -10,7 +10,7 @@ index e9155526..b43cdfa5 100644
  kernelsu-objs += throne_tracker.o
  kernelsu-objs += pkg_observer.o
  kernelsu-objs += setuid_hook.o
-@@ -82,4 +81,13 @@ ccflags-y += -DOFFICIAL_EXPECTED_HASH=\"$(OFFICIAL_EXPECTED_HASH)\"
+@@ -77,4 +76,13 @@ ccflags-y += -DEXPECTED_HASH=\"$(KSU_EXPECTED_HASH)\"
  ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
  ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable
  
@@ -25,7 +25,7 @@ index e9155526..b43cdfa5 100644
 +endif
  # Keep a new line here!! Because someone may append config
 diff --git a/kernel/Kconfig b/kernel/Kconfig
-index cc4dbb3a..7382012b 100644
+index cc4dbb3a1..7382012bc 100644
 --- a/kernel/Kconfig
 +++ b/kernel/Kconfig
 @@ -1,20 +1,109 @@
@@ -152,7 +152,7 @@ index cc4dbb3a..7382012b 100644
  
  endmenu
 diff --git a/kernel/allowlist.c b/kernel/allowlist.c
-index 095029d5..2874b3e2 100644
+index 095029d5f..2874b3e28 100644
 --- a/kernel/allowlist.c
 +++ b/kernel/allowlist.c
 @@ -17,7 +17,9 @@
@@ -177,26 +177,23 @@ index 095029d5..2874b3e2 100644
  
      return result;
 diff --git a/kernel/apk_sign.c b/kernel/apk_sign.c
-index 008379b1..b2976529 100644
+index b5b7d3a8d..d8632c31b 100644
 --- a/kernel/apk_sign.c
 +++ b/kernel/apk_sign.c
-@@ -308,7 +308,13 @@ module_param_cb(ksu_debug_manager_appid, &expected_size_ops,
+@@ -308,5 +308,10 @@ module_param_cb(ksu_debug_manager_appid, &expected_size_ops,
  
  bool is_manager_apk(char *path)
  {
 +#ifndef CONFIG_KSU_SUSFS
-     return check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH) ||
-            check_v2_signature(path, OFFICIAL_EXPECTED_SIZE,
-                               OFFICIAL_EXPECTED_HASH);
+     return check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH);
 +#else
 +    return check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH) ||
-+           check_v2_signature(path, OFFICIAL_EXPECTED_SIZE, OFFICIAL_EXPECTED_HASH) ||
 +           check_v2_signature(path, 384, "7e0c6d7278a3bb8e364e0fcba95afaf3666cf5ff3c245a3b63c8833bd0445cc4"); // 5ec1cff
 +#endif // #ifndef CONFIG_KSU_SUSFS
  }
 \ No newline at end of file
 diff --git a/kernel/app_profile.c b/kernel/app_profile.c
-index 7bfedeac..a24006ea 100644
+index 7bfedeacb..a24006eab 100644
 --- a/kernel/app_profile.c
 +++ b/kernel/app_profile.c
 @@ -13,7 +13,9 @@
@@ -233,7 +230,7 @@ index 7bfedeac..a24006ea 100644
      setup_mount_ns(profile->namespaces);
  }
 diff --git a/kernel/kernel_umount.c b/kernel/kernel_umount.c
-index e1d67bd9..ba06b66d 100644
+index e1d67bd9f..ba06b66df 100644
 --- a/kernel/kernel_umount.c
 +++ b/kernel/kernel_umount.c
 @@ -108,6 +108,7 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
@@ -254,7 +251,7 @@ index e1d67bd9..ba06b66d 100644
      pr_info("handle umount for uid: %d, pid: %d\n", new_uid, current->pid);
  
 diff --git a/kernel/ksu.c b/kernel/ksu.c
-index 14400836..ad42b28d 100644
+index 144008369..ad42b28d3 100644
 --- a/kernel/ksu.c
 +++ b/kernel/ksu.c
 @@ -4,12 +4,20 @@
@@ -318,7 +315,7 @@ index 14400836..ad42b28d 100644
      ksu_supercalls_exit();
  
 diff --git a/kernel/ksu.h b/kernel/ksu.h
-index d37c9cb0..9ec29e47 100644
+index d37c9cb0d..9ec29e478 100644
 --- a/kernel/ksu.h
 +++ b/kernel/ksu.h
 @@ -25,6 +25,10 @@ static inline int endswith(const char *s, const char *t)
@@ -333,7 +330,7 @@ index d37c9cb0..9ec29e47 100644
  
  #endif
 diff --git a/kernel/ksud.c b/kernel/ksud.c
-index 67d5a484..7f527789 100644
+index 67d5a484f..7f527789d 100644
 --- a/kernel/ksud.c
 +++ b/kernel/ksud.c
 @@ -58,9 +58,15 @@ static void stop_vfs_read_hook();
@@ -508,7 +505,7 @@ index 67d5a484..7f527789 100644
 +#endif // #ifndef CONFIG_KSU_SUSFS
  }
 diff --git a/kernel/ksud.h b/kernel/ksud.h
-index 85720d3c..44f2df4c 100644
+index 85720d3cd..44f2df4c9 100644
 --- a/kernel/ksud.h
 +++ b/kernel/ksud.h
 @@ -20,4 +20,23 @@ extern u32 ksu_file_sid;
@@ -536,7 +533,7 @@ index 85720d3c..44f2df4c 100644
 +
  #endif
 diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
-index fac0d0d7..13d4b600 100644
+index fac0d0d7f..13d4b6003 100644
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
 @@ -94,6 +94,15 @@ void apply_kernelsu_rules()
@@ -556,7 +553,7 @@ index fac0d0d7..13d4b600 100644
  }
  
 diff --git a/kernel/selinux/selinux.c b/kernel/selinux/selinux.c
-index c50ef2cd..00b95f79 100644
+index deee0fefd..777d3c56e 100644
 --- a/kernel/selinux/selinux.c
 +++ b/kernel/selinux/selinux.c
 @@ -164,3 +164,94 @@ u32 ksu_get_ksu_file_sid()
@@ -655,7 +652,7 @@ index c50ef2cd..00b95f79 100644
 +}
 +#endif // #ifdef CONFIG_KSU_SUSFS
 diff --git a/kernel/selinux/selinux.h b/kernel/selinux/selinux.h
-index a7759952..f232b86b 100644
+index a77599524..f232b86b9 100644
 --- a/kernel/selinux/selinux.h
 +++ b/kernel/selinux/selinux.h
 @@ -34,4 +34,17 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4);
@@ -677,7 +674,7 @@ index a7759952..f232b86b 100644
 +
  #endif
 diff --git a/kernel/setuid_hook.c b/kernel/setuid_hook.c
-index 513339cd..1a9020b1 100644
+index 513339cdc..1a9020b1b 100644
 --- a/kernel/setuid_hook.c
 +++ b/kernel/setuid_hook.c
 @@ -11,6 +11,9 @@
@@ -836,7 +833,7 @@ index 513339cd..1a9020b1 100644
  void ksu_setuid_hook_init(void)
  {
 diff --git a/kernel/sucompat.c b/kernel/sucompat.c
-index e3f688b9..f6a92e16 100644
+index e3f688b9f..f6a92e16d 100644
 --- a/kernel/sucompat.c
 +++ b/kernel/sucompat.c
 @@ -11,6 +11,12 @@
@@ -1005,7 +1002,7 @@ index e3f688b9..f6a92e16 100644
  // sucompat: permitted process can execute 'su' to gain root access.
  void ksu_sucompat_init()
 diff --git a/kernel/sucompat.h b/kernel/sucompat.h
-index b8d26982..cdac225d 100644
+index b8d269823..cdac225d4 100644
 --- a/kernel/sucompat.h
 +++ b/kernel/sucompat.h
 @@ -10,7 +10,11 @@ void ksu_sucompat_exit(void);
@@ -1021,7 +1018,7 @@ index b8d26982..cdac225d 100644
                                 void *__never_use_argv, void *__never_use_envp,
                                 int *__never_use_flags);
 diff --git a/kernel/supercalls.c b/kernel/supercalls.c
-index 00d794a4..6f3638b6 100644
+index def67f325..017a59cf3 100644
 --- a/kernel/supercalls.c
 +++ b/kernel/supercalls.c
 @@ -12,6 +12,10 @@
@@ -1049,7 +1046,7 @@ index 00d794a4..6f3638b6 100644
  
  #include "tiny_sulog.c"
  
-@@ -113,6 +123,9 @@ static int do_report_event(void __user *arg)
+@@ -118,6 +128,9 @@ static int do_report_event(void __user *arg)
              boot_complete_lock = true;
              pr_info("boot_complete triggered\n");
              on_boot_completed();
@@ -1059,7 +1056,7 @@ index 00d794a4..6f3638b6 100644
          }
          break;
      }
-@@ -362,6 +375,7 @@ static int do_manage_mark(void __user *arg)
+@@ -367,6 +380,7 @@ static int do_manage_mark(void __user *arg)
  
      switch (cmd.operation) {
      case KSU_MARK_GET: {
@@ -1067,7 +1064,7 @@ index 00d794a4..6f3638b6 100644
          // Get task mark status
          ret = ksu_get_task_mark(cmd.pid);
          if (ret < 0) {
-@@ -370,8 +384,19 @@ static int do_manage_mark(void __user *arg)
+@@ -375,8 +389,19 @@ static int do_manage_mark(void __user *arg)
          }
          cmd.result = (u32)ret;
          break;
@@ -1087,7 +1084,7 @@ index 00d794a4..6f3638b6 100644
          if (cmd.pid == 0) {
              ksu_mark_all_process();
          } else {
-@@ -382,9 +407,15 @@ static int do_manage_mark(void __user *arg)
+@@ -387,9 +412,15 @@ static int do_manage_mark(void __user *arg)
                  return ret;
              }
          }
@@ -1103,7 +1100,7 @@ index 00d794a4..6f3638b6 100644
          if (cmd.pid == 0) {
              ksu_unmark_all_process();
          } else {
-@@ -395,11 +426,20 @@ static int do_manage_mark(void __user *arg)
+@@ -400,11 +431,20 @@ static int do_manage_mark(void __user *arg)
                  return ret;
              }
          }
@@ -1124,7 +1121,7 @@ index 00d794a4..6f3638b6 100644
          break;
      }
      default: {
-@@ -731,6 +771,7 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
+@@ -736,6 +776,7 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
      kfree(tw);
  }
  
@@ -1132,7 +1129,7 @@ index 00d794a4..6f3638b6 100644
  // downstream: make sure to pass arg as reference, this can allow us to extend things.
  static int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
  {
-@@ -814,6 +855,149 @@ static struct kprobe reboot_kp = {
+@@ -831,6 +872,150 @@ static struct kprobe reboot_kp = {
      .symbol_name = REBOOT_SYMBOL,
      .pre_handler = reboot_handler_pre,
  };
@@ -1278,11 +1275,12 @@ index 00d794a4..6f3638b6 100644
 +    }
 +    return 0;
 +}
++EXPORT_SYMBOL(ksu_handle_sys_reboot); // required visiblity for toolkit
 +#endif // #ifndef CONFIG_KSU_SUSFS
  
  void ksu_supercalls_init(void)
  {
-@@ -825,19 +1009,25 @@ void ksu_supercalls_init(void)
+@@ -842,19 +1027,25 @@ void ksu_supercalls_init(void)
                  ksu_ioctl_handlers[i].cmd);
      }
  
