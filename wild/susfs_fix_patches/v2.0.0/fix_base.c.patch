@@ -1,9 +1,9 @@
---- a/fs/proc/base.c
-+++ b/fs/proc/base.c
-@@ -863,6 +863,22 @@
+--- a/fs/proc/base.c	2025-12-28 06:28:12.000000000 -0500
++++ b/fs/proc/base.c	2025-12-28 02:14:17.386870635 -0500
+@@ -973,6 +973,23 @@
+ 		size_t this_len, max_len;
+ 		int retval;
  
- 	while (count > 0) {
- 		int this_len = min_t(int, count, PAGE_SIZE);
 +#ifdef CONFIG_KSU_SUSFS_SUS_MAP
 +		vma = find_vma(mm, addr);
 +		if (vma && vma->vm_file) {
@@ -20,6 +20,7 @@
 +			}
 +		}
 +#endif
++
+ 		if (src >= (env_end - env_start))
+ 			break;
  
- 		if (write && copy_from_user(page, buf, this_len)) {
- 			copied = -EFAULT;
