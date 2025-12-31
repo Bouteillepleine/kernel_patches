@@ -1,5 +1,5 @@
 diff --git a/kernel/sucompat.c b/kernel/sucompat.c
-index 4e5db588..53967ce9 100644
+index 97e500cb..978b26d5 100644
 --- a/kernel/sucompat.c
 +++ b/kernel/sucompat.c
 @@ -76,7 +76,7 @@ static char __user *ksud_user_path(void)

@@ -1,0 +1,50 @@
+diff --git a/kernel/setuid_hook.c b/kernel/setuid_hook.c
+index 22570627..70706dda 100644
+--- a/kernel/setuid_hook.c
++++ b/kernel/setuid_hook.c
+@@ -23,7 +23,9 @@
+ #include "selinux/selinux.h"
+ #include "seccomp_cache.h"
+ #include "supercalls.h"
++#ifndef CONFIG_KSU_SUSFS
+ #include "syscall_hook_manager.h"
++#endif // #ifndef CONFIG_KSU_SUSFS
+ #include "kernel_umount.h"
+ 
+ static bool ksu_enhanced_security_enabled = false;
+@@ -49,12 +51,35 @@ static const struct ksu_feature_handler enhanced_security_handler = {
+     .set_handler = enhanced_security_feature_set,
+ };
+ 
++#ifdef CONFIG_KSU_SUSFS
++static inline bool is_zygote_isolated_service_uid(uid_t uid)
++{
++    uid %= 100000;
++    return (uid >= 99000 && uid < 100000);
++}
++
++static inline bool is_zygote_normal_app_uid(uid_t uid)
++{
++    uid %= 100000;
++    return (uid >= 10000 && uid < 19999);
++}
++
++extern u32 susfs_zygote_sid;
++#ifdef CONFIG_KSU_SUSFS_SUS_PATH
++extern void susfs_run_sus_path_loop(uid_t uid);
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++extern void susfs_reorder_mnt_id(void);
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++#endif // #ifdef CONFIG_KSU_SUSFS
++
+ static void ksu_install_manager_fd_tw_func(struct callback_head *cb)
+ {
+     ksu_install_fd();
+     kfree(cb);
+ }
+ 
++#ifndef CONFIG_KSU_SUSFS
+ int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)
+ {
+     // we rely on the fact that zygote always call setresuid(3) with same uids

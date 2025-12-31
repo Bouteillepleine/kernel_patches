@@ -1,5 +1,5 @@
 diff --git a/kernel/ksu.c b/kernel/ksu.c
-index c1aa6f20..f4f4544b 100644
+index c1aa6f20..b95ee374 100644
 --- a/kernel/ksu.c
 +++ b/kernel/ksu.c
 @@ -44,15 +44,22 @@ int __init kernelsu_init(void)
@@ -11,14 +11,14 @@ index c1aa6f20..f4f4544b 100644
  	ksu_syscall_hook_manager_init();
 -
 +#else
-+	ksu_setuid_hook_init();
-+	ksu_sucompat_init();
++    ksu_setuid_hook_init();
++    ksu_sucompat_init();
 +#endif // #ifndef CONFIG_KSU_SUSFS
  	ksu_allowlist_init();
  
  	ksu_throne_tracker_init();
 +#ifdef CONFIG_KSU_SUSFS
-+	susfs_init();
++    susfs_init();
 +#endif // #ifdef CONFIG_KSU_SUSFS
  
 +#ifndef CONFIG_KSU_SUSFS
