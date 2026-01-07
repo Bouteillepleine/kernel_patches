@@ -1,0 +1,81 @@
+diff --git a/kernel/supercalls.c b/kernel/supercalls.c
+index 6f3638b6..7af8e864 100644
+--- a/kernel/supercalls.c
++++ b/kernel/supercalls.c
+@@ -771,6 +771,18 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
+     kfree(tw);
+ }
+ 
++static inline bool ksu_require_root(void)
++{
++	return current_uid().val == 0;
++}
++
++// copy to userspace (reply back)
++static inline void ksu_copy_reply_user(unsigned long user_ptr, unsigned long reply)
++{
++	if (copy_to_user((void __user *)user_ptr, &reply, sizeof(reply)))
++		pr_info("sys_reboot: reply fail\n");
++}
++
+ #ifndef CONFIG_KSU_SUSFS
+ // downstream: make sure to pass arg as reference, this can allow us to extend things.
+ static int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
+@@ -965,38 +977,42 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user
+     }
+ 
+     // extensions
+-    u64 reply = (u64)*arg;
+-
++    // User's pointer -> reply
+     if (magic2 == CHANGE_MANAGER_UID) {
+-        // only root is allowed for this command
+-        if (current_uid().val != 0)
++        unsigned long reply = (unsigned long)(*arg);
++        unsigned long user_ptr = reply;
++
++        if (!ksu_require_root())
+             return 0;
+ 
+         pr_info("sys_reboot: ksu_set_manager_appid to: %d\n", cmd);
+         ksu_set_manager_appid(cmd);
+ 
+-        if (cmd == ksu_get_manager_appid()) {
+-            if (copy_to_user((void __user *)*arg, &reply, sizeof(reply)))
+-            	pr_info("sys_reboot: reply fail\n");
+-        }
++        if (cmd == ksu_get_manager_appid())
++            ksu_copy_reply_user(user_ptr, reply);
+ 
+         return 0;
+     }
+ 
++    // User's pointer -> reply
+     if (magic2 == GET_SULOG_DUMP_V2) {
+-        // only root is allowed for this command
+-        if (current_uid().val != 0)
+-            return 0;
++        unsigned long reply = (unsigned long)(*arg);
++        unsigned long user_ptr = reply;
+ 
+-        int ret = send_sulog_dump(*arg);
+-            if (ret)
+-                return 0;
++        if (!ksu_require_root())
++            return 0;
+ 
+-        if (copy_to_user((void __user *)*arg, &reply, sizeof(reply) ))
++        int ret = send_sulog_dump((void __user *)*arg);
++        if (ret)
+             return 0;
++
++        ksu_copy_reply_user(user_ptr, reply);
++        return 0;
+     }
++
+     return 0;
+ }
++EXPORT_SYMBOL(ksu_handle_sys_reboot); // required visiblity for toolkit
+ #endif // #ifndef CONFIG_KSU_SUSFS
+ 
+ void ksu_supercalls_init(void)
