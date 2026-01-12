@@ -1,4 +1,3 @@
-cat > multi_manager.patch << 'EOF'
 diff --git a/kernel/apk_sign.c b/kernel/apk_sign.c
 index 3f2ae2d4..96a3c861 100644
 --- a/kernel/apk_sign.c
@@ -33,4 +32,3 @@ index 3f2ae2d4..96a3c861 100644
 +		|| check_v2_signature(path, 0x35c, "947ae944f3de4ed4c21a7b4f7953ecf351bfa2b36239da37a34111ad29993eef")
 +		|| check_v2_signature(path, 0x396, "f415f4ed9435427e1fdf7f1fccd4dbc07b3d6b8751e4dbcec6f19671f427870b"));
  }
-EOF
