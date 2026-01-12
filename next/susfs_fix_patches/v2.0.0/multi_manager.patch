@@ -13,7 +13,7 @@ index 3f2ae2d4..96a3c861 100644
  struct sdesc {
  	struct shash_desc shash;
  	char ctx[];
-@@ -356,9 +360,11 @@ bool is_manager_apk(char *path)
+@@ -356,9 +360,17 @@ bool is_manager_apk(char *path)
  	}
  
  	// pkg is `<real package>`
