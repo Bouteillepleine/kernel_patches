@@ -21,11 +21,13 @@ index a24006ea..4d7b0757 100644
  #include <linux/sched.h>
  #include <linux/sched/signal.h>
  #include <linux/seccomp.h>
-@@ -152,6 +153,8 @@ void escape_with_root_profile(void)
+@@ -152,6 +153,10 @@ void escape_with_root_profile(void)
  
      setup_groups(profile, cred);
  
-+    bbg_cred(cred)->is_untrusted_process = 1;
++    struct bbg_cred_security_struct *bbg = bbg_cred(cred);
++    if (bbg)
++        bbg->is_untrusted_process = 1;
 +
      commit_creds(cred);
  
