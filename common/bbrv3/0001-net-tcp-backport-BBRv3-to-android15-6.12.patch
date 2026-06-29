@@ -1,5 +1,5 @@
 diff --git a/include/linux/tcp.h b/include/linux/tcp.h
-index 842785347dd1..181eff5aa535 100644
+index 842785347dd1..162311fb7a58 100644
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
 @@ -370,7 +370,13 @@ struct tcp_sock {
@@ -7,9 +7,9 @@ index 842785347dd1..181eff5aa535 100644
  	u8	dup_ack_counter:2,
  		tlp_retrans:1,	/* TLP is a retransmission */
 -		unused:5;
++#ifndef __GENKSYMS__
 +			fast_ack_mode:2, /* which fast ack mode ? */
 +			tlp_orig_data_app_limited:1, /* app-limited before TLP rtx? */
-+#ifndef __GENKSYMS__
 +			unused:2;
 +#else
 +			unused:5;
