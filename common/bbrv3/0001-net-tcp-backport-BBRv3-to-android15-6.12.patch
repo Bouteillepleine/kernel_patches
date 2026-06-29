@@ -2,7 +2,7 @@ diff --git a/include/linux/tcp.h b/include/linux/tcp.h
 index 842785347dd1..162311fb7a58 100644
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
-@@ -370,7 +370,13 @@ struct tcp_sock {
+@@ -370,7 +370,14 @@ struct tcp_sock {
  	u8	compressed_ack;
  	u8	dup_ack_counter:2,
  		tlp_retrans:1,	/* TLP is a retransmission */
@@ -10,13 +10,22 @@ index 842785347dd1..162311fb7a58 100644
 +#ifndef __GENKSYMS__
 +			fast_ack_mode:2, /* which fast ack mode ? */
 +			tlp_orig_data_app_limited:1, /* app-limited before TLP rtx? */
-+			unused:2;
++			bbr_is_ece:1,			/* BBRv3: ACK had ECE? */
++			bbr_is_acking_tlp_retrans_seq:1; /* BBRv3: ACKed TLP rtx seq? */
 +#else
 +			unused:5;
 +#endif
  	u8	thin_lto    : 1,/* Use linear timeouts for thin streams */
  		fastopen_connect:1, /* FASTOPEN_CONNECT sockopt */
  		fastopen_no_cookie:1, /* Allow send/recv SYN+data without a cookie */
+@@ -503,6 +509,6 @@ struct tcp_sock {
+ 	struct request_sock __rcu *fastopen_rsk;
+ 	struct saved_syn *saved_syn;
+ 
+-	ANDROID_KABI_RESERVE(1);
++	ANDROID_KABI_USE2(1, u32 bbr_tx_in_flight, u32 bbr_lost);
+ 	ANDROID_OEM_DATA(1);
+ };
 diff --git a/include/net/tcp.h b/include/net/tcp.h
 index 3255a199ef60..d3bd37619422 100644
 --- a/include/net/tcp.h
@@ -96,10 +105,10 @@ index 3255a199ef60..d3bd37619422 100644
  	CA_EVENT_LOSS,		/* loss timeout */
  	CA_EVENT_ECN_NO_CE,	/* ECT set, but not CE marked */
  	CA_EVENT_ECN_IS_CE,	/* received CE marked IP packet */
-+#ifndef __GENKSYMS__
-+	CA_EVENT_TLP_RECOVERY,	/* a lost segment was repaired by TLP probe */
-+#endif
  };
++
++/* KMI-safe: standalone constant, NOT added to enum tcp_ca_event (STG ABI). */
++#define CA_EVENT_TLP_RECOVERY 6
  
  /* Information about inbound ACK, passed to cong_ops->in_ack_event() */
 @@ -1127,7 +1169,11 @@ enum tcp_ca_ack_event_flags {
@@ -115,20 +124,6 @@ index 3255a199ef60..d3bd37619422 100644
  
  union tcp_cc_info;
  
-@@ -1162,6 +1208,13 @@ struct rate_sample {
- 	bool is_app_limited;	/* is sample from packet with bubble in pipe? */
- 	bool is_retrans;	/* is sample from retransmission? */
- 	bool is_ack_delayed;	/* is this (likely) a delayed ACK? */
-+#ifndef __GENKSYMS__
-+	bool is_acking_tlp_retrans_seq;  /* ACKed a TLP retransmit sequence? */
-+	bool is_ece;		/* did this ACK have ECN marked? */
-+	u32 tx_in_flight;	/* packets in flight at starting timestamp */
-+	s32  lost;		/* number of packets lost over interval */
-+	u32  prior_lost;	/* tp->lost at "prior_mstamp" */
-+#endif
- };
- 
- struct tcp_congestion_ops {
 @@ -1252,6 +1305,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
  }
  #endif
@@ -250,42 +245,6 @@ index 3255a199ef60..d3bd37619422 100644
  /* At how many usecs into the future should the RTO fire? */
  static inline s64 tcp_rto_delta_us(const struct sock *sk)
  {
-diff --git a/include/uapi/linux/inet_diag.h b/include/uapi/linux/inet_diag.h
-index 86bb2e8b17c9..dcb697f46cdc 100644
---- a/include/uapi/linux/inet_diag.h
-+++ b/include/uapi/linux/inet_diag.h
-@@ -229,6 +229,31 @@ struct tcp_bbr_info {
- 	__u32	bbr_min_rtt;		/* min-filtered RTT in uSec */
- 	__u32	bbr_pacing_gain;	/* pacing gain shifted left 8 bits */
- 	__u32	bbr_cwnd_gain;		/* cwnd gain shifted left 8 bits */
-+#ifndef __GENKSYMS__
-+	__u32	bbr_bw_hi_lsb;		/* lower 32 bits of bw_hi */
-+	__u32	bbr_bw_hi_msb;		/* upper 32 bits of bw_hi */
-+	__u32	bbr_bw_lo_lsb;		/* lower 32 bits of bw_lo */
-+	__u32	bbr_bw_lo_msb;		/* upper 32 bits of bw_lo */
-+	__u8	bbr_mode;		/* current bbr_mode in state machine */
-+	__u8	bbr_phase;		/* current state machine phase */
-+	__u8	unused1;		/* alignment padding; not used yet */
-+	__u8	bbr_version;		/* BBR algorithm version */
-+	__u32	bbr_inflight_lo;	/* lower short-term data volume bound */
-+	__u32	bbr_inflight_hi;	/* higher long-term data volume bound */
-+	__u32	bbr_extra_acked;	/* max excess packets ACKed in epoch */
-+#endif
-+};
-+
-+/* TCP BBR congestion control bbr_phase as reported in netlink/ss stats. */
-+enum tcp_bbr_phase {
-+	BBR_PHASE_INVALID			= 0,
-+	BBR_PHASE_STARTUP			= 1,
-+	BBR_PHASE_DRAIN				= 2,
-+	BBR_PHASE_PROBE_RTT			= 3,
-+	BBR_PHASE_PROBE_BW_UP		= 4,
-+	BBR_PHASE_PROBE_BW_DOWN		= 5,
-+	BBR_PHASE_PROBE_BW_CRUISE	= 6,
-+	BBR_PHASE_PROBE_BW_REFILL	= 7,
- };
- 
- union tcp_cc_info {
 diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
 index db7254d52d93..38de18d921ea 100644
 --- a/include/uapi/linux/rtnetlink.h
@@ -379,10 +338,11 @@ index 9792e82e5549..36f31e90df0f 100644
  	/* Clean up fastopen related fields */
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 new file mode 100644
-index 000000000000..ba4e4783d5cb
+index 000000000000..000000000001
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr3.c
-@@ -0,0 +1,2359 @@
+@@ -0,0 +1,2321 @@
++++ b/net/ipv4/tcp_bbr3.c
 +/* BBR (Bottleneck Bandwidth and RTT) congestion control
 + *
 + * BBR is a model-based congestion control algorithm that aims for low queues,
@@ -1497,10 +1457,10 @@ index 000000000000..ba4e4783d5cb
 +	const struct bbr3 *bbr = bbr3_get_priv(sk);
 +	u32 loss_thresh, ecn_thresh;
 +
-+	if (rs->lost > 0 && rs->tx_in_flight) {
-+		loss_thresh = (u64)rs->tx_in_flight * bbr_param(sk, loss_thresh) >>
++	if ((s32)tcp_sk(sk)->bbr_lost > 0 && tcp_sk(sk)->bbr_tx_in_flight) {
++		loss_thresh = (u64)tcp_sk(sk)->bbr_tx_in_flight * bbr_param(sk, loss_thresh) >>
 +				BBR_SCALE;
-+		if (rs->lost > loss_thresh) {
++		if ((s32)tcp_sk(sk)->bbr_lost > loss_thresh) {
 +			return true;
 +		}
 +	}
@@ -1538,27 +1498,27 @@ index 000000000000..ba4e4783d5cb
 +	pcount = tcp_skb_pcount(skb);
 +
 +	/* How much data was in flight before this skb? */
-+	inflight_prev = rs->tx_in_flight - pcount;
++	inflight_prev = tcp_sk(sk)->bbr_tx_in_flight - pcount;
 +	if (inflight_prev < 0) {
 +		WARN_ONCE(tcp_skb_tx_in_flight_is_suspicious(
 +				  pcount,
 +				  TCP_SKB_CB(skb)->sacked,
-+				  rs->tx_in_flight),
++				  tcp_sk(sk)->bbr_tx_in_flight),
 +			  "tx_in_flight: %u pcount: %u reneg: %u",
-+			  rs->tx_in_flight, pcount, tcp_sk(sk)->is_sack_reneg);
++			  tcp_sk(sk)->bbr_tx_in_flight, pcount, tcp_sk(sk)->is_sack_reneg);
 +		return ~0U;
 +	}
 +
 +	/* How much inflight data was marked lost before this skb? */
-+	lost_prev = rs->lost - pcount;
++	lost_prev = (s32)tcp_sk(sk)->bbr_lost - pcount;
 +	if (WARN_ONCE(lost_prev < 0,
 +		      "cwnd: %u ca: %d out: %u lost: %u pif: %u "
 +		      "tx_in_flight: %u tx.lost: %u tp->lost: %u rs->lost: %d "
 +		      "lost_prev: %d pcount: %d seq: %u end_seq: %u reneg: %u",
 +		      tcp_snd_cwnd(tp), inet_csk(sk)->icsk_ca_state,
 +		      tp->packets_out, tp->lost_out, tcp_packets_in_flight(tp),
-+		      rs->tx_in_flight, TCP_SKB_CB(skb)->tx.lost, tp->lost,
-+		      rs->lost, lost_prev, pcount,
++		      tcp_sk(sk)->bbr_tx_in_flight, TCP_SKB_CB(skb)->tx.lost, tp->lost,
++		      (s32)tcp_sk(sk)->bbr_lost, lost_prev, pcount,
 +		      TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
 +		      tp->is_sack_reneg))
 +		return ~0U;
@@ -1785,7 +1745,7 @@ index 000000000000..ba4e4783d5cb
 +	 * that a TLP retransmit plugged a tail loss, we'll want to remember
 +	 * how much data the path delivered before the tail loss.
 +	 */
-+	if (bbr->loss_round_start && !rs->is_acking_tlp_retrans_seq) {
++	if (bbr->loss_round_start && !tcp_sk(sk)->bbr_is_acking_tlp_retrans_seq) {
 +		bbr->bw_latest = ctx->sample_bw;
 +		bbr->inflight_latest = rs->delivered;
 +	}
@@ -1961,7 +1921,7 @@ index 000000000000..ba4e4783d5cb
 +	 * samples are not known to be robustly probing bw).
 +	 */
 +	if (!rs->is_app_limited) {
-+		bbr->inflight_hi = max_t(u32, rs->tx_in_flight,
++		bbr->inflight_hi = max_t(u32, tcp_sk(sk)->bbr_tx_in_flight,
 +					 (u64)bbr_target_inflight(sk) *
 +					 (BBR_UNIT - beta) >> BBR_SCALE);
 +	}
@@ -2018,8 +1978,8 @@ index 000000000000..ba4e4783d5cb
 +		/* To be resilient to random loss, we must raise bw/inflight_hi
 +		 * if we observe in any phase that a higher level is safe.
 +		 */
-+		if (rs->tx_in_flight > bbr->inflight_hi) {
-+			bbr->inflight_hi = rs->tx_in_flight;
++		if (tcp_sk(sk)->bbr_tx_in_flight > bbr->inflight_hi) {
++			bbr->inflight_hi = tcp_sk(sk)->bbr_tx_in_flight;
 +		}
 +
 +		if (bbr->mode == BBR_PROBE_BW &&
@@ -2375,7 +2335,7 @@ index 000000000000..ba4e4783d5cb
 +	}
 +	bbr_plb(sk, rs, ce_ratio);
 +
-+	bbr->ecn_in_round  |= (bbr->ecn_eligible && rs->is_ece);
++	bbr->ecn_in_round  |= (bbr->ecn_eligible && tcp_sk(sk)->bbr_is_ece);
 +	bbr_calculate_bw_sample(sk, rs, &ctx);
 +	bbr_update_latest_delivery_signals(sk, rs, &ctx);
 +
@@ -2395,7 +2355,7 @@ index 000000000000..ba4e4783d5cb
 +out:
 +	bbr_advance_latest_delivery_signals(sk, rs, &ctx);
 +	bbr->prev_ca_state = inet_csk(sk)->icsk_ca_state;
-+	bbr->loss_in_cycle |= rs->lost > 0;
++	bbr->loss_in_cycle |= (s32)tcp_sk(sk)->bbr_lost > 0;
 +	bbr->ecn_in_cycle  |= rs->delivered_ce > 0;
 +}
 +
@@ -2601,33 +2561,6 @@ index 000000000000..ba4e4783d5cb
 +	return tcp_sk(sk)->snd_ssthresh;
 +}
 +
-+static enum tcp_bbr_phase bbr_get_phase(struct bbr3 *bbr)
-+{
-+	switch (bbr->mode) {
-+	case BBR_STARTUP:
-+		return BBR_PHASE_STARTUP;
-+	case BBR_DRAIN:
-+		return BBR_PHASE_DRAIN;
-+	case BBR_PROBE_BW:
-+		break;
-+	case BBR_PROBE_RTT:
-+		return BBR_PHASE_PROBE_RTT;
-+	default:
-+		return BBR_PHASE_INVALID;
-+	}
-+	switch (bbr->cycle_idx) {
-+	case BBR_BW_PROBE_UP:
-+		return BBR_PHASE_PROBE_BW_UP;
-+	case BBR_BW_PROBE_DOWN:
-+		return BBR_PHASE_PROBE_BW_DOWN;
-+	case BBR_BW_PROBE_CRUISE:
-+		return BBR_PHASE_PROBE_BW_CRUISE;
-+	case BBR_BW_PROBE_REFILL:
-+		return BBR_PHASE_PROBE_BW_REFILL;
-+	default:
-+		return BBR_PHASE_INVALID;
-+	}
-+}
 +
 +static size_t bbr3_get_info(struct sock *sk, u32 ext, int *attr,
 +			    union tcp_cc_info *info)
@@ -2635,34 +2568,22 @@ index 000000000000..ba4e4783d5cb
 +	if (ext & (1 << (INET_DIAG_BBRINFO - 1)) ||
 +	    ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
 +		struct tcp_bbr_info *bbr_info;
-+		u64 bw, bw_hi, bw_lo;
++		u64 bw;
 +
 +		struct bbr3 *bbr = bbr3_get_priv(sk);
 +		if(!bbr || !bbr->initialized)
 +			return 0;
 +
 +		bw = bbr_bw_bytes_per_sec(sk, bbr_bw(sk));
-+		bw_hi = bbr_bw_bytes_per_sec(sk, bbr_max_bw(sk));
-+		bw_lo = bbr->bw_lo == ~0U ?
-+			~0ULL : bbr_bw_bytes_per_sec(sk, bbr->bw_lo);
 +		bbr_info = &info->bbr;
 +
++		/* KMI-safe: tcp_bbr_info kept frozen; report baseline fields only. */
 +		memset(bbr_info, 0, sizeof(*bbr_info));
 +		bbr_info->bbr_bw_lo		= (u32)bw;
 +		bbr_info->bbr_bw_hi		= (u32)(bw >> 32);
 +		bbr_info->bbr_min_rtt		= bbr->min_rtt_us;
 +		bbr_info->bbr_pacing_gain	= bbr->pacing_gain;
 +		bbr_info->bbr_cwnd_gain		= bbr->cwnd_gain;
-+		bbr_info->bbr_bw_hi_lsb		= (u32)bw_hi;
-+		bbr_info->bbr_bw_hi_msb		= (u32)(bw_hi >> 32);
-+		bbr_info->bbr_bw_lo_lsb		= (u32)bw_lo;
-+		bbr_info->bbr_bw_lo_msb		= (u32)(bw_lo >> 32);
-+		bbr_info->bbr_mode		= bbr->mode;
-+		bbr_info->bbr_phase		= (__u8)bbr_get_phase(bbr);
-+		bbr_info->bbr_version		= (__u8)BBR_VERSION;
-+		bbr_info->bbr_inflight_lo	= bbr->inflight_lo;
-+		bbr_info->bbr_inflight_hi	= bbr->inflight_hi;
-+		bbr_info->bbr_extra_acked	= bbr_extra_acked(sk);
 +		*attr = INET_DIAG_BBRINFO;
 +		return sizeof(*bbr_info);
 +	}
@@ -2839,7 +2760,7 @@ index 65b35868ac7e..859fd90cc468 100644
 +		/* This ACK matches a TLP retransmit. We cannot yet tell if
 +		 * this ACK is for the original or the TLP retransmit.
 +		 */
-+		rs->is_acking_tlp_retrans_seq = 1;
++		tp->bbr_is_acking_tlp_retrans_seq = 1;
  	}
  }
  
@@ -2864,7 +2785,7 @@ index 65b35868ac7e..859fd90cc468 100644
  	delivered = tcp_newly_delivered(sk, delivered, flag);
  	lost = tp->lost - lost;			/* freshly marked lost */
  	rs.is_ack_delayed = !!(flag & FLAG_ACK_MAYBE_DELAYED);
-+	rs.is_ece = !!(flag & FLAG_ECE);
++	tp->bbr_is_ece = !!(flag & FLAG_ECE);
  	tcp_rate_gen(sk, delivered, lost, is_sack_reneg, sack_state.rate);
  	tcp_cong_control(sk, ack, delivered, flag, sack_state.rate);
  	tcp_xmit_recovery(sk, rexmit);
@@ -3042,13 +2963,13 @@ index a8f6d9d06f2e..3ad92f7b362c 100644
  	if (!rs->prior_delivered ||
  	    tcp_skb_sent_after(tx_tstamp, tp->first_tx_mstamp,
  			       scb->end_seq, rs->last_end_seq)) {
-+		rs->prior_lost	     = scb->tx.lost;
++		tp->bbr_lost = scb->tx.lost;
  		rs->prior_delivered_ce  = scb->tx.delivered_ce;
  		rs->prior_delivered  = scb->tx.delivered;
  		rs->prior_mstamp     = scb->tx.delivered_mstamp;
  		rs->is_app_limited   = scb->tx.is_app_limited;
  		rs->is_retrans	     = scb->sacked & TCPCB_RETRANS;
-+		rs->tx_in_flight     = scb->tx.in_flight;
++		tp->bbr_tx_in_flight = scb->tx.in_flight;
  		rs->last_end_seq     = scb->end_seq;
  
  		/* Record send time of most recently ACKed packet: */
@@ -3063,7 +2984,7 @@ index a8f6d9d06f2e..3ad92f7b362c 100644
  		return;
  	}
  	rs->delivered   = tp->delivered - rs->prior_delivered;
-+	rs->lost        = tp->lost - rs->prior_lost;
++	tp->bbr_lost = tp->lost - tp->bbr_lost;
  
  	rs->delivered_ce = tp->delivered_ce - rs->prior_delivered_ce;
  	/* delivered_ce occupies less than 32 bits in the skb control block */
