@@ -1,26 +1,31 @@
-From 5059ac7eb7354170c13a0621c264f9043dfa7391 Mon Sep 17 00:00:00 2001
-From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
-Date: Sat, 4 Jul 2026 15:58:54 +0200
+From e7740bbdc0aa4eefcc6e72b170933c0b41ef898b Mon Sep 17 00:00:00 2001
+From: steve <steve0007.xda@gmail.com>
+Date: Sat, 4 Jul 2026 16:56:12 +0200
 Subject: [PATCH] net: tcp: bbr3: add debugfs diagnostics and runtime tunables
+ (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Additive follow-up to the BBRv3 backport; no frozen KMI type is
-touched (struct bbr3 is heap-private module state, confirmed outside
-the KMI type graph by stgdiff against gki/aarch64/abi.stg).
+touched and — unlike v1 — no per-connection hot-path code is added.
 
 1) /sys/kernel/debug/tcp_bbr3/sockets: one line per live bbr3
    connection (ports, mode, bw_hi/lo, inflight_hi/lo, min_rtt_us,
-   ecn_alpha, pacing/cwnd gains, full_bw_reached), restoring the
-   visibility lost when bbr3_get_info was frozen to baseline
-   tcp_bbr_info fields. Connections are published at the end of
-   bbr3_init() and unpublished in bbr3_release() under a dedicated
-   spinlock; entries on the list are always fully initialized and
-   cannot be freed while a reader holds the lock.
+   ecn_alpha, gains, full_bw_reached). Implemented as a read-time
+   RCU walk of the TCP established hash (the /proc/net/tcp pattern):
+   no socket registry, no bbr3_init()/bbr3_release() changes, no
+   shared mutable state. v1 used a spinlock-protected registry
+   published from bbr3_init(); that build failed to boot on the
+   OnePlus 15 (mechanism undetermined; bisected to exactly those
+   hooks) — this rewrite removes the entire class.
 
 2) Runtime tunables under /sys/module/tcp_bbr3/parameters/ (0644):
    bbr_min_rtt_win_sec, bbr_probe_rtt_mode_ms, bbr_probe_rtt_win_ms,
    bbr_ecn_max_rtt_us, bbr_ecn_factor, bbr_ecn_thresh,
    bbr_loss_thresh, bbr_full_loss_cnt. Fractions are BBR_UNIT=256
-   scaled where noted; changes apply to subsequent per-ACK checks.
+   scaled where noted. (Device-proven booting as part of the 0002a
+   bisect build.)
 
 3) Mobile ECN enablement: BBRv3's ECN logic ships with datacenter
    tuning (bbr_ecn_max_rtt_us=5000 makes it ineligible at mobile
@@ -29,27 +34,11 @@ the KMI type graph by stgdiff against gki/aarch64/abi.stg).
      sysctl -w net.ipv4.tcp_ecn=1
    and set RTAX_FEATURE_ECN_LOW (1<<5) on the route via netlink.
 ---
- include/net/tcp.h   |  4 ++
- net/ipv4/tcp_bbr3.c | 97 ++++++++++++++++++++++++++++++++++++++++-----
- 2 files changed, 91 insertions(+), 10 deletions(-)
+ net/ipv4/tcp_bbr3.c | 101 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 91 insertions(+), 10 deletions(-)
 
-diff --git a/include/net/tcp.h b/include/net/tcp.h
-index cc6f521..4febc5e 100644
---- a/include/net/tcp.h
-+++ b/include/net/tcp.h
-@@ -2594,6 +2594,10 @@ struct bbr3 {
- 
- 	/* react to a specific lost skb (optional) */
- 	void (*skb_marked_lost)(struct sock *sk, const struct sk_buff *skb);
-+
-+	/* debugfs introspection registry (heap-private state; not KMI) */
-+	struct list_head dbg_list;
-+	struct sock *dbg_sk;
- };
- 
- /* At how many usecs into the future should the RTO fire? */
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
-index 84ff858..138be4f 100644
+index 84ff858..1b1be65 100644
 --- a/net/ipv4/tcp_bbr3.c
 +++ b/net/ipv4/tcp_bbr3.c
 @@ -64,6 +64,8 @@
@@ -137,41 +126,58 @@ index 84ff858..138be4f 100644
  
  /* Exit STARTUP if number of round trips with ECN mark rate above ecn_thresh
   * meets this count.
-@@ -2019,6 +2037,41 @@ out:
+@@ -2019,6 +2037,58 @@ out:
  
  static struct kmem_cache *bbr3_cache __read_mostly;
  
-+/* debugfs introspection: registry of live bbr3 connections.
-+ * Nodes are embedded in struct bbr3 (heap-private, not KMI), added at the
-+ * end of bbr3_init() and removed in bbr3_release() under bbr3_dbg_lock,
-+ * so entries on the list are always fully initialized and never freed
-+ * while a reader holds the lock.
++/* debugfs introspection: read-time walk of the TCP established hash
++ * (the /proc/net/tcp pattern). No per-socket bookkeeping, no shared
++ * mutable state, nothing on any connection hot path. Racy lock-free
++ * field reads, same as inet_diag - fine for diagnostics.
 + */
-+static LIST_HEAD(bbr3_dbg_socks);
-+static DEFINE_SPINLOCK(bbr3_dbg_lock);
 +static struct dentry *bbr3_debugfs_dir;
++static struct tcp_congestion_ops tcp_bbr3_cong_ops __read_mostly;
 +
 +static int bbr3_dbg_show(struct seq_file *m, void *v)
 +{
-+	struct bbr3 *bbr;
++	unsigned int slot;
 +
-+	seq_puts(m, "# sport dport mode bw_hi0 bw_hi1 bw_lo inflight_hi inflight_lo min_rtt_us ecn_alpha pacing_gain cwnd_gain full_bw_reached\n");
-+	seq_puts(m, "# bw unit: packets/uS << 24; gains: BBR_UNIT=256 fractions; ~0 = unset\n");
-+	spin_lock_bh(&bbr3_dbg_lock);
-+	list_for_each_entry(bbr, &bbr3_dbg_socks, dbg_list) {
-+		const struct sock *sk = bbr->dbg_sk;
-+		const struct inet_sock *inet = inet_sk(sk);
++	seq_puts(m, "# sport dport mode bw_hi0 bw_hi1 bw_lo inflight_hi inflight_lo min_rtt_us ecn_alpha pacing_gain cwnd_gain full_bw_reached
++");
++	seq_puts(m, "# bw unit: packets/uS << 24; gains: BBR_UNIT=256 fractions; ~0 = unset
++");
++	for (slot = 0; slot <= tcp_hashinfo.ehash_mask; slot++) {
++		struct inet_ehash_bucket *head = &tcp_hashinfo.ehash[slot];
++		struct hlist_nulls_node *node;
++		struct sock *sk;
 +
-+		seq_printf(m, "%u %u %u %u %u %u %u %u %u %u %u %u %u\n",
-+			   ntohs(inet->inet_sport), ntohs(inet->inet_dport),
-+			   (u32)bbr->mode,
-+			   bbr->bw_hi[0], bbr->bw_hi[1], bbr->bw_lo,
-+			   bbr->inflight_hi, bbr->inflight_lo,
-+			   bbr->min_rtt_us, (u32)bbr->ecn_alpha,
-+			   (u32)bbr->pacing_gain, (u32)bbr->cwnd_gain,
-+			   (u32)bbr->full_bw_reached);
++		if (hlist_nulls_empty(&head->chain))
++			continue;
++		rcu_read_lock();
++		sk_nulls_for_each_rcu(sk, node, &head->chain) {
++			const struct inet_sock *inet;
++			const struct bbr3 *bbr;
++
++			if (!sk_fullsock(sk))
++				continue;	/* skip timewait/request socks */
++			if (inet_csk(sk)->icsk_ca_ops != &tcp_bbr3_cong_ops)
++				continue;
++			bbr = *(struct bbr3 **)inet_csk_ca(sk);
++			if (!bbr || !bbr->initialized)
++				continue;
++			inet = inet_sk(sk);
++			seq_printf(m, "%u %u %u %u %u %u %u %u %u %u %u %u %u
++",
++				   ntohs(inet->inet_sport), ntohs(inet->inet_dport),
++				   (u32)bbr->mode,
++				   bbr->bw_hi[0], bbr->bw_hi[1], bbr->bw_lo,
++				   bbr->inflight_hi, bbr->inflight_lo,
++				   bbr->min_rtt_us, (u32)bbr->ecn_alpha,
++				   (u32)bbr->pacing_gain, (u32)bbr->cwnd_gain,
++				   (u32)bbr->full_bw_reached);
++		}
++		rcu_read_unlock();
 +	}
-+	spin_unlock_bh(&bbr3_dbg_lock);
 +	return 0;
 +}
 +DEFINE_SHOW_ATTRIBUTE(bbr3_dbg);
@@ -179,42 +185,15 @@ index 84ff858..138be4f 100644
  static void bbr3_init(struct sock *sk)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
-@@ -2038,6 +2091,9 @@ static void bbr3_init(struct sock *sk)
- 
- 	*bbr3_ptr = bbr;
- 
-+	INIT_LIST_HEAD(&bbr->dbg_list);
-+	bbr->dbg_sk = sk;
-+
- 	bbr->skb_marked_lost = bbr3_skb_marked_lost;
- 
- 	bbr->initialized = 1;
-@@ -2115,6 +2171,11 @@ static void bbr3_init(struct sock *sk)
+@@ -2115,6 +2185,7 @@ static void bbr3_init(struct sock *sk)
  
  	if (bbr_can_use_ecn(sk))
  		tp->ecn_flags |= TCP_ECN_ECT_PERMANENT;
 +
-+	/* Fully initialized: publish to the debugfs registry last. */
-+	spin_lock_bh(&bbr3_dbg_lock);
-+	list_add_tail(&bbr->dbg_list, &bbr3_dbg_socks);
-+	spin_unlock_bh(&bbr3_dbg_lock);
  }
  
  static void bbr3_release(struct sock *sk)
-@@ -2133,6 +2194,12 @@ static void bbr3_release(struct sock *sk)
- 	if (!bbr)
- 		return;
- 
-+	/* Unpublish from debugfs registry (no-op if init never listed it). */
-+	spin_lock_bh(&bbr3_dbg_lock);
-+	if (!list_empty(&bbr->dbg_list))
-+		list_del_init(&bbr->dbg_list);
-+	spin_unlock_bh(&bbr3_dbg_lock);
-+
- 	*bbr3_ptr = NULL;
- 	kmem_cache_free(bbr3_cache, bbr);
- }
-@@ -2347,13 +2414,23 @@ static int __init bbr3_register(void)
+@@ -2347,13 +2418,23 @@ static int __init bbr3_register(void)
  		return -ENOMEM;
  
  	ret = tcp_register_congestion_control(&tcp_bbr3_cong_ops);
