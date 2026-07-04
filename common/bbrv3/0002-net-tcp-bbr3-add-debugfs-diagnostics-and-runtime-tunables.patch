@@ -1,4 +1,4 @@
-From e7740bbdc0aa4eefcc6e72b170933c0b41ef898b Mon Sep 17 00:00:00 2001
+From 972e7aacc9459d8792f68be22a4853bbbf9e4bb8 Mon Sep 17 00:00:00 2001
 From: steve <steve0007.xda@gmail.com>
 Date: Sat, 4 Jul 2026 16:56:12 +0200
 Subject: [PATCH] net: tcp: bbr3: add debugfs diagnostics and runtime tunables
@@ -34,11 +34,11 @@ touched and — unlike v1 — no per-connection hot-path code is added.
      sysctl -w net.ipv4.tcp_ecn=1
    and set RTAX_FEATURE_ECN_LOW (1<<5) on the route via netlink.
 ---
- net/ipv4/tcp_bbr3.c | 101 +++++++++++++++++++++++++++++++++++++++-----
- 1 file changed, 91 insertions(+), 10 deletions(-)
+ net/ipv4/tcp_bbr3.c | 98 ++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 88 insertions(+), 10 deletions(-)
 
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
-index 84ff858..1b1be65 100644
+index 84ff858..3758189 100644
 --- a/net/ipv4/tcp_bbr3.c
 +++ b/net/ipv4/tcp_bbr3.c
 @@ -64,6 +64,8 @@
@@ -126,7 +126,7 @@ index 84ff858..1b1be65 100644
  
  /* Exit STARTUP if number of round trips with ECN mark rate above ecn_thresh
   * meets this count.
-@@ -2019,6 +2037,58 @@ out:
+@@ -2019,6 +2037,55 @@ out:
  
  static struct kmem_cache *bbr3_cache __read_mostly;
  
@@ -142,10 +142,8 @@ index 84ff858..1b1be65 100644
 +{
 +	unsigned int slot;
 +
-+	seq_puts(m, "# sport dport mode bw_hi0 bw_hi1 bw_lo inflight_hi inflight_lo min_rtt_us ecn_alpha pacing_gain cwnd_gain full_bw_reached
-+");
-+	seq_puts(m, "# bw unit: packets/uS << 24; gains: BBR_UNIT=256 fractions; ~0 = unset
-+");
++	seq_puts(m, "# sport dport mode bw_hi0 bw_hi1 bw_lo inflight_hi inflight_lo min_rtt_us ecn_alpha pacing_gain cwnd_gain full_bw_reached\n");
++	seq_puts(m, "# bw unit: packets/uS << 24; gains: BBR_UNIT=256 fractions; ~0 = unset\n");
 +	for (slot = 0; slot <= tcp_hashinfo.ehash_mask; slot++) {
 +		struct inet_ehash_bucket *head = &tcp_hashinfo.ehash[slot];
 +		struct hlist_nulls_node *node;
@@ -166,8 +164,7 @@ index 84ff858..1b1be65 100644
 +			if (!bbr || !bbr->initialized)
 +				continue;
 +			inet = inet_sk(sk);
-+			seq_printf(m, "%u %u %u %u %u %u %u %u %u %u %u %u %u
-+",
++			seq_printf(m, "%u %u %u %u %u %u %u %u %u %u %u %u %u\n",
 +				   ntohs(inet->inet_sport), ntohs(inet->inet_dport),
 +				   (u32)bbr->mode,
 +				   bbr->bw_hi[0], bbr->bw_hi[1], bbr->bw_lo,
@@ -185,7 +182,7 @@ index 84ff858..1b1be65 100644
  static void bbr3_init(struct sock *sk)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
-@@ -2115,6 +2185,7 @@ static void bbr3_init(struct sock *sk)
+@@ -2115,6 +2182,7 @@ static void bbr3_init(struct sock *sk)
  
  	if (bbr_can_use_ecn(sk))
  		tp->ecn_flags |= TCP_ECN_ECT_PERMANENT;
@@ -193,7 +190,7 @@ index 84ff858..1b1be65 100644
  }
  
  static void bbr3_release(struct sock *sk)
-@@ -2347,13 +2418,23 @@ static int __init bbr3_register(void)
+@@ -2347,13 +2415,23 @@ static int __init bbr3_register(void)
  		return -ENOMEM;
  
  	ret = tcp_register_congestion_control(&tcp_bbr3_cong_ops);
