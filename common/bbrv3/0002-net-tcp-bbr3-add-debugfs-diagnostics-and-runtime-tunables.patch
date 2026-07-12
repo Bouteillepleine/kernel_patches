@@ -1,6 +1,6 @@
-From 972e7aacc9459d8792f68be22a4853bbbf9e4bb8 Mon Sep 17 00:00:00 2001
-From: steve <steve0007.xda@gmail.com>
-Date: Sat, 4 Jul 2026 16:56:12 +0200
+From 84de740463b4939d502ccf7a47c195fd32427624 Mon Sep 17 00:00:00 2001
+From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
+Date: Sun, 12 Jul 2026 00:00:00 +0000
 Subject: [PATCH] net: tcp: bbr3: add debugfs diagnostics and runtime tunables
  (v2)
 MIME-Version: 1.0
@@ -24,8 +24,7 @@ touched and — unlike v1 — no per-connection hot-path code is added.
    bbr_min_rtt_win_sec, bbr_probe_rtt_mode_ms, bbr_probe_rtt_win_ms,
    bbr_ecn_max_rtt_us, bbr_ecn_factor, bbr_ecn_thresh,
    bbr_loss_thresh, bbr_full_loss_cnt. Fractions are BBR_UNIT=256
-   scaled where noted. (Device-proven booting as part of the 0002a
-   bisect build.)
+   scaled where noted.
 
 3) Mobile ECN enablement: BBRv3's ECN logic ships with datacenter
    tuning (bbr_ecn_max_rtt_us=5000 makes it ineligible at mobile
@@ -33,10 +32,31 @@ touched and — unlike v1 — no per-connection hot-path code is added.
      echo 0 > /sys/module/tcp_bbr3/parameters/bbr_ecn_max_rtt_us
      sysctl -w net.ipv4.tcp_ecn=1
    and set RTAX_FEATURE_ECN_LOW (1<<5) on the route via netlink.
----
- net/ipv4/tcp_bbr3.c | 98 ++++++++++++++++++++++++++++++++++++++++-----
- 1 file changed, 88 insertions(+), 10 deletions(-)
 
+4) Build tcp_bbr3.o with -Os (CFLAGS_tcp_bbr3.o += -Os). The BBRv3
+   object's built-in size pushed the vmlinux Image just past the
+   OnePlus 15 recovery boot-image size limit (0x2700000 = 39 MiB),
+   which overlaps the larger recovery ramdisk and cold-resets before
+   the logo. Size-compiling only tcp_bbr3.o reclaims enough to clear
+   the boundary while keeping every feature config and leaving the
+   rest of the kernel at -O2.
+---
+ net/ipv4/Makefile   |  1 +
+ net/ipv4/tcp_bbr3.c | 98 ++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 89 insertions(+), 10 deletions(-)
+
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index 45324da..cb73741 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -46,6 +46,7 @@ obj-$(CONFIG_INET_UDP_DIAG) += udp_diag.o
+ obj-$(CONFIG_INET_RAW_DIAG) += raw_diag.o
+ obj-$(CONFIG_TCP_CONG_BBR) += tcp_bbr.o
+ obj-$(CONFIG_TCP_CONG_BBR3) += tcp_bbr3.o
++CFLAGS_tcp_bbr3.o += -Os
+ obj-$(CONFIG_TCP_CONG_BIC) += tcp_bic.o
+ obj-$(CONFIG_TCP_CONG_CDG) += tcp_cdg.o
+ obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 index 84ff858..3758189 100644
 --- a/net/ipv4/tcp_bbr3.c
