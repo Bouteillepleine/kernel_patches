@@ -1,6 +1,6 @@
-From 3bd1d66ef1301e713edb7e22436a8bb63051fb34 Mon Sep 17 00:00:00 2001
+From 1ff4d493b6d33fa587e8d28baf14a317a9c39c1f Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
-Date: Mon, 13 Jul 2026 07:30:18 +0200
+Date: Mon, 13 Jul 2026 08:40:08 +0200
 Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
  hardened)
 
@@ -28,35 +28,38 @@ and =m, replaces the per-loss strcmp() and cannot false-match a same-named
 module); READ_ONCE() on sysctl_tcp_min_tso_segs; static tcp_set_tx_in_flight();
 wrap-safe tcp_stamp32_us_delta(); tx.in_flight bounded vs TCPCB_IN_FLIGHT_MAX
 in tcp_shifted_skb() and tcp_fragment().
-v2 (KMI fix): guard the tcp_sock ANDROID_KABI_USE2 slot under
-#ifdef __GENKSYMS__ so genksyms sees the original ANDROID_KABI_RESERVE(1).
-Without the guard, genksyms observed the bbr_tx_in_flight/bbr_lost fields
-and shifted the modversions CRC of tcp_cong_avoid_ai (0x1de02b47 ->
-0x7d175721) and tcp_slow_start (0x95667182 -> 0xbd9ea60e) -- the only
-exported symbols taking struct tcp_sock* directly. That broke modversions
-for the OnePlus vendor module oplus_network_tuning.ko, which is listed in
-modules.load.recovery (but not modules.load): normal boot was unaffected,
-but reboot-to-recovery bootlooped when the module failed to load. Guarding
-the slot restores the stock CRCs so the module loads; the runtime fields
-(and all BBRv3 behaviour) are unchanged.
+v3 (recovery fix): carry the per-ACK in-flight/lost values in struct
+rate_sample (two appended u32 fields, the upstream BBRv3 layout) instead
+of two new tcp_sock fields. android16-6.12 GKI computes symbol CRCs with
+gendwarfksyms (DWARF-based), which ignores #ifdef __GENKSYMS__ guards, so
+the earlier ANDROID_KABI_USE2 fields on tcp_sock were visible to it and
+shifted the modversions CRC of tcp_cong_avoid_ai and tcp_slow_start (the
+only exported symbols taking struct tcp_sock *). That broke the OnePlus
+first-stage vendor module oplus_network_tuning.ko, which is listed in
+modules.load.recovery but not modules.load: normal boot was unaffected,
+reboot-to-recovery bootlooped. rate_sample is the upstream carrier for
+this state and is imported by no recovery module, so tcp_sock returns to
+its stock layout and both CRCs return to stock. The per-ACK reset and the
+loss-hook save/restore are no longer needed (rate_sample is zero-init per
+ACK; the loss hooks use an independent local rate_sample).
 ---
- include/linux/tcp.h            |   13 +-
- include/net/tcp.h              |  151 +-
+ include/linux/tcp.h            |    9 +-
+ include/net/tcp.h              |  153 ++-
  include/uapi/linux/rtnetlink.h |    4 +-
  net/ipv4/Kconfig               |   22 +
  net/ipv4/Makefile              |    1 +
  net/ipv4/tcp.c                 |    1 +
- net/ipv4/tcp_bbr3.c            | 2376 ++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_bbr3.c            | 2360 ++++++++++++++++++++++++++++++++
  net/ipv4/tcp_cong.c            |    1 +
- net/ipv4/tcp_input.c           |   43 +-
+ net/ipv4/tcp_input.c           |   41 +-
  net/ipv4/tcp_minisocks.c       |    2 +
  net/ipv4/tcp_output.c          |   38 +-
  net/ipv4/tcp_rate.c            |   25 +-
- 12 files changed, 2666 insertions(+), 11 deletions(-)
+ 12 files changed, 2646 insertions(+), 11 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr3.c
 
 diff --git a/include/linux/tcp.h b/include/linux/tcp.h
-index 3bbf355..1fc5d62 100644
+index 3bbf355..7ab2c6f 100644
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
 @@ -370,7 +370,14 @@ struct tcp_sock {
@@ -75,20 +78,8 @@ index 3bbf355..1fc5d62 100644
  	u8	thin_lto    : 1,/* Use linear timeouts for thin streams */
  		fastopen_connect:1, /* FASTOPEN_CONNECT sockopt */
  		fastopen_no_cookie:1, /* Allow send/recv SYN+data without a cookie */
-@@ -503,7 +510,11 @@ struct tcp_sock {
- 	struct request_sock __rcu *fastopen_rsk;
- 	struct saved_syn *saved_syn;
- 
-+#ifdef __GENKSYMS__
- 	ANDROID_KABI_RESERVE(1);
-+#else
-+	ANDROID_KABI_USE2(1, u32 bbr_tx_in_flight, u32 bbr_lost);
-+#endif
- 	ANDROID_OEM_DATA(1);
- };
- 
 diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 3255a19..cc6f521 100644
+index 3255a19..e0c48dd 100644
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -376,6 +376,8 @@ static inline void tcp_dec_quickack_mode(struct sock *sk)
@@ -188,7 +179,16 @@ index 3255a19..cc6f521 100644
  
  union tcp_cc_info;
  
-@@ -1252,6 +1301,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
+@@ -1162,6 +1211,8 @@ struct rate_sample {
+ 	bool is_app_limited;	/* is sample from packet with bubble in pipe? */
+ 	bool is_retrans;	/* is sample from retransmission? */
+ 	bool is_ack_delayed;	/* is this (likely) a delayed ACK? */
++	u32  bbr_tx_in_flight;	/* BBRv3: pkts in flight at send of (S)ACKed skb */
++	u32  bbr_lost;		/* BBRv3: pkts lost over interval (read as s32) */
+ };
+ 
+ struct tcp_congestion_ops {
+@@ -1252,6 +1303,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
  }
  #endif
  
@@ -203,7 +203,7 @@ index 3255a19..cc6f521 100644
  static inline bool tcp_ca_needs_ecn(const struct sock *sk)
  {
  	const struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -1283,6 +1340,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
+@@ -1283,6 +1342,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
  	return t1 > t2 || (t1 == t2 && after(seq1, seq2));
  }
  
@@ -225,7 +225,7 @@ index 3255a19..cc6f521 100644
  /* These functions determine how the current flow behaves in respect of SACK
   * handling. SACK is negotiated with the peer, and therefore it can vary
   * between different flows.
-@@ -2447,6 +2519,83 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
+@@ -2447,6 +2521,83 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
  void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb);
  void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb);
  
@@ -402,10 +402,10 @@ index 13c7b6b..e2dd566 100644
  	/* Clean up fastopen related fields */
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 new file mode 100644
-index 0000000..84ff858
+index 0000000..006ec06
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr3.c
-@@ -0,0 +1,2376 @@
+@@ -0,0 +1,2360 @@
 +/* BBR (Bottleneck Bandwidth and RTT) congestion control
 + *
 + * BBR is a model-based congestion control algorithm that aims for low queues,
@@ -1523,10 +1523,10 @@ index 0000000..84ff858
 +	const struct bbr3 *bbr = bbr3_get_priv(sk);
 +	u32 loss_thresh, ecn_thresh;
 +
-+	if ((s32)tcp_sk(sk)->bbr_lost > 0 && tcp_sk(sk)->bbr_tx_in_flight) {
-+		loss_thresh = (u64)tcp_sk(sk)->bbr_tx_in_flight * bbr_param(sk, loss_thresh) >>
++	if ((s32)rs->bbr_lost > 0 && rs->bbr_tx_in_flight) {
++		loss_thresh = (u64)rs->bbr_tx_in_flight * bbr_param(sk, loss_thresh) >>
 +				BBR_SCALE;
-+		if ((s32)tcp_sk(sk)->bbr_lost > loss_thresh) {
++		if ((s32)rs->bbr_lost > loss_thresh) {
 +			return true;
 +		}
 +	}
@@ -1564,27 +1564,27 @@ index 0000000..84ff858
 +	pcount = tcp_skb_pcount(skb);
 +
 +	/* How much data was in flight before this skb? */
-+	inflight_prev = tcp_sk(sk)->bbr_tx_in_flight - pcount;
++	inflight_prev = rs->bbr_tx_in_flight - pcount;
 +	if (inflight_prev < 0) {
 +		WARN_ONCE(tcp_skb_tx_in_flight_is_suspicious(
 +				  pcount,
 +				  TCP_SKB_CB(skb)->sacked,
-+				  tcp_sk(sk)->bbr_tx_in_flight),
++				  rs->bbr_tx_in_flight),
 +			  "tx_in_flight: %u pcount: %u reneg: %u",
-+			  tcp_sk(sk)->bbr_tx_in_flight, pcount, tcp_sk(sk)->is_sack_reneg);
++			  rs->bbr_tx_in_flight, pcount, tcp_sk(sk)->is_sack_reneg);
 +		return ~0U;
 +	}
 +
 +	/* How much inflight data was marked lost before this skb? */
-+	lost_prev = (s32)tcp_sk(sk)->bbr_lost - pcount;
++	lost_prev = (s32)rs->bbr_lost - pcount;
 +	if (WARN_ONCE(lost_prev < 0,
 +		      "cwnd: %u ca: %d out: %u lost: %u pif: %u "
 +		      "tx_in_flight: %u tx.lost: %u tp->lost: %u rs->lost: %d "
 +		      "lost_prev: %d pcount: %d seq: %u end_seq: %u reneg: %u",
 +		      tcp_snd_cwnd(tp), inet_csk(sk)->icsk_ca_state,
 +		      tp->packets_out, tp->lost_out, tcp_packets_in_flight(tp),
-+		      tcp_sk(sk)->bbr_tx_in_flight, TCP_SKB_CB(skb)->tx.lost, tp->lost,
-+		      (s32)tcp_sk(sk)->bbr_lost, lost_prev, pcount,
++		      rs->bbr_tx_in_flight, TCP_SKB_CB(skb)->tx.lost, tp->lost,
++		      (s32)rs->bbr_lost, lost_prev, pcount,
 +		      TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
 +		      tp->is_sack_reneg))
 +		return ~0U;
@@ -1987,7 +1987,7 @@ index 0000000..84ff858
 +	 * samples are not known to be robustly probing bw).
 +	 */
 +	if (!rs->is_app_limited) {
-+		bbr->inflight_hi = max_t(u32, tcp_sk(sk)->bbr_tx_in_flight,
++		bbr->inflight_hi = max_t(u32, rs->bbr_tx_in_flight,
 +					 (u64)bbr_target_inflight(sk) *
 +					 (BBR_UNIT - beta) >> BBR_SCALE);
 +	}
@@ -2044,8 +2044,8 @@ index 0000000..84ff858
 +		/* To be resilient to random loss, we must raise bw/inflight_hi
 +		 * if we observe in any phase that a higher level is safe.
 +		 */
-+		if (tcp_sk(sk)->bbr_tx_in_flight > bbr->inflight_hi) {
-+			bbr->inflight_hi = tcp_sk(sk)->bbr_tx_in_flight;
++		if (rs->bbr_tx_in_flight > bbr->inflight_hi) {
++			bbr->inflight_hi = rs->bbr_tx_in_flight;
 +		}
 +
 +		if (bbr->mode == BBR_PROBE_BW &&
@@ -2421,7 +2421,7 @@ index 0000000..84ff858
 +out:
 +	bbr_advance_latest_delivery_signals(sk, rs, &ctx);
 +	bbr->prev_ca_state = inet_csk(sk)->icsk_ca_state;
-+	bbr->loss_in_cycle |= (s32)tcp_sk(sk)->bbr_lost > 0;
++	bbr->loss_in_cycle |= (s32)rs->bbr_lost > 0;
 +	bbr->ecn_in_cycle  |= rs->delivered_ce > 0;
 +}
 +
@@ -2568,7 +2568,6 @@ index 0000000..84ff858
 +	struct bbr3 *bbr = bbr3_get_priv(sk);
 +	struct tcp_skb_cb *scb = TCP_SKB_CB(skb);
 +	struct rate_sample rs = {};
-+	u32 prior_lost, prior_tx_in_flight;
 +
 +	if (!bbr || !bbr->initialized)
 +		return;
@@ -2583,24 +2582,16 @@ index 0000000..84ff858
 +	 * estimates what happened in the flight leading up to this lost skb,
 +	 * then see if the loss rate went too high, and if so at which packet.
 +	 *
-+	 * The tcp_sock carriers stand in for upstream's local rate_sample
-+	 * fields (frozen for KMI). tcp_ack() uses the same carriers for the
-+	 * per-ACK rate sample between tcp_rate_skb_delivered() and
-+	 * tcp_rate_gen(), and this hook runs in between via
-+	 * tcp_fastretrans_alert() — so save and restore them, or the per-ACK
-+	 * sample seen by bbr3_main() is corrupted.
++	 * in-flight/lost ride this local rate_sample (upstream layout),
++	 * independent of the per-ACK sample bbr3_main() consumes.
 +	 */
-+	prior_lost = tp->bbr_lost;
-+	prior_tx_in_flight = tp->bbr_tx_in_flight;
-+	tcp_sk(sk)->bbr_tx_in_flight = scb->tx.in_flight;
-+	tcp_sk(sk)->bbr_lost = tp->lost - scb->tx.lost;
++	rs.bbr_tx_in_flight = scb->tx.in_flight;
++	rs.bbr_lost = tp->lost - scb->tx.lost;
 +	rs.is_app_limited = scb->tx.is_app_limited;
 +	if (bbr_is_inflight_too_high(sk, &rs)) {
-+		tcp_sk(sk)->bbr_tx_in_flight = bbr_inflight_hi_from_lost_skb(sk, &rs, skb);
++		rs.bbr_tx_in_flight = bbr_inflight_hi_from_lost_skb(sk, &rs, skb);
 +		bbr_handle_inflight_too_high(sk, &rs);
 +	}
-+	tp->bbr_lost = prior_lost;
-+	tp->bbr_tx_in_flight = prior_tx_in_flight;
 +}
 +
 +static void bbr_run_loss_probe_recovery(struct sock *sk)
@@ -2608,7 +2599,6 @@ index 0000000..84ff858
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr3 *bbr = bbr3_get_priv(sk);
 +	struct rate_sample rs = {0};
-+	u32 prior_lost, prior_tx_in_flight;
 +
 +	bbr_note_loss(sk);
 +
@@ -2618,20 +2608,14 @@ index 0000000..84ff858
 +	 * estimates what happened in the flight leading up to this
 +	 * loss, then see if the loss rate went too high.
 +	 *
-+	 * Save/restore the tcp_sock carriers: this runs from
-+	 * tcp_process_tlp_ack() between tcp_rate_skb_delivered() and
-+	 * tcp_rate_gen(), which share the carriers for the per-ACK
-+	 * rate sample (see bbr3_skb_marked_lost()).
++	 * in-flight/lost ride this local rate_sample (upstream layout);
++	 * see bbr3_skb_marked_lost().
 +	 */
-+	prior_lost = tp->bbr_lost;
-+	prior_tx_in_flight = tp->bbr_tx_in_flight;
-+	tcp_sk(sk)->bbr_lost = 1;	/* TLP probe repaired loss of a single segment */
-+	tcp_sk(sk)->bbr_tx_in_flight = bbr->inflight_latest + tcp_sk(sk)->bbr_lost;
++	rs.bbr_lost = 1;	/* TLP probe repaired loss of a single segment */
++	rs.bbr_tx_in_flight = bbr->inflight_latest + rs.bbr_lost;
 +	rs.is_app_limited = tp->tlp_orig_data_app_limited;
 +	if (bbr_is_inflight_too_high(sk, &rs))
 +		bbr_handle_inflight_too_high(sk, &rs);
-+	tp->bbr_lost = prior_lost;
-+	tp->bbr_tx_in_flight = prior_tx_in_flight;
 +}
 +
 +/* Revert short-term model if current loss recovery event was spurious. */
@@ -2795,7 +2779,7 @@ index 0306d25..28f581c 100644
  		icsk->icsk_ca_ops->init(sk);
  	if (tcp_ca_needs_ecn(sk))
 diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index 5158676..e5da50b 100644
+index 5158676..e8b20ed 100644
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
 @@ -376,7 +376,7 @@ static void __tcp_ecn_check_ce(struct sock *sk, const struct sk_buff *skb)
@@ -2874,20 +2858,18 @@ index 5158676..e5da50b 100644
  	}
  }
  
-@@ -3999,6 +4028,12 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+@@ -3999,6 +4028,10 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
  
  	prior_fack = tcp_is_sack(tp) ? tcp_highest_sack_seq(tp) : tp->snd_una;
  	rs.prior_in_flight = tcp_packets_in_flight(tp);
 +	tcp_rate_check_app_limited(sk);
-+	/* BBRv3 KMI-safe carriers: reset per-ACK (mirror stack rate_sample). */
-+	tp->bbr_tx_in_flight = 0;
-+	tp->bbr_lost = 0;
++	/* BBRv3: in-flight/lost now ride rate_sample; reset only the bit-carriers. */
 +	tp->bbr_is_ece = 0;
 +	tp->bbr_is_acking_tlp_retrans_seq = 0;
  
  	/* ts_recent update must be made after we are sure that the packet
  	 * is in window.
-@@ -4088,6 +4123,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+@@ -4088,6 +4121,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
  	delivered = tcp_newly_delivered(sk, delivered, flag);
  	lost = tp->lost - lost;			/* freshly marked lost */
  	rs.is_ack_delayed = !!(flag & FLAG_ACK_MAYBE_DELAYED);
@@ -2895,7 +2877,7 @@ index 5158676..e5da50b 100644
  	tcp_rate_gen(sk, delivered, lost, is_sack_reneg, sack_state.rate);
  	tcp_cong_control(sk, ack, delivered, flag, sack_state.rate);
  	tcp_xmit_recovery(sk, rexmit);
-@@ -5788,13 +5824,14 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+@@ -5788,13 +5822,14 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
@@ -3010,7 +2992,7 @@ index d75c1cd..469c2bf 100644
  		goto rearm_timer;
  
 diff --git a/net/ipv4/tcp_rate.c b/net/ipv4/tcp_rate.c
-index a8f6d9d..ed43f07 100644
+index a8f6d9d..52524a4 100644
 --- a/net/ipv4/tcp_rate.c
 +++ b/net/ipv4/tcp_rate.c
 @@ -34,6 +34,24 @@
@@ -3052,13 +3034,13 @@ index a8f6d9d..ed43f07 100644
  	if (!rs->prior_delivered ||
  	    tcp_skb_sent_after(tx_tstamp, tp->first_tx_mstamp,
  			       scb->end_seq, rs->last_end_seq)) {
-+		tp->bbr_lost = scb->tx.lost;
++		rs->bbr_lost = scb->tx.lost;
  		rs->prior_delivered_ce  = scb->tx.delivered_ce;
  		rs->prior_delivered  = scb->tx.delivered;
  		rs->prior_mstamp     = scb->tx.delivered_mstamp;
  		rs->is_app_limited   = scb->tx.is_app_limited;
  		rs->is_retrans	     = scb->sacked & TCPCB_RETRANS;
-+		tp->bbr_tx_in_flight = scb->tx.in_flight;
++		rs->bbr_tx_in_flight = scb->tx.in_flight;
  		rs->last_end_seq     = scb->end_seq;
  
  		/* Record send time of most recently ACKed packet: */
@@ -3073,7 +3055,7 @@ index a8f6d9d..ed43f07 100644
  		return;
  	}
  	rs->delivered   = tp->delivered - rs->prior_delivered;
-+	tp->bbr_lost = tp->lost - tp->bbr_lost;
++	rs->bbr_lost = tp->lost - rs->bbr_lost;
  
  	rs->delivered_ce = tp->delivered_ce - rs->prior_delivered_ce;
  	/* delivered_ce occupies less than 32 bits in the skb control block */
