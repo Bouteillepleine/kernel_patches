@@ -1,4 +1,4 @@
-From 25210ccf48a14a3f4f7c08a2d00c6f88506946e2 Mon Sep 17 00:00:00 2001
+From 8635d7ae65cb51ebea8143f30e7ba0d1057a65ba Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
 Date: Mon, 13 Jul 2026 14:11:25 +0200
 Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
@@ -49,21 +49,27 @@ CA_EVENT_TLP_RECOVERY on TCP_CONG_HAS_LOSS_HOOK so non-BBRv3 CCs never see
 the standalone event value; document the u32 tcp_skb_cb timestamp wrap
 assumption and the bbr3_get_priv() NULL invariant; expand the one-line
 bbr3_ctx_if_active() context-write blocks to normal kernel style.
+
+v7 (review follow-up, no ABI/CRC change): make tcp_ca_wants_ce_events()
+NULL-safe on icsk_ca_ops (was the last icsk_ca_ops deref left unguarded
+after the ACK-path fix); order the TCP_ECN_ECT_PERMANENT setup before
+bbr->initialized = 1 so "publish last" holds with no post-publish mutation
+of BBR-relevant state.
 ---
- include/net/tcp.h              |  177 ++-
+ include/net/tcp.h              |  178 ++-
  include/uapi/linux/rtnetlink.h |    4 +-
  net/ipv4/Kconfig               |   22 +
  net/ipv4/Makefile              |    1 +
- net/ipv4/tcp_bbr3.c            | 2376 ++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_bbr3.c            | 2377 ++++++++++++++++++++++++++++++++
  net/ipv4/tcp_input.c           |   73 +-
  net/ipv4/tcp_minisocks.c       |    2 +
  net/ipv4/tcp_output.c          |   43 +-
  net/ipv4/tcp_rate.c            |   40 +-
- 9 files changed, 2728 insertions(+), 10 deletions(-)
+ 9 files changed, 2730 insertions(+), 10 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr3.c
 
 diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 3255a19..41b230a 100644
+index 3255a19..4bde922 100644
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -376,6 +376,8 @@ static inline void tcp_dec_quickack_mode(struct sock *sk)
@@ -173,7 +179,7 @@ index 3255a19..41b230a 100644
  
  union tcp_cc_info;
  
-@@ -1252,6 +1311,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
+@@ -1252,6 +1311,15 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
  }
  #endif
  
@@ -181,14 +187,15 @@ index 3255a19..41b230a 100644
 +{
 +	const struct inet_connection_sock *icsk = inet_csk(sk);
 +
-+	return icsk->icsk_ca_ops->flags & (TCP_CONG_NEEDS_ECN |
-+					   TCP_CONG_WANTS_CE_EVENTS);
++	return icsk->icsk_ca_ops &&
++	       (icsk->icsk_ca_ops->flags & (TCP_CONG_NEEDS_ECN |
++					    TCP_CONG_WANTS_CE_EVENTS));
 +}
 +
  static inline bool tcp_ca_needs_ecn(const struct sock *sk)
  {
  	const struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -1283,6 +1350,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
+@@ -1283,6 +1351,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
  	return t1 > t2 || (t1 == t2 && after(seq1, seq2));
  }
  
@@ -210,7 +217,7 @@ index 3255a19..41b230a 100644
  /* These functions determine how the current flow behaves in respect of SACK
   * handling. SACK is negotiated with the peer, and therefore it can vary
   * between different flows.
-@@ -2447,6 +2529,99 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
+@@ -2447,6 +2530,99 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
  void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb);
  void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb);
  
@@ -391,10 +398,10 @@ index ec36d2e..45324da 100644
  obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 new file mode 100644
-index 0000000..c2bf5fa
+index 0000000..bdb02f9
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr3.c
-@@ -0,0 +1,2376 @@
+@@ -0,0 +1,2377 @@
 +/* BBR (Bottleneck Bandwidth and RTT) congestion control
 + *
 + * BBR is a model-based congestion control algorithm that aims for low queues,
@@ -2511,13 +2518,14 @@ index 0000000..c2bf5fa
 +	bbr->alpha_last_delivered_ce = 0;
 +	bbr->plb.pause_until = 0;
 +
-+	/* Publish last: the BBRv3 context is fully initialized here (no ACK/loss
-+	 * callback runs on this socket during .init); the ecn_flags tweak below
-+	 * only touches tcp_sock. */
-+	bbr->initialized = 1;
-+
 +	if (bbr_can_use_ecn(sk))
 +		tp->ecn_flags |= TCP_ECN_ECT_PERMANENT;
++
++	/* Publish last: the BBRv3 context and the related TCP ECN state are
++	 * fully initialized at this point. No ACK/loss callback runs on this
++	 * socket during .init, but mark the context ready only after every
++	 * field it exposes has been set. */
++	bbr->initialized = 1;
 +}
 +
 +static void bbr3_release(struct sock *sk)
