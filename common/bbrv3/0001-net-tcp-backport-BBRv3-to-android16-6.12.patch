@@ -1,4 +1,4 @@
-From 8b3fbf9f39d9f2b081c9f22a8ffd51016c3a5390 Mon Sep 17 00:00:00 2001
+From 8676422544213d3cd4e9652f1520654b18bc6e2d Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
 Date: Mon, 13 Jul 2026 14:11:25 +0200
 Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
@@ -48,12 +48,12 @@ hooks keep the save/restore since the context is per-connection shared.
  include/uapi/linux/rtnetlink.h |    4 +-
  net/ipv4/Kconfig               |   22 +
  net/ipv4/Makefile              |    1 +
- net/ipv4/tcp_bbr3.c            | 2367 ++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_bbr3.c            | 2368 ++++++++++++++++++++++++++++++++
  net/ipv4/tcp_input.c           |   40 +-
  net/ipv4/tcp_minisocks.c       |    2 +
  net/ipv4/tcp_output.c          |   38 +-
  net/ipv4/tcp_rate.c            |   25 +-
- 9 files changed, 2659 insertions(+), 10 deletions(-)
+ 9 files changed, 2660 insertions(+), 10 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr3.c
 
 diff --git a/include/net/tcp.h b/include/net/tcp.h
@@ -378,10 +378,10 @@ index ec36d2e..45324da 100644
  obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 new file mode 100644
-index 0000000..7a29248
+index 0000000..2d41520
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr3.c
-@@ -0,0 +1,2367 @@
+@@ -0,0 +1,2368 @@
 +/* BBR (Bottleneck Bandwidth and RTT) congestion control
 + *
 + * BBR is a model-based congestion control algorithm that aims for low queues,
@@ -1531,6 +1531,7 @@ index 0000000..7a29248
 +					  const struct sk_buff *skb)
 +{
 +	const struct tcp_sock *tp = tcp_sk(sk);
++	struct bbr3 *bbr = bbr3_get_priv(sk);
 +	u32 loss_thresh  = bbr_param(sk, loss_thresh);
 +	u32 pcount, divisor, inflight_hi;
 +	s32 inflight_prev, lost_prev;
