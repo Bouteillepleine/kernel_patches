@@ -1,4 +1,4 @@
-From 5fd1344b34b393e691fce77a4ae4aaa8f8bfaf9f Mon Sep 17 00:00:00 2001
+From 25210ccf48a14a3f4f7c08a2d00c6f88506946e2 Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
 Date: Mon, 13 Jul 2026 14:11:25 +0200
 Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
@@ -6,15 +6,28 @@ Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
 
 Backport BBRv3 congestion control to the Android 16 / 6.12 GKI kernel.
 
-KMI is preserved by avoiding changes to exported TCP operation structures
-and carrying BBRv3 state through Android KABI reserve space and layout-
-preserving tcp_skb_cb unions. bbr_tx_in_flight/bbr_lost use ANDROID_KABI_USE2
-on tcp_sock's reserved slot; transient per-ACK state uses previously unused
-tcp_sock bits. The loss-notification path uses an O(1) congestion-control
-flag (TCP_CONG_HAS_LOSS_HOOK) rather than extending struct tcp_congestion_ops,
-and CA_EVENT_TLP_RECOVERY is a standalone constant rather than an enum
+KMI is preserved by keeping every CRC-versioned type byte-identical to
+stock. android16-6.12 GKI versions symbol CRCs with gendwarfksyms, which
+deep-expands pointer chains: a field added to struct tcp_sock shifts the two
+exported symbols taking struct tcp_sock* (tcp_cong_avoid_ai / tcp_slow_start,
+imported by the OnePlus vendor module oplus_network_tuning.ko that recovery
+loads via modules.load.recovery) -> reboot-to-recovery bootloop; a field on
+struct rate_sample is worse still (reachable via tcp_sock->icsk_ca_ops->
+cong_control->rate_sample, it rippled to ~718 exported symbols). So struct
+tcp_sock AND struct rate_sample are left exactly as stock, and ALL BBRv3
+per-ACK / per-connection carriers (bbr_tx_in_flight, bbr_lost, bbr_is_ece,
+bbr_is_acking_tlp_retrans_seq, tlp_orig_data_app_limited) live in the private
+struct bbr3 -- the heap object behind icsk_ca_priv, which gendwarfksyms treats
+as an opaque u64[] and never traverses, so adding fields to it is zero CRC
+impact. fast_ack_mode becomes a TCP_CONG_WANTS_FAST_ACK ops flag. The
+loss-notification path uses an O(1) congestion-control flag
+(TCP_CONG_HAS_LOSS_HOOK) rather than extending struct tcp_congestion_ops, and
+CA_EVENT_TLP_RECOVERY is a standalone constant rather than an enum
 tcp_ca_event extension. Native 6.12 TCP PLB is reused. RTAX_FEATURE_ECN_LOW
 reuses an unused route-feature bit (1<<5) and changes no structure layout.
+Generic producers in tcp_rate.c / tcp_input.c / tcp_output.c write the context
+via bbr3_ctx_if_active(sk) (gated on the loss-hook flag); the loss hooks keep
+the save/restore since the context is per-connection shared.
 
 Hardening: memcg-accounted kmem_cache-backed bbr3 allocation (SLAB_ACCOUNT |
 SLAB_HWCACHE_ALIGN) + NULL-safe icsk_ca_priv pointer, with the atomic alloc
@@ -28,36 +41,29 @@ and =m, replaces the per-loss strcmp() and cannot false-match a same-named
 module); READ_ONCE() on sysctl_tcp_min_tso_segs; static tcp_set_tx_in_flight();
 wrap-safe tcp_stamp32_us_delta(); tx.in_flight bounded vs TCPCB_IN_FLIGHT_MAX
 in tcp_shifted_skb() and tcp_fragment().
-v5 (recovery fix, final): keep struct tcp_sock AND struct rate_sample
-byte-identical to stock. android16-6.12 GKI versions CRCs with gendwarfksyms,
-which deep-expands pointer chains: a field on tcp_sock shifts the 2 exported
-syms taking struct tcp_sock* (tcp_cong_avoid_ai/tcp_slow_start, imported by
-the OnePlus vendor module oplus_network_tuning.ko loaded via
-modules.load.recovery) -> reboot-to-recovery bootloop; and a field on
-rate_sample is even worse (reachable via tcp_sock->icsk_ca_ops->cong_control->
-rate_sample, it rippled to ~718 symbols). So ALL BBRv3 per-ACK/per-connection
-carriers (bbr_tx_in_flight, bbr_lost, bbr_is_ece, bbr_is_acking_tlp_retrans_seq,
-tlp_orig_data_app_limited) now live in the private struct bbr3 (the heap object
-behind icsk_ca_priv, which gendwarfksyms treats as an opaque u64[] and never
-traverses -> zero CRC impact). fast_ack_mode becomes a TCP_CONG_WANTS_FAST_ACK
-ops flag. Generic producers in tcp_rate.c/tcp_input.c/tcp_output.c write the
-context via bbr3_ctx_if_active(sk) (gated on the loss-hook flag); the loss
-hooks keep the save/restore since the context is per-connection shared.
+
+Hardening (no ABI/behaviour change): set bbr->initialized last in
+bbr3_init(); WRITE_ONCE/READ_ONCE the skb_marked_lost hook pointer with a
+module-lifetime note (CC .owner refcount keeps the text mapped); gate
+CA_EVENT_TLP_RECOVERY on TCP_CONG_HAS_LOSS_HOOK so non-BBRv3 CCs never see
+the standalone event value; document the u32 tcp_skb_cb timestamp wrap
+assumption and the bbr3_get_priv() NULL invariant; expand the one-line
+bbr3_ctx_if_active() context-write blocks to normal kernel style.
 ---
- include/net/tcp.h              |  171 ++-
+ include/net/tcp.h              |  177 ++-
  include/uapi/linux/rtnetlink.h |    4 +-
  net/ipv4/Kconfig               |   22 +
  net/ipv4/Makefile              |    1 +
- net/ipv4/tcp_bbr3.c            | 2368 ++++++++++++++++++++++++++++++++
- net/ipv4/tcp_input.c           |   41 +-
+ net/ipv4/tcp_bbr3.c            | 2376 ++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_input.c           |   73 +-
  net/ipv4/tcp_minisocks.c       |    2 +
- net/ipv4/tcp_output.c          |   38 +-
- net/ipv4/tcp_rate.c            |   25 +-
- 9 files changed, 2662 insertions(+), 10 deletions(-)
+ net/ipv4/tcp_output.c          |   43 +-
+ net/ipv4/tcp_rate.c            |   40 +-
+ 9 files changed, 2728 insertions(+), 10 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr3.c
 
 diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 3255a19..48c460d 100644
+index 3255a19..41b230a 100644
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -376,6 +376,8 @@ static inline void tcp_dec_quickack_mode(struct sock *sk)
@@ -85,10 +91,16 @@ index 3255a19..48c460d 100644
  /* Compute the actual rto_min value */
  static inline u32 tcp_rto_min(const struct sock *sk)
  {
-@@ -901,6 +912,11 @@ static inline u32 tcp_stamp_us_delta(u64 t1, u64 t0)
+@@ -901,6 +912,17 @@ static inline u32 tcp_stamp_us_delta(u64 t1, u64 t0)
  	return max_t(s64, t1 - t0, 0);
  }
  
++/*
++ * BBRv3 backport stores skb tx timestamps as the low 32 bits of the usec
++ * clock to keep struct tcp_skb_cb layout frozen for KMI. This wrap-safe delta
++ * is correct for intervals below 2^31 usec (~35 min), far above any
++ * ACK/rate-sample interval.
++ */
 +static inline u32 tcp_stamp32_us_delta(u32 t1, u32 t0)
 +{
 +	return max_t(s32, t1 - t0, 0);
@@ -97,7 +109,7 @@ index 3255a19..48c460d 100644
  /* provide the departure time in us unit */
  static inline u64 tcp_skb_timestamp_us(const struct sk_buff *skb)
  {
-@@ -989,10 +1005,33 @@ struct tcp_skb_cb {
+@@ -989,10 +1011,33 @@ struct tcp_skb_cb {
  			      unused:11;
  			/* pkts S/ACKed so far upon tx of skb, incl retrans: */
  			__u32 delivered;
@@ -131,7 +143,7 @@ index 3255a19..48c460d 100644
  		} tx;   /* only used for outgoing skbs */
  		union {
  			struct inet_skb_parm	h4;
-@@ -1107,6 +1146,9 @@ enum tcp_ca_event {
+@@ -1107,6 +1152,9 @@ enum tcp_ca_event {
  	CA_EVENT_ECN_IS_CE,	/* received CE marked IP packet */
  };
  
@@ -141,7 +153,7 @@ index 3255a19..48c460d 100644
  /* Information about inbound ACK, passed to cong_ops->in_ack_event() */
  enum tcp_ca_ack_event_flags {
  	CA_ACK_SLOWPATH		= (1 << 0),	/* In slow path processing */
-@@ -1127,7 +1169,18 @@ enum tcp_ca_ack_event_flags {
+@@ -1127,7 +1175,18 @@ enum tcp_ca_ack_event_flags {
  #define TCP_CONG_NON_RESTRICTED 0x1
  /* Requires ECN/ECT set on all packets */
  #define TCP_CONG_NEEDS_ECN	0x2
@@ -161,7 +173,7 @@ index 3255a19..48c460d 100644
  
  union tcp_cc_info;
  
-@@ -1252,6 +1305,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
+@@ -1252,6 +1311,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
  }
  #endif
  
@@ -176,7 +188,7 @@ index 3255a19..48c460d 100644
  static inline bool tcp_ca_needs_ecn(const struct sock *sk)
  {
  	const struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -1283,6 +1344,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
+@@ -1283,6 +1350,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
  	return t1 > t2 || (t1 == t2 && after(seq1, seq2));
  }
  
@@ -198,7 +210,7 @@ index 3255a19..48c460d 100644
  /* These functions determine how the current flow behaves in respect of SACK
   * handling. SACK is negotiated with the peer, and therefore it can vary
   * between different flows.
-@@ -2447,6 +2523,99 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
+@@ -2447,6 +2529,99 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
  void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb);
  void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb);
  
@@ -379,10 +391,10 @@ index ec36d2e..45324da 100644
  obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 new file mode 100644
-index 0000000..e4c905b
+index 0000000..c2bf5fa
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr3.c
-@@ -0,0 +1,2368 @@
+@@ -0,0 +1,2376 @@
 +/* BBR (Bottleneck Bandwidth and RTT) congestion control
 + *
 + * BBR is a model-based congestion control algorithm that aims for low queues,
@@ -669,9 +681,14 @@ index 0000000..e4c905b
 +
 +static void bbr3_skb_marked_lost(struct sock *sk, const struct sk_buff *skb);
 +
++/*
++ * Return the BBRv3 context from slot 0 of icsk_ca_priv. May be NULL before
++ * bbr3_init() or after a failed allocation; top-level CC callbacks rely on the
++ * non-NULL + ->initialized invariant, other callers must NULL-check (see
++ * bbr3_ctx_if_active()).
++ */
 +static inline struct bbr3 *bbr3_get_priv(const struct sock *sk)
 +{
-+	/* Read the address value out of slot 0 of the 104-byte array space */
 +	return *(struct bbr3 **)inet_csk_ca(sk);
 +}
 +
@@ -2423,9 +2440,7 @@ index 0000000..e4c905b
 +
 +	*bbr3_ptr = bbr;
 +
-+	bbr->skb_marked_lost = bbr3_skb_marked_lost;
-+
-+	bbr->initialized = 1;
++	WRITE_ONCE(bbr->skb_marked_lost, bbr3_skb_marked_lost);
 +
 +	bbr->init_cwnd = min(0x7FU, tcp_snd_cwnd(tp));
 +	bbr->prior_cwnd = tp->prior_cwnd;
@@ -2495,6 +2510,11 @@ index 0000000..e4c905b
 +	bbr->alpha_last_delivered = 0;
 +	bbr->alpha_last_delivered_ce = 0;
 +	bbr->plb.pause_until = 0;
++
++	/* Publish last: the BBRv3 context is fully initialized here (no ACK/loss
++	 * callback runs on this socket during .init); the ecn_flags tweak below
++	 * only touches tcp_sock. */
++	bbr->initialized = 1;
 +
 +	if (bbr_can_use_ecn(sk))
 +		tp->ecn_flags |= TCP_ECN_ECT_PERMANENT;
@@ -2752,7 +2772,7 @@ index 0000000..e4c905b
 +MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
 +MODULE_VERSION(__stringify(BBR_VERSION));
 diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index 5158676..b4a84d2 100644
+index 5158676..1dc4641 100644
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
 @@ -376,7 +376,7 @@ static void __tcp_ecn_check_ce(struct sock *sk, const struct sk_buff *skb)
@@ -2773,7 +2793,7 @@ index 5158676..b4a84d2 100644
  			tcp_ca_event(sk, CA_EVENT_ECN_NO_CE);
  		tp->ecn_flags |= TCP_ECN_SEEN;
  		break;
-@@ -1140,7 +1140,17 @@ static void tcp_verify_retransmit_hint(struct tcp_sock *tp, struct sk_buff *skb)
+@@ -1140,7 +1140,27 @@ static void tcp_verify_retransmit_hint(struct tcp_sock *tp, struct sk_buff *skb)
   */
  static void tcp_notify_skb_loss_event(struct tcp_sock *tp, const struct sk_buff *skb)
  {
@@ -2783,15 +2803,25 @@ index 5158676..b4a84d2 100644
 +
  	tp->lost += tcp_skb_pcount(skb);
 +
++	/*
++	 * bbr3->skb_marked_lost points into tcp_bbr3 text (module when =m). The
++	 * TCP CC framework holds a reference on icsk_ca_ops->owner (THIS_MODULE)
++	 * for every socket that has this CC selected, so the text cannot be
++	 * unloaded while this socket still resolves the hook. READ_ONCE pairs
++	 * with the WRITE_ONCE in bbr3_init().
++	 */
 +	if (ca_ops && (ca_ops->flags & TCP_CONG_HAS_LOSS_HOOK)) {
++		void (*hook)(struct sock *, const struct sk_buff *);
++
 +		bbr3 = *(struct bbr3 **)inet_csk_ca(sk);
-+		if (bbr3 && bbr3->skb_marked_lost)
-+			bbr3->skb_marked_lost(sk, skb);
++		hook = bbr3 ? READ_ONCE(bbr3->skb_marked_lost) : NULL;
++		if (hook)
++			hook(sk, skb);
 +	}
  }
  
  void tcp_mark_skb_lost(struct sock *sk, struct sk_buff *skb)
-@@ -1512,6 +1522,19 @@ static bool tcp_shifted_skb(struct sock *sk, struct sk_buff *prev,
+@@ -1512,6 +1532,19 @@ static bool tcp_shifted_skb(struct sock *sk, struct sk_buff *prev,
  	WARN_ON_ONCE(tcp_skb_pcount(skb) < pcount);
  	tcp_skb_pcount_add(skb, -pcount);
  
@@ -2811,15 +2841,19 @@ index 5158676..b4a84d2 100644
  	/* When we're adding to gso_segs == 1, gso_size will be zero,
  	 * in theory this shouldn't be necessary but as long as DSACK
  	 * code can come after this skb later on it's better to keep
-@@ -3870,6 +3893,7 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
+@@ -3870,6 +3903,11 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
  		/* ACK advances: there was a loss, so reduce cwnd. Reset
  		 * tlp_high_seq in tcp_init_cwnd_reduction()
  		 */
-+		tcp_ca_event(sk, CA_EVENT_TLP_RECOVERY);
++		/* CA_EVENT_TLP_RECOVERY is a BBRv3-specific standalone value; only
++		 * deliver it to CCs that opt into the private loss hook. */
++		if (inet_csk(sk)->icsk_ca_ops &&
++		    (inet_csk(sk)->icsk_ca_ops->flags & TCP_CONG_HAS_LOSS_HOOK))
++			tcp_ca_event(sk, CA_EVENT_TLP_RECOVERY);
  		tcp_init_cwnd_reduction(sk);
  		tcp_set_ca_state(sk, TCP_CA_CWR);
  		tcp_end_cwnd_reduction(sk);
-@@ -3880,6 +3904,11 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
+@@ -3880,6 +3918,16 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
  			     FLAG_NOT_DUP | FLAG_DATA_SACKED))) {
  		/* Pure dupack: original and TLP probe arrived; no loss */
  		tp->tlp_high_seq = 0;
@@ -2827,29 +2861,47 @@ index 5158676..b4a84d2 100644
 +		/* This ACK matches a TLP retransmit. We cannot yet tell if
 +		 * this ACK is for the original or the TLP retransmit.
 +		 */
-+		{ struct bbr3 *b = bbr3_ctx_if_active(sk); if (b) b->bbr_is_acking_tlp_retrans_seq = 1; }
++		{
++			struct bbr3 *b = bbr3_ctx_if_active(sk);
++
++			if (b)
++				b->bbr_is_acking_tlp_retrans_seq = 1;
++		}
  	}
  }
  
-@@ -3999,6 +4028,9 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+@@ -3999,6 +4047,17 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
  
  	prior_fack = tcp_is_sack(tp) ? tcp_highest_sack_seq(tp) : tp->snd_una;
  	rs.prior_in_flight = tcp_packets_in_flight(tp);
 +	tcp_rate_check_app_limited(sk);
-+	{ struct bbr3 *b = bbr3_ctx_if_active(sk);
-+	  if (b) { b->bbr_tx_in_flight = 0; b->bbr_lost = 0; b->bbr_is_ece = 0; b->bbr_is_acking_tlp_retrans_seq = 0; } }
++	{
++		struct bbr3 *b = bbr3_ctx_if_active(sk);
++
++		if (b) {
++			b->bbr_tx_in_flight = 0;
++			b->bbr_lost = 0;
++			b->bbr_is_ece = 0;
++			b->bbr_is_acking_tlp_retrans_seq = 0;
++		}
++	}
  
  	/* ts_recent update must be made after we are sure that the packet
  	 * is in window.
-@@ -4088,6 +4120,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+@@ -4088,6 +4147,12 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
  	delivered = tcp_newly_delivered(sk, delivered, flag);
  	lost = tp->lost - lost;			/* freshly marked lost */
  	rs.is_ack_delayed = !!(flag & FLAG_ACK_MAYBE_DELAYED);
-+	{ struct bbr3 *b = bbr3_ctx_if_active(sk); if (b) b->bbr_is_ece = !!(flag & FLAG_ECE); }
++	{
++		struct bbr3 *b = bbr3_ctx_if_active(sk);
++
++		if (b)
++			b->bbr_is_ece = !!(flag & FLAG_ECE);
++	}
  	tcp_rate_gen(sk, delivered, lost, is_sack_reneg, sack_state.rate);
  	tcp_cong_control(sk, ack, delivered, flag, sack_state.rate);
  	tcp_xmit_recovery(sk, rexmit);
-@@ -5788,13 +5821,15 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+@@ -5788,13 +5853,15 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
@@ -2880,7 +2932,7 @@ index adddfb7..806a530 100644
  		const struct tcp_congestion_ops *ca;
  
 diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index d75c1cd..0437fbd 100644
+index d75c1cd..09536f6 100644
 --- a/net/ipv4/tcp_output.c
 +++ b/net/ipv4/tcp_output.c
 @@ -346,9 +346,9 @@ static void tcp_ecn_send_syn(struct sock *sk, struct sk_buff *skb)
@@ -2956,16 +3008,21 @@ index d75c1cd..0437fbd 100644
  	}
  
  	/* Link BUFF into the send queue. */
-@@ -3002,6 +3031,7 @@ void tcp_send_loss_probe(struct sock *sk)
+@@ -3002,6 +3031,12 @@ void tcp_send_loss_probe(struct sock *sk)
  	if (WARN_ON(!skb || !tcp_skb_pcount(skb)))
  		goto rearm_timer;
  
-+	{ struct bbr3 *b = bbr3_ctx_if_active(sk); if (b) b->tlp_orig_data_app_limited = TCP_SKB_CB(skb)->tx.is_app_limited; }
++	{
++		struct bbr3 *b = bbr3_ctx_if_active(sk);
++
++		if (b)
++			b->tlp_orig_data_app_limited = TCP_SKB_CB(skb)->tx.is_app_limited;
++	}
  	if (__tcp_retransmit_skb(sk, skb, 1))
  		goto rearm_timer;
  
 diff --git a/net/ipv4/tcp_rate.c b/net/ipv4/tcp_rate.c
-index a8f6d9d..b1f2235 100644
+index a8f6d9d..f1b7e14 100644
 --- a/net/ipv4/tcp_rate.c
 +++ b/net/ipv4/tcp_rate.c
 @@ -34,6 +34,24 @@
@@ -3003,17 +3060,27 @@ index a8f6d9d..b1f2235 100644
  }
  
  /* When an skb is sacked or acked, we fill in the rate sample with the (prior)
-@@ -91,17 +111,19 @@ void tcp_rate_skb_delivered(struct sock *sk, struct sk_buff *skb,
+@@ -91,17 +111,29 @@ void tcp_rate_skb_delivered(struct sock *sk, struct sk_buff *skb,
  	if (!rs->prior_delivered ||
  	    tcp_skb_sent_after(tx_tstamp, tp->first_tx_mstamp,
  			       scb->end_seq, rs->last_end_seq)) {
-+		{ struct bbr3 *b = bbr3_ctx_if_active(sk); if (b) b->bbr_lost = scb->tx.lost; }
++		{
++			struct bbr3 *b = bbr3_ctx_if_active(sk);
++
++			if (b)
++				b->bbr_lost = scb->tx.lost;
++		}
  		rs->prior_delivered_ce  = scb->tx.delivered_ce;
  		rs->prior_delivered  = scb->tx.delivered;
  		rs->prior_mstamp     = scb->tx.delivered_mstamp;
  		rs->is_app_limited   = scb->tx.is_app_limited;
  		rs->is_retrans	     = scb->sacked & TCPCB_RETRANS;
-+		{ struct bbr3 *b = bbr3_ctx_if_active(sk); if (b) b->bbr_tx_in_flight = scb->tx.in_flight; }
++		{
++			struct bbr3 *b = bbr3_ctx_if_active(sk);
++
++			if (b)
++				b->bbr_tx_in_flight = scb->tx.in_flight;
++		}
  		rs->last_end_seq     = scb->end_seq;
  
  		/* Record send time of most recently ACKed packet: */
@@ -3024,11 +3091,16 @@ index a8f6d9d..b1f2235 100644
  						     scb->tx.first_tx_mstamp);
  
  	}
-@@ -144,6 +166,7 @@ void tcp_rate_gen(struct sock *sk, u32 delivered, u32 lost,
+@@ -144,6 +176,12 @@ void tcp_rate_gen(struct sock *sk, u32 delivered, u32 lost,
  		return;
  	}
  	rs->delivered   = tp->delivered - rs->prior_delivered;
-+	{ struct bbr3 *b = bbr3_ctx_if_active(sk); if (b) b->bbr_lost = tp->lost - b->bbr_lost; }
++	{
++		struct bbr3 *b = bbr3_ctx_if_active(sk);
++
++		if (b)
++			b->bbr_lost = tp->lost - b->bbr_lost;
++	}
  
  	rs->delivered_ce = tp->delivered_ce - rs->prior_delivered_ce;
  	/* delivered_ce occupies less than 32 bits in the skb control block */
