@@ -1,6 +1,6 @@
-From 5ce04225246329bf8e5049a427b8f095af1c4983 Mon Sep 17 00:00:00 2001
+From 3bd1d66ef1301e713edb7e22436a8bb63051fb34 Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
-Date: Tue, 30 Jun 2026 21:00:00 +0000
+Date: Mon, 13 Jul 2026 07:30:18 +0200
 Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
  hardened)
 
@@ -28,8 +28,19 @@ and =m, replaces the per-loss strcmp() and cannot false-match a same-named
 module); READ_ONCE() on sysctl_tcp_min_tso_segs; static tcp_set_tx_in_flight();
 wrap-safe tcp_stamp32_us_delta(); tx.in_flight bounded vs TCPCB_IN_FLIGHT_MAX
 in tcp_shifted_skb() and tcp_fragment().
+v2 (KMI fix): guard the tcp_sock ANDROID_KABI_USE2 slot under
+#ifdef __GENKSYMS__ so genksyms sees the original ANDROID_KABI_RESERVE(1).
+Without the guard, genksyms observed the bbr_tx_in_flight/bbr_lost fields
+and shifted the modversions CRC of tcp_cong_avoid_ai (0x1de02b47 ->
+0x7d175721) and tcp_slow_start (0x95667182 -> 0xbd9ea60e) -- the only
+exported symbols taking struct tcp_sock* directly. That broke modversions
+for the OnePlus vendor module oplus_network_tuning.ko, which is listed in
+modules.load.recovery (but not modules.load): normal boot was unaffected,
+but reboot-to-recovery bootlooped when the module failed to load. Guarding
+the slot restores the stock CRCs so the module loads; the runtime fields
+(and all BBRv3 behaviour) are unchanged.
 ---
- include/linux/tcp.h            |   11 +-
+ include/linux/tcp.h            |   13 +-
  include/net/tcp.h              |  151 +-
  include/uapi/linux/rtnetlink.h |    4 +-
  net/ipv4/Kconfig               |   22 +
@@ -41,11 +52,11 @@ in tcp_shifted_skb() and tcp_fragment().
  net/ipv4/tcp_minisocks.c       |    2 +
  net/ipv4/tcp_output.c          |   38 +-
  net/ipv4/tcp_rate.c            |   25 +-
- 12 files changed, 2663 insertions(+), 12 deletions(-)
+ 12 files changed, 2666 insertions(+), 11 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr3.c
 
 diff --git a/include/linux/tcp.h b/include/linux/tcp.h
-index 3bbf355..91f2775 100644
+index 3bbf355..1fc5d62 100644
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
 @@ -370,7 +370,14 @@ struct tcp_sock {
@@ -64,12 +75,15 @@ index 3bbf355..91f2775 100644
  	u8	thin_lto    : 1,/* Use linear timeouts for thin streams */
  		fastopen_connect:1, /* FASTOPEN_CONNECT sockopt */
  		fastopen_no_cookie:1, /* Allow send/recv SYN+data without a cookie */
-@@ -503,7 +510,7 @@ struct tcp_sock {
+@@ -503,7 +510,11 @@ struct tcp_sock {
  	struct request_sock __rcu *fastopen_rsk;
  	struct saved_syn *saved_syn;
  
--	ANDROID_KABI_RESERVE(1);
++#ifdef __GENKSYMS__
+ 	ANDROID_KABI_RESERVE(1);
++#else
 +	ANDROID_KABI_USE2(1, u32 bbr_tx_in_flight, u32 bbr_lost);
++#endif
  	ANDROID_OEM_DATA(1);
  };
  
