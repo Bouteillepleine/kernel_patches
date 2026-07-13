@@ -1,4 +1,4 @@
-From 8676422544213d3cd4e9652f1520654b18bc6e2d Mon Sep 17 00:00:00 2001
+From 5fd1344b34b393e691fce77a4ae4aaa8f8bfaf9f Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
 Date: Mon, 13 Jul 2026 14:11:25 +0200
 Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
@@ -44,20 +44,20 @@ ops flag. Generic producers in tcp_rate.c/tcp_input.c/tcp_output.c write the
 context via bbr3_ctx_if_active(sk) (gated on the loss-hook flag); the loss
 hooks keep the save/restore since the context is per-connection shared.
 ---
- include/net/tcp.h              |  170 ++-
+ include/net/tcp.h              |  171 ++-
  include/uapi/linux/rtnetlink.h |    4 +-
  net/ipv4/Kconfig               |   22 +
  net/ipv4/Makefile              |    1 +
  net/ipv4/tcp_bbr3.c            | 2368 ++++++++++++++++++++++++++++++++
- net/ipv4/tcp_input.c           |   40 +-
+ net/ipv4/tcp_input.c           |   41 +-
  net/ipv4/tcp_minisocks.c       |    2 +
  net/ipv4/tcp_output.c          |   38 +-
  net/ipv4/tcp_rate.c            |   25 +-
- 9 files changed, 2660 insertions(+), 10 deletions(-)
+ 9 files changed, 2662 insertions(+), 10 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr3.c
 
 diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 3255a19..499fde9 100644
+index 3255a19..48c460d 100644
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -376,6 +376,8 @@ static inline void tcp_dec_quickack_mode(struct sock *sk)
@@ -141,14 +141,15 @@ index 3255a19..499fde9 100644
  /* Information about inbound ACK, passed to cong_ops->in_ack_event() */
  enum tcp_ca_ack_event_flags {
  	CA_ACK_SLOWPATH		= (1 << 0),	/* In slow path processing */
-@@ -1127,7 +1169,17 @@ enum tcp_ca_ack_event_flags {
+@@ -1127,7 +1169,18 @@ enum tcp_ca_ack_event_flags {
  #define TCP_CONG_NON_RESTRICTED 0x1
  /* Requires ECN/ECT set on all packets */
  #define TCP_CONG_NEEDS_ECN	0x2
 -#define TCP_CONG_MASK	(TCP_CONG_NON_RESTRICTED | TCP_CONG_NEEDS_ECN)
 +/* Wants notification of CE events (CA_EVENT_ECN_IS_CE, CA_EVENT_ECN_NO_CE). */
 +#define TCP_CONG_WANTS_CE_EVENTS	0x4
-+/* CC provides a per-skb loss hook (bbr3 ptr in icsk_ca_priv slot 0). */
++/* BBRv3-private: CC stores a struct bbr3 * in icsk_ca_priv slot 0 and
++ * provides a per-skb loss hook. Reserved for BBRv3 only (see bbr3_ctx_if_active). */
 +#define TCP_CONG_HAS_LOSS_HOOK		0x8
 +/* CC wants fast ACKs regardless of pingpong (BBRv3). */
 +#define TCP_CONG_WANTS_FAST_ACK		0x10
@@ -160,7 +161,7 @@ index 3255a19..499fde9 100644
  
  union tcp_cc_info;
  
-@@ -1252,6 +1304,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
+@@ -1252,6 +1305,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
  }
  #endif
  
@@ -175,7 +176,7 @@ index 3255a19..499fde9 100644
  static inline bool tcp_ca_needs_ecn(const struct sock *sk)
  {
  	const struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -1283,6 +1343,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
+@@ -1283,6 +1344,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
  	return t1 > t2 || (t1 == t2 && after(seq1, seq2));
  }
  
@@ -197,7 +198,7 @@ index 3255a19..499fde9 100644
  /* These functions determine how the current flow behaves in respect of SACK
   * handling. SACK is negotiated with the peer, and therefore it can vary
   * between different flows.
-@@ -2447,6 +2522,99 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
+@@ -2447,6 +2523,99 @@ void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
  void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb);
  void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb);
  
@@ -378,7 +379,7 @@ index ec36d2e..45324da 100644
  obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 new file mode 100644
-index 0000000..2d41520
+index 0000000..e4c905b
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr3.c
 @@ -0,0 +1,2368 @@
@@ -2699,7 +2700,7 @@ index 0000000..2d41520
 +
 +static struct tcp_congestion_ops tcp_bbr3_cong_ops __read_mostly = {
 +	.flags		= TCP_CONG_NON_RESTRICTED | TCP_CONG_WANTS_CE_EVENTS |
-+			  TCP_CONG_HAS_LOSS_HOOK,
++			  TCP_CONG_HAS_LOSS_HOOK | TCP_CONG_WANTS_FAST_ACK,
 +	.name		= "bbr3",
 +	.owner		= THIS_MODULE,
 +	.init		= bbr3_init,
@@ -2751,7 +2752,7 @@ index 0000000..2d41520
 +MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
 +MODULE_VERSION(__stringify(BBR_VERSION));
 diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index 5158676..ce231ac 100644
+index 5158676..b4a84d2 100644
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
 @@ -376,7 +376,7 @@ static void __tcp_ecn_check_ce(struct sock *sk, const struct sk_buff *skb)
@@ -2848,11 +2849,12 @@ index 5158676..ce231ac 100644
  	tcp_rate_gen(sk, delivered, lost, is_sack_reneg, sack_state.rate);
  	tcp_cong_control(sk, ack, delivered, flag, sack_state.rate);
  	tcp_xmit_recovery(sk, rexmit);
-@@ -5788,13 +5821,14 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+@@ -5788,13 +5821,15 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
-+		((inet_csk(sk)->icsk_ca_ops->flags & TCP_CONG_WANTS_FAST_ACK) ||
++		((inet_csk(sk)->icsk_ca_ops &&
++		  (inet_csk(sk)->icsk_ca_ops->flags & TCP_CONG_WANTS_FAST_ACK)) ||
  	     /* ... and right edge of window advances far enough.
  	      * (tcp_recvmsg() will send ACK otherwise).
  	      * If application uses SO_RCVLOWAT, we want send ack now if
