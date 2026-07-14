@@ -38,30 +38,7 @@ echo 'CONFIG_NOMOUNT=y' >> arch/arm64/configs/gki_defconfig
 The driver registers `/dev/nomount` (root-only, 0600) and `/sys/kernel/nomount/`,
 and defaults **disabled** until userspace enables it via ioctl.
 
-## What "de-branded" changed
-
-Pure identifier/string rename vs. upstream ZeroMount — the **code is byte-identical**:
-
-| ZeroMount | NoMount |
-|-----------|---------|
-| `CONFIG_ZEROMOUNT` | `CONFIG_NOMOUNT` |
-| `zeromount_*` / `ZEROMOUNT_*` / `ZM_*` / `zm_*` | `nomount_*` / `NOMOUNT_*` / `NM_*` / `nm_*` |
-| `/dev/zeromount`, `/sys/kernel/zeromount` | `/dev/nomount`, `/sys/kernel/nomount` |
-| `fs/zeromount.c`, `linux/zeromount.h` | `fs/nomount.c`, `linux/nomount.h` |
-| `"ZeroMount:"` log prefix | `"NoMount:"` |
-
-**Wire ABI is unchanged on purpose**: the ioctl magic value (`0x5A`), ioctl numbers,
-and `struct` layouts are identical to ZeroMount. Only the *names* differ. Because
-the device node moved to `/dev/nomount`, you need a **matching de-branded userspace
-manager** (a stock ZeroMount manager looks for `/dev/zeromount`). If you want to also
-change the magic value (`0x5A` = `'Z'`), do it in both the kernel header and userspace.
-
 ## Relationship to SUSFS
-
-Upstream, ZeroMount is diffed against a tree that **already has SUSFS applied**
-(`50_add_susfs` → `60_zeromount`). These patches were rebased off that dependency
-so they stand alone on clean GKI. The driver still *cooperates* with SUSFS when
-present (calls under `#ifdef CONFIG_KSU_SUSFS` compile out cleanly without it).
 
 If you apply **both** SUSFS and NoMount to one tree: apply **NoMount first**, then
 SUSFS. Both insert into overlapping functions (`getdents*`, `generic_permission`,
@@ -81,10 +58,6 @@ NOT done:
 - ❌ **Not compile-tested.** No GKI toolchain was run.
 - ❌ **Not boot-tested.** This is heavy VFS surgery on hot paths.
 
-Given the OnePlus 15 recovery-bootloop history, treat the 6.12 patch as unproven
-until you build it and test on a throwaway boot. `CONFIG_NOMOUNT` is off at boot by
-default, and the driver self-disables on the reboot notifier, which reduces (not
-eliminates) brick risk.
 
 ## Provenance
 - Upstream driver: `github.com/Enginex0/zeromount`
