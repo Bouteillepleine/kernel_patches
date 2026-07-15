@@ -1999,7 +1999,7 @@ diff -ruN a/fs/nomount.c b/fs/nomount.c
 diff -ruN a/include/linux/nomount.h b/include/linux/nomount.h
 --- a/include/linux/nomount.h	1970-01-01 02:00:00.000000000 +0200
 +++ b/include/linux/nomount.h	2026-07-15 00:58:16.059455000 +0200
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,187 @@
 +#ifndef _LINUX_NOMOUNT_H
 +#define _LINUX_NOMOUNT_H
 +
@@ -2021,36 +2021,24 @@ diff -ruN a/include/linux/nomount.h b/include/linux/nomount.h
 +#define NM_BLOOM_SHIFT    12
 +#define NM_BLOOM_MASK     (NM_BLOOM_BITS - 1)
 +
-+/* Per-task recursion guard using android_oem_data1 bit 0.
-+ * Survives CPU migration -- no preemption constraints needed. */
-+#ifdef CONFIG_ANDROID_VENDOR_OEM_DATA
-+#define NM_RECURSIVE_BIT 0
-+
-+static inline void nm_enter(void)
-+{
-+	set_bit(NM_RECURSIVE_BIT,
-+		(unsigned long *)&current->android_oem_data1);
-+}
-+
-+static inline void nm_exit(void)
-+{
-+	clear_bit(NM_RECURSIVE_BIT,
-+		  (unsigned long *)&current->android_oem_data1);
-+}
-+
-+static inline bool nm_is_recursive(void)
-+{
-+	return test_bit(NM_RECURSIVE_BIT,
-+			(unsigned long *)&current->android_oem_data1);
-+}
-+#else
++/* Per-task recursion guard using current->journal_info.
++ *
++ * NOTE: we deliberately do NOT use current->android_oem_data1 here. On
++ * Oplus/OnePlus GKI kernels that field is not scratch space -- it holds a
++ * pointer to struct oplus_task_struct (get_oplus_task_struct()), so a
++ * set_bit()/clear_bit() on it corrupts the scheduler's per-task pointer and
++ * soft-locks the device during boot. journal_info is safe across all vendors
++ * and survives CPU migration.
++ *
++ * Only claim journal_info if it is free — avoids clobbering jbd2 handles
++ * held by user processes doing ext4 I/O. If already occupied, we treat the
++ * call as a no-op; nm_is_recursive() returns false so NoMount proceeds
++ * normally, which is safe since the occupied handle means we are in a
++ * filesystem transaction context where redirection is unwanted. Our own
++ * hook brackets only do read-side lookups, so they never start a jbd2
++ * transaction that could mistake the marker for a real handle. */
 +#define NM_RECURSIVE_MARKER ((void *)0x5A4D)
 +
-+/* Only claim journal_info if it is free — avoids clobbering jbd2 handles
-+ * held by user processes doing ext4 I/O. If already occupied, we treat
-+ * the call as a no-op; nm_is_recursive() returns false so NoMount
-+ * proceeds normally, which is safe since the occupied handle means we
-+ * are in a filesystem transaction context where redirection is unwanted. */
 +static inline void nm_enter(void)
 +{
 +	if (!current->journal_info)
@@ -2067,7 +2055,6 @@ diff -ruN a/include/linux/nomount.h b/include/linux/nomount.h
 +{
 +	return current->journal_info == NM_RECURSIVE_MARKER;
 +}
-+#endif
 +
 +extern int nomount_debug_level;
 +
