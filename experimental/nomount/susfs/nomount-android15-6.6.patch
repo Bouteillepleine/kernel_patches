@@ -1,5 +1,6 @@
---- a/fs/Kconfig	2026-03-01 02:42:32.372399519 +0100
-+++ b/fs/Kconfig	2026-03-01 02:42:39.801747392 +0100
+diff -ruN a/fs/Kconfig b/fs/Kconfig
+--- a/fs/Kconfig	2026-07-15 00:22:05.161000000 +0200
++++ b/fs/Kconfig	2026-07-15 03:34:46.450015900 +0200
 @@ -405,4 +405,11 @@
  config IO_WQ
  	bool
@@ -12,15 +13,17 @@
 +	  without mounting filesystems. Useful for systemless modifications.
 +
  endmenu
---- a/fs/Makefile	2026-03-01 02:42:32.374541267 +0100
-+++ b/fs/Makefile	2026-03-01 02:42:39.801971793 +0100
+diff -ruN a/fs/Makefile b/fs/Makefile
+--- a/fs/Makefile	2026-07-15 03:34:46.265727700 +0200
++++ b/fs/Makefile	2026-07-15 03:34:46.454068900 +0200
 @@ -137,3 +137,4 @@
  obj-$(CONFIG_EROFS_FS)		+= erofs/
  obj-$(CONFIG_VBOXSF_FS)		+= vboxsf/
  obj-$(CONFIG_ZONEFS_FS)		+= zonefs/
 +obj-$(CONFIG_NOMOUNT)		+= nomount.o
---- a/fs/d_path.c	2026-03-01 02:42:32.376659810 +0100
-+++ b/fs/d_path.c	2026-03-01 02:42:39.802362766 +0100
+diff -ruN a/fs/d_path.c b/fs/d_path.c
+--- a/fs/d_path.c	2026-07-15 00:22:05.770000000 +0200
++++ b/fs/d_path.c	2026-07-15 03:34:46.457069700 +0200
 @@ -8,6 +8,10 @@
  #include <linux/prefetch.h>
  #include "mount.h"
@@ -53,11 +56,13 @@
  	/*
  	 * We have various synthetic filesystems that never get mounted.  On
  	 * these filesystems dentries are never used for lookup purposes, and
---- a/fs/namei.c	2026-03-01 02:42:32.379496523 +0100
-+++ b/fs/namei.c	2026-03-01 02:42:39.804070545 +0100
-@@ -49,6 +49,10 @@
+diff -ruN a/fs/namei.c b/fs/namei.c
+--- a/fs/namei.c	2026-07-15 03:34:46.269719200 +0200
++++ b/fs/namei.c	2026-07-15 03:34:46.758490400 +0200
+@@ -48,6 +48,10 @@
+ #include "internal.h"
  #include "mount.h"
-
+ 
 +#ifdef CONFIG_NOMOUNT
 +#include <linux/nomount.h>
 +#endif
@@ -65,8 +70,7 @@
  #ifdef CONFIG_KSU_SUSFS_SUS_PATH
  extern bool susfs_is_inode_sus_path(struct mnt_idmap* idmap, struct inode *inode);
  extern const struct qstr susfs_fake_qstr_name;
- #endif
-@@ -213,6 +217,13 @@
+@@ -210,6 +214,12 @@
  	result->uptr = filename;
  	result->aname = NULL;
  	audit_getname(result);
@@ -76,11 +80,10 @@
 +		result = nomount_getname_hook(result);
 +	}
 +#endif
-+
  	return result;
  }
  
-@@ -413,6 +424,18 @@
+@@ -410,6 +420,18 @@
  {
  	int ret;
  
@@ -99,7 +102,7 @@
  	/*
  	 * Do the basic permission checks.
  	 */
-@@ -517,6 +540,18 @@
+@@ -514,6 +536,18 @@
  {
  	int retval;
  
@@ -118,8 +121,72 @@
  	retval = sb_permission(inode->i_sb, inode, mask);
  	if (retval)
  		return retval;
---- a/fs/readdir.c	2026-03-01 02:42:32.383724513 +0100
-+++ b/fs/readdir.c	2026-03-01 02:44:17.536480316 +0100
+diff -ruN a/fs/proc/base.c b/fs/proc/base.c
+--- a/fs/proc/base.c	2026-07-15 03:34:46.275719400 +0200
++++ b/fs/proc/base.c	2026-07-15 03:34:46.494025300 +0200
+@@ -108,6 +108,9 @@
+ #include <trace/events/oom.h>
+ #include <trace/hooks/sched.h>
+ #include "internal.h"
++#ifdef CONFIG_NOMOUNT
++#include <linux/nomount.h>
++#endif
+ #include "fd.h"
+ 
+ #include "../../lib/kstrtox.h"
+@@ -1863,6 +1866,26 @@
+ 		}
+ 	}
+ #endif
++
++#ifdef CONFIG_NOMOUNT
++	if (!nomount_should_skip() && path->dentry) {
++		struct inode *inode = d_backing_inode(path->dentry);
++		if (inode) {
++			char *vpath = nomount_get_static_vpath(inode);
++			if (vpath) {
++				int vlen = strlen(vpath);
++				if (vlen > buflen)
++					vlen = buflen;
++				if (copy_to_user(buffer, vpath, vlen) == 0) {
++					kfree(vpath);
++					kfree(tmp);
++					return vlen;
++				}
++				kfree(vpath);
++			}
++		}
++	}
++#endif
+ 
+ 	pathname = d_path(path, tmp, PATH_MAX);
+ 	len = PTR_ERR(pathname);
+diff -ruN a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+--- a/fs/proc/task_mmu.c	2026-07-15 03:34:46.280719600 +0200
++++ b/fs/proc/task_mmu.c	2026-07-15 03:34:46.761476900 +0200
+@@ -21,6 +21,9 @@
+ #include <linux/page_size_compat.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/uaccess.h>
++#ifdef CONFIG_NOMOUNT
++#include <linux/nomount.h>
++#endif
+ #include <linux/pkeys.h>
+ #include <trace/hooks/mm.h>
+ #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+@@ -431,6 +434,9 @@
+ #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 		dev = inode->i_sb->s_dev;
+ 		ino = inode->i_ino;
++#ifdef CONFIG_NOMOUNT
++		nomount_spoof_mmap_metadata(inode, &dev, &ino);
++#endif
+ 		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+ #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+ 		susfs_sus_kstat_spoof_show_map_vma(inode, &dev, &ino);
+diff -ruN a/fs/readdir.c b/fs/readdir.c
+--- a/fs/readdir.c	2026-07-15 03:34:46.284717600 +0200
++++ b/fs/readdir.c	2026-07-15 03:34:46.759491000 +0200
 @@ -21,6 +21,9 @@
  #include <linux/unistd.h>
  #include <linux/compat.h>
@@ -130,7 +197,7 @@
  
  #include <asm/unaligned.h>
  
-@@ -364,11 +367,21 @@
+@@ -362,11 +365,21 @@
  		.current_dir = dirent
  	};
  	int error;
@@ -152,7 +219,7 @@
  #ifdef CONFIG_KSU_SUSFS_SUS_PATH
  	buf.sb = f.file->f_inode->i_sb;
  	buf.idmap = mnt_idmap(f.file->f_path.mnt);
-@@ -376,6 +389,16 @@
+@@ -375,6 +388,16 @@
  	error = iterate_dir(f.file, &buf.ctx);
  	if (error >= 0)
  		error = buf.error;
@@ -169,7 +236,7 @@
  	if (buf.prev_reclen) {
  		struct linux_dirent __user * lastdirent;
  		lastdirent = (void __user *)buf.current_dir - buf.prev_reclen;
-@@ -385,6 +408,9 @@
+@@ -384,6 +407,9 @@
  		else
  			error = count - buf.count;
  	}
@@ -179,7 +246,7 @@
  	fdput_pos(f);
  	return error;
  }
-@@ -471,11 +497,21 @@
+@@ -470,11 +496,21 @@
  		.current_dir = dirent
  	};
  	int error;
@@ -228,7 +295,7 @@
  	fdput_pos(f);
  	return error;
  }
-@@ -685,11 +734,21 @@
+@@ -686,11 +735,21 @@
  		.count = count
  	};
  	int error;
@@ -250,7 +317,7 @@
  #ifdef CONFIG_KSU_SUSFS_SUS_PATH
  	buf.sb = f.file->f_inode->i_sb;
  	buf.idmap = mnt_idmap(f.file->f_path.mnt);
-@@ -697,6 +756,16 @@
+@@ -699,6 +758,16 @@
  	error = iterate_dir(f.file, &buf.ctx);
  	if (error >= 0)
  		error = buf.error;
@@ -267,7 +334,7 @@
  	if (buf.prev_reclen) {
  		struct compat_linux_dirent __user * lastdirent;
  		lastdirent = (void __user *)buf.current_dir - buf.prev_reclen;
-@@ -706,6 +775,9 @@
+@@ -708,6 +777,9 @@
  		else
  			error = count - buf.count;
  	}
@@ -277,8 +344,9 @@
  	fdput_pos(f);
  	return error;
  }
---- a/fs/stat.c	2026-03-01 02:42:32.387032344 +0100
-+++ b/fs/stat.c	2026-03-01 02:44:46.123861740 +0100
+diff -ruN a/fs/stat.c b/fs/stat.c
+--- a/fs/stat.c	2026-07-15 03:34:46.285717600 +0200
++++ b/fs/stat.c	2026-07-15 03:34:46.760478400 +0200
 @@ -25,6 +25,9 @@
  #include <linux/version.h>
  #endif
@@ -289,8 +357,10 @@
  #include <asm/unistd.h>
  
  #include "internal.h"
-@@ -220,2 +223,36 @@
- 
+@@ -274,6 +277,40 @@
+  *
+  * 0 will be returned on success, and a -ve error code if unsuccessful.
+  */
 +#ifdef CONFIG_NOMOUNT
 +static inline int nomount_stat_hook(int dfd, struct filename *filename,
 +                                      struct kstat *stat, unsigned int request_mask,
@@ -325,10 +395,12 @@
 +    return -ENOENT;
 +}
 +#endif
- int vfs_fstat(int fd, struct kstat *stat)
-@@ -294,6 +331,16 @@
- orig_flow:
- #endif
+ static int vfs_statx(int dfd, struct filename *filename, int flags,
+ 	      struct kstat *stat, u32 request_mask)
+ {
+@@ -298,6 +335,17 @@
+ 		      AT_STATX_SYNC_TYPE))
+ 		return -EINVAL;
  
 +#ifdef CONFIG_NOMOUNT
 +	/* Try NoMount hook for relative paths */
@@ -340,14 +412,16 @@
 +#endif
 +
 +
- #ifdef CONFIG_KSU_SUSFS_UNICODE_FILTER
- 	if (!IS_ERR(filename) && susfs_check_unicode_bypass(filename->uptr)) {
- 		return -ENOENT;
---- a/fs/statfs.c	2026-03-01 02:42:32.390383324 +0100
-+++ b/fs/statfs.c	2026-03-01 02:42:39.835704809 +0100
++
+ retry:
+ 	error = filename_lookup(dfd, filename, lookup_flags, &path, NULL);
+ 	if (error)
+diff -ruN a/fs/statfs.c b/fs/statfs.c
+--- a/fs/statfs.c	2026-07-15 03:34:46.286723400 +0200
++++ b/fs/statfs.c	2026-07-15 03:34:46.481026500 +0200
 @@ -14,6 +14,9 @@
- #include "mount.h"
- #endif
+ #endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+ 
  #include "internal.h"
 +#ifdef CONFIG_NOMOUNT
 +#include <linux/nomount.h>
@@ -355,7 +429,7 @@
  
  static int flags_by_mnt(int mnt_flags)
  {
-@@ -118,7 +121,14 @@
+@@ -147,7 +150,14 @@
  retry:
  	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
  	if (!error) {
@@ -370,8 +444,9 @@
  		path_put(&path);
  		if (retry_estale(error, lookup_flags)) {
  			lookup_flags |= LOOKUP_REVAL;
---- a/fs/xattr.c	2026-03-01 02:42:32.393758992 +0100
-+++ b/fs/xattr.c	2026-03-01 02:42:39.836037224 +0100
+diff -ruN a/fs/xattr.c b/fs/xattr.c
+--- a/fs/xattr.c	2026-07-15 00:22:07.913000000 +0200
++++ b/fs/xattr.c	2026-07-15 03:34:46.489025500 +0200
 @@ -25,6 +25,9 @@
  #include <linux/posix_acl_xattr.h>
  
@@ -382,8 +457,7 @@
  
  #include "internal.h"
  
-@@ -428,7 +431,13 @@
- ssize_t
+@@ -429,6 +432,12 @@
  vfs_getxattr(struct mnt_idmap *idmap, struct dentry *dentry,
  	     const char *name, void *value, size_t size)
  {
@@ -396,69 +470,9 @@
  	struct inode *inode = dentry->d_inode;
  	int error;
  
---- a/fs/proc/base.c	2026-03-01 02:42:32.397406585 +0100
-+++ b/fs/proc/base.c	2026-03-01 02:42:39.806855584 +0100
-@@ -108,6 +108,9 @@
- #endif
- 
- #include "internal.h"
-+#ifdef CONFIG_NOMOUNT
-+#include <linux/nomount.h>
-+#endif
- #include "fd.h"
- 
- #include "../../lib/kstrtox.h"
-@@ -1869,6 +1872,26 @@
- 	if (!tmp)
- 		return -ENOMEM;
- 
-+#ifdef CONFIG_NOMOUNT
-+	if (!nomount_should_skip() && path->dentry) {
-+		struct inode *inode = d_backing_inode(path->dentry);
-+		if (inode) {
-+			char *vpath = nomount_get_static_vpath(inode);
-+			if (vpath) {
-+				int vlen = strlen(vpath);
-+				if (vlen > buflen)
-+					vlen = buflen;
-+				if (copy_to_user(buffer, vpath, vlen) == 0) {
-+					kfree(vpath);
-+					kfree(tmp);
-+					return vlen;
-+				}
-+				kfree(vpath);
-+			}
-+		}
-+	}
-+#endif
-+
- 	pathname = d_path(path, tmp, PATH_MAX);
- 	len = PTR_ERR(pathname);
- 
---- a/fs/proc/task_mmu.c	2026-03-01 02:42:32.402972154 +0100
-+++ b/fs/proc/task_mmu.c	2026-03-01 02:42:39.830594483 +0100
-@@ -19,6 +19,9 @@
- #include <linux/mmu_notifier.h>
- #include <linux/page_idle.h>
- #include <linux/page_size_compat.h>
-+#ifdef CONFIG_NOMOUNT
-+#include <linux/nomount.h>
-+#endif
- #include <linux/shmem_fs.h>
- #include <linux/uaccess.h>
- #include <linux/pkeys.h>
-@@ -310,6 +313,9 @@
- #endif
- 		dev = inode->i_sb->s_dev;
- 		ino = inode->i_ino;
-+#ifdef CONFIG_NOMOUNT
-+		nomount_spoof_mmap_metadata(inode, &dev, &ino);
-+#endif
- #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
- bypass_orig_flow:
- #endif
---- a/fs/nomount.c	2026-03-01 02:48:33.847739002 +0100
-+++ b/fs/nomount.c	2026-03-01 02:42:39.836505791 +0100
+diff -ruN a/fs/nomount.c b/fs/nomount.c
+--- a/fs/nomount.c	1970-01-01 02:00:00.000000000 +0200
++++ b/fs/nomount.c	2026-07-15 03:34:46.505306200 +0200
 @@ -0,0 +1,1526 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
@@ -1986,8 +2000,9 @@
 +}
 +fs_initcall(nomount_init);
 +
---- a/include/linux/nomount.h	2026-03-01 02:48:33.847739002 +0100
-+++ b/include/linux/nomount.h	2026-03-01 02:42:39.836808083 +0100
+diff -ruN a/include/linux/nomount.h b/include/linux/nomount.h
+--- a/include/linux/nomount.h	1970-01-01 02:00:00.000000000 +0200
++++ b/include/linux/nomount.h	2026-07-15 03:34:46.509304600 +0200
 @@ -0,0 +1,200 @@
 +#ifndef _LINUX_NOMOUNT_H
 +#define _LINUX_NOMOUNT_H

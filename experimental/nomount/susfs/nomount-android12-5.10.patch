@@ -1,8 +1,7 @@
-diff --git a/fs/Kconfig b/fs/Kconfig
-index 5e4dea4cf..ff3c8adde 100644
---- a/fs/Kconfig
-+++ b/fs/Kconfig
-@@ -350,6 +350,13 @@ source "fs/unicode/Kconfig"
+diff -ruN a/fs/Kconfig b/fs/Kconfig
+--- a/fs/Kconfig	2026-07-15 00:22:00.158000000 +0200
++++ b/fs/Kconfig	2026-07-15 03:34:50.972574300 +0200
+@@ -351,4 +351,11 @@
  config IO_WQ
  	bool
  
@@ -14,21 +13,17 @@ index 5e4dea4cf..ff3c8adde 100644
 +	  without mounting filesystems. Useful for systemless modifications.
 +
  endmenu
- 
- config KSU_SUSFS_SUS_KSTAT_REDIRECT
-diff --git a/fs/Makefile b/fs/Makefile
-index e951f5487..5cf04de70 100644
---- a/fs/Makefile
-+++ b/fs/Makefile
-@@ -139,3 +139,4 @@ obj-$(CONFIG_EFIVAR_FS)		+= efivarfs/
+diff -ruN a/fs/Makefile b/fs/Makefile
+--- a/fs/Makefile	2026-07-15 03:34:50.788448500 +0200
++++ b/fs/Makefile	2026-07-15 03:34:50.973582700 +0200
+@@ -139,3 +139,4 @@
  obj-$(CONFIG_EROFS_FS)		+= erofs/
  obj-$(CONFIG_VBOXSF_FS)		+= vboxsf/
  obj-$(CONFIG_ZONEFS_FS)		+= zonefs/
 +obj-$(CONFIG_NOMOUNT)		+= nomount.o
-diff --git a/fs/d_path.c b/fs/d_path.c
-index a69e2cd36..11678ff56 100644
---- a/fs/d_path.c
-+++ b/fs/d_path.c
+diff -ruN a/fs/d_path.c b/fs/d_path.c
+--- a/fs/d_path.c	2026-07-15 00:22:01.093000000 +0200
++++ b/fs/d_path.c	2026-07-15 03:34:50.975585300 +0200
 @@ -8,6 +8,10 @@
  #include <linux/prefetch.h>
  #include "mount.h"
@@ -40,7 +35,7 @@ index a69e2cd36..11678ff56 100644
  static int prepend(char **buffer, int *buflen, const char *str, int namelen)
  {
  	*buflen -= namelen;
-@@ -265,6 +269,26 @@ char *d_path(const struct path *path, char *buf, int buflen)
+@@ -265,6 +269,26 @@
  	struct path root;
  	int error;
  
@@ -67,11 +62,10 @@ index a69e2cd36..11678ff56 100644
  	/*
  	 * We have various synthetic filesystems that never get mounted.  On
  	 * these filesystems dentries are never used for lookup purposes, and
-diff --git a/fs/namei.c b/fs/namei.c
-index 3dfde472b..81e8e5547 100644
---- a/fs/namei.c
-+++ b/fs/namei.c
-@@ -49,6 +49,10 @@
+diff -ruN a/fs/namei.c b/fs/namei.c
+--- a/fs/namei.c	2026-07-15 03:34:50.791468800 +0200
++++ b/fs/namei.c	2026-07-15 03:34:51.281021900 +0200
+@@ -46,6 +46,10 @@
  #include "internal.h"
  #include "mount.h"
  
@@ -82,7 +76,7 @@ index 3dfde472b..81e8e5547 100644
  #define CREATE_TRACE_POINTS
  #include <trace/events/namei.h>
  
-@@ -214,6 +218,13 @@ getname_flags(const char __user *filename, int flags, int *empty)
+@@ -211,6 +215,12 @@
  	result->uptr = filename;
  	result->aname = NULL;
  	audit_getname(result);
@@ -92,11 +86,10 @@ index 3dfde472b..81e8e5547 100644
 +		result = nomount_getname_hook(result);
 +	}
 +#endif
-+
  	return result;
  }
  
-@@ -361,6 +372,18 @@ int generic_permission(struct inode *inode, int mask)
+@@ -358,6 +368,18 @@
  {
  	int ret;
  
@@ -115,7 +108,7 @@ index 3dfde472b..81e8e5547 100644
  	/*
  	 * Do the basic permission checks.
  	 */
-@@ -454,6 +477,18 @@ int inode_permission(struct inode *inode, int mask)
+@@ -451,6 +473,18 @@
  {
  	int retval;
  
@@ -134,12 +127,11 @@ index 3dfde472b..81e8e5547 100644
  	retval = sb_permission(inode->i_sb, inode, mask);
  	if (retval)
  		return retval;
-diff --git a/fs/proc/base.c b/fs/proc/base.c
-index 156ce6286..373978ce5 100644
---- a/fs/proc/base.c
-+++ b/fs/proc/base.c
-@@ -102,6 +102,9 @@
- #endif
+diff -ruN a/fs/proc/base.c b/fs/proc/base.c
+--- a/fs/proc/base.c	2026-07-15 03:34:50.798464200 +0200
++++ b/fs/proc/base.c	2026-07-15 03:34:50.979581700 +0200
+@@ -105,6 +105,9 @@
+ 
  #include <trace/events/oom.h>
  #include "internal.h"
 +#ifdef CONFIG_NOMOUNT
@@ -148,10 +140,11 @@ index 156ce6286..373978ce5 100644
  #include "fd.h"
  
  #include "../../lib/kstrtox.h"
-@@ -1791,6 +1794,27 @@ static int do_proc_readlink(struct path *path, char __user *buffer, int buflen)
- 	if (!tmp)
- 		return -ENOMEM;
- 
+@@ -1846,6 +1849,27 @@
+ 		}
+ 	}
+ #endif
++
 +
 +#ifdef CONFIG_NOMOUNT
 +	if (!nomount_should_skip() && path->dentry) {
@@ -172,38 +165,35 @@ index 156ce6286..373978ce5 100644
 +		}
 +	}
 +#endif
-+
+ 
  	pathname = d_path(path, tmp, PAGE_SIZE);
  	len = PTR_ERR(pathname);
- 	if (IS_ERR(pathname))
-diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
-index 7cb00fe68..fd8d787e7 100644
---- a/fs/proc/task_mmu.c
-+++ b/fs/proc/task_mmu.c
+diff -ruN a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+--- a/fs/proc/task_mmu.c	2026-07-15 03:34:50.802452200 +0200
++++ b/fs/proc/task_mmu.c	2026-07-15 03:34:51.284004900 +0200
 @@ -19,6 +19,9 @@
+ #include <linux/page_idle.h>
  #include <linux/shmem_fs.h>
  #include <linux/uaccess.h>
- #include <linux/pkeys.h>
 +#ifdef CONFIG_NOMOUNT
 +#include <linux/nomount.h>
 +#endif
- #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)
+ #include <linux/pkeys.h>
+ #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
  #include <linux/susfs_def.h>
- #endif
-@@ -366,6 +369,9 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
- #endif
+@@ -359,6 +362,9 @@
+ #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
  		dev = inode->i_sb->s_dev;
  		ino = inode->i_ino;
 +#ifdef CONFIG_NOMOUNT
 +		nomount_spoof_mmap_metadata(inode, &dev, &ino);
 +#endif
+ 		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
  #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
- bypass_orig_flow:
- #endif
-diff --git a/fs/readdir.c b/fs/readdir.c
-index e5a56fcfc..d0fca7da3 100644
---- a/fs/readdir.c
-+++ b/fs/readdir.c
+ 		susfs_sus_kstat_spoof_show_map_vma(inode, &dev, &ino);
+diff -ruN a/fs/readdir.c b/fs/readdir.c
+--- a/fs/readdir.c	2026-07-15 03:34:50.806461000 +0200
++++ b/fs/readdir.c	2026-07-15 03:34:51.281998500 +0200
 @@ -21,6 +21,9 @@
  #include <linux/unistd.h>
  #include <linux/compat.h>
@@ -214,15 +204,17 @@ index e5a56fcfc..d0fca7da3 100644
  
  #include <asm/unaligned.h>
  
-@@ -323,17 +326,37 @@ SYSCALL_DEFINE3(getdents, unsigned int, fd,
+@@ -339,6 +342,9 @@
  		.current_dir = dirent
  	};
  	int error;
 +#ifdef CONFIG_NOMOUNT
 +	int initial_count = count;
 +#endif
- 
- 	f = fdget_pos(fd);
+ #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ 	int path_err = -EINVAL;
+ 	struct path path;
+@@ -348,6 +354,13 @@
  	if (!f.file)
  		return -EBADF;
  
@@ -234,8 +226,9 @@ index e5a56fcfc..d0fca7da3 100644
 +#endif
 +
  #ifdef CONFIG_KSU_SUSFS_SUS_PATH
- 	buf.sb = f.file->f_inode->i_sb;
- #endif
+ 	if (f.file->f_inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+ 		path_err = susfs_get_data_path(&path);
+@@ -363,6 +376,16 @@
  	error = iterate_dir(f.file, &buf.ctx);
  	if (error >= 0)
  		error = buf.error;
@@ -252,7 +245,7 @@ index e5a56fcfc..d0fca7da3 100644
  	if (buf.prev_reclen) {
  		struct linux_dirent __user * lastdirent;
  		lastdirent = (void __user *)buf.current_dir - buf.prev_reclen;
-@@ -343,6 +366,9 @@ SYSCALL_DEFINE3(getdents, unsigned int, fd,
+@@ -372,6 +395,9 @@
  		else
  			error = count - buf.count;
  	}
@@ -260,17 +253,19 @@ index e5a56fcfc..d0fca7da3 100644
 +nm_out:
 +#endif
  	fdput_pos(f);
- 	return error;
- }
-@@ -420,17 +446,37 @@ SYSCALL_DEFINE3(getdents64, unsigned int, fd,
+ #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ 	if (!path_err)
+@@ -460,6 +486,9 @@
  		.current_dir = dirent
  	};
  	int error;
 +#ifdef CONFIG_NOMOUNT
 +	int initial_count = count;
 +#endif
- 
- 	f = fdget_pos(fd);
+ #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ 	int path_err = -EINVAL;
+ 	struct path path;
+@@ -469,6 +498,13 @@
  	if (!f.file)
  		return -EBADF;
  
@@ -282,8 +277,9 @@ index e5a56fcfc..d0fca7da3 100644
 +#endif
 +
  #ifdef CONFIG_KSU_SUSFS_SUS_PATH
- 	buf.sb = f.file->f_inode->i_sb;
- #endif
+ 	if (f.file->f_inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+ 		path_err = susfs_get_data_path(&path);
+@@ -484,6 +520,16 @@
  	error = iterate_dir(f.file, &buf.ctx);
  	if (error >= 0)
  		error = buf.error;
@@ -300,7 +296,7 @@ index e5a56fcfc..d0fca7da3 100644
  	if (buf.prev_reclen) {
  		struct linux_dirent64 __user * lastdirent;
  		typeof(lastdirent->d_off) d_off = buf.ctx.pos;
-@@ -441,6 +487,9 @@ SYSCALL_DEFINE3(getdents64, unsigned int, fd,
+@@ -494,6 +540,9 @@
  		else
  			error = count - buf.count;
  	}
@@ -308,17 +304,19 @@ index e5a56fcfc..d0fca7da3 100644
 +nm_out:
 +#endif
  	fdput_pos(f);
- 	return error;
- }
-@@ -614,17 +663,37 @@ COMPAT_SYSCALL_DEFINE3(getdents, unsigned int, fd,
+ #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ 	if (!path_err)
+@@ -704,6 +753,9 @@
  		.count = count
  	};
  	int error;
 +#ifdef CONFIG_NOMOUNT
 +	int initial_count = count;
 +#endif
- 
- 	f = fdget_pos(fd);
+ #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ 	int path_err = -EINVAL;
+ 	struct path path;
+@@ -713,6 +765,13 @@
  	if (!f.file)
  		return -EBADF;
  
@@ -330,8 +328,9 @@ index e5a56fcfc..d0fca7da3 100644
 +#endif
 +
  #ifdef CONFIG_KSU_SUSFS_SUS_PATH
- 	buf.sb = f.file->f_inode->i_sb;
- #endif
+ 	if (f.file->f_inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+ 		path_err = susfs_get_data_path(&path);
+@@ -728,6 +787,16 @@
  	error = iterate_dir(f.file, &buf.ctx);
  	if (error >= 0)
  		error = buf.error;
@@ -348,7 +347,7 @@ index e5a56fcfc..d0fca7da3 100644
  	if (buf.prev_reclen) {
  		struct compat_linux_dirent __user * lastdirent;
  		lastdirent = (void __user *)buf.current_dir - buf.prev_reclen;
-@@ -634,6 +703,9 @@ COMPAT_SYSCALL_DEFINE3(getdents, unsigned int, fd,
+@@ -737,6 +806,9 @@
  		else
  			error = count - buf.count;
  	}
@@ -356,13 +355,12 @@ index e5a56fcfc..d0fca7da3 100644
 +nm_out:
 +#endif
  	fdput_pos(f);
- 	return error;
- }
-diff --git a/fs/stat.c b/fs/stat.c
-index 9c699e632..c4a5678b8 100644
---- a/fs/stat.c
-+++ b/fs/stat.c
-@@ -26,6 +26,9 @@
+ #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+ 	if (!path_err)
+diff -ruN a/fs/stat.c b/fs/stat.c
+--- a/fs/stat.c	2026-07-15 03:34:50.807461600 +0200
++++ b/fs/stat.c	2026-07-15 03:34:51.283000400 +0200
+@@ -23,6 +23,9 @@
  #endif
  
  #include <linux/uaccess.h>
@@ -372,7 +370,7 @@ index 9c699e632..c4a5678b8 100644
  #include <asm/unistd.h>
  
  #include "internal.h"
-@@ -217,6 +220,41 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *fla
+@@ -216,6 +219,41 @@
   *
   * 0 will be returned on success, and a -ve error code if unsuccessful.
   */
@@ -414,7 +412,7 @@ index 9c699e632..c4a5678b8 100644
  static int vfs_statx(int dfd, const char __user *filename, int flags,
  	      struct kstat *stat, u32 request_mask)
  {
-@@ -224,6 +262,16 @@ static int vfs_statx(int dfd, const char __user *filename, int flags,
+@@ -223,6 +261,17 @@
  	unsigned lookup_flags = 0;
  	int error;
  
@@ -428,16 +426,16 @@ index 9c699e632..c4a5678b8 100644
 +#endif
 +
 +
- #ifdef CONFIG_KSU_SUSFS_UNICODE_FILTER
- 	if (susfs_check_unicode_bypass(filename)) {
- 		return -ENOENT;
-diff --git a/fs/statfs.c b/fs/statfs.c
-index a21875ca3..093287941 100644
---- a/fs/statfs.c
-+++ b/fs/statfs.c
++
+ #ifdef CONFIG_KSU_SUSFS
+ 	if (likely(susfs_is_current_proc_umounted()))
+ 		goto orig_flow;
+diff -ruN a/fs/statfs.c b/fs/statfs.c
+--- a/fs/statfs.c	2026-07-15 03:34:50.809451000 +0200
++++ b/fs/statfs.c	2026-07-15 03:34:50.988565500 +0200
 @@ -14,6 +14,9 @@
- #include "mount.h"
- #endif
+ #endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+ 
  #include "internal.h"
 +#ifdef CONFIG_NOMOUNT
 +#include <linux/nomount.h>
@@ -445,7 +443,7 @@ index a21875ca3..093287941 100644
  
  static int flags_by_mnt(int mnt_flags)
  {
-@@ -118,7 +121,14 @@ int user_statfs(const char __user *pathname, struct kstatfs *st)
+@@ -147,7 +150,14 @@
  retry:
  	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
  	if (!error) {
@@ -460,10 +458,9 @@ index a21875ca3..093287941 100644
  		path_put(&path);
  		if (retry_estale(error, lookup_flags)) {
  			lookup_flags |= LOOKUP_REVAL;
-diff --git a/fs/xattr.c b/fs/xattr.c
-index 8d7151492..e21419bd7 100644
---- a/fs/xattr.c
-+++ b/fs/xattr.c
+diff -ruN a/fs/xattr.c b/fs/xattr.c
+--- a/fs/xattr.c	2026-07-15 00:22:02.921000000 +0200
++++ b/fs/xattr.c	2026-07-15 03:34:50.989584600 +0200
 @@ -24,6 +24,9 @@
  #include <linux/posix_acl_xattr.h>
  
@@ -474,7 +471,7 @@ index 8d7151492..e21419bd7 100644
  
  static const char *
  strcmp_prefix(const char *a, const char *a_prefix)
-@@ -403,6 +406,12 @@ EXPORT_SYMBOL(__vfs_getxattr);
+@@ -403,6 +406,12 @@
  ssize_t
  vfs_getxattr(struct dentry *dentry, const char *name, void *value, size_t size)
  {
@@ -487,11 +484,9 @@ index 8d7151492..e21419bd7 100644
  	return __vfs_getxattr(dentry, dentry->d_inode, name, value, size, 0);
  }
  EXPORT_SYMBOL_NS_GPL(vfs_getxattr, ANDROID_GKI_VFS_EXPORT_ONLY);
-diff --git a/fs/nomount.c b/fs/nomount.c
-new file mode 100644
-index 000000000..0b596ea48
---- /dev/null
-+++ b/fs/nomount.c
+diff -ruN a/fs/nomount.c b/fs/nomount.c
+--- a/fs/nomount.c	1970-01-01 02:00:00.000000000 +0200
++++ b/fs/nomount.c	2026-07-15 03:34:50.992569500 +0200
 @@ -0,0 +1,1526 @@
 +#include <linux/module.h>
 +#include <linux/kernel.h>
@@ -2019,11 +2014,9 @@ index 000000000..0b596ea48
 +}
 +fs_initcall(nomount_init);
 +
-diff --git a/include/linux/nomount.h b/include/linux/nomount.h
-new file mode 100644
-index 000000000..01fd6aca0
---- /dev/null
-+++ b/include/linux/nomount.h
+diff -ruN a/include/linux/nomount.h b/include/linux/nomount.h
+--- a/include/linux/nomount.h	1970-01-01 02:00:00.000000000 +0200
++++ b/include/linux/nomount.h	2026-07-15 03:34:50.996584700 +0200
 @@ -0,0 +1,200 @@
 +#ifndef _LINUX_NOMOUNT_H
 +#define _LINUX_NOMOUNT_H

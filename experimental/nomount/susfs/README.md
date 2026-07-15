@@ -1,8 +1,9 @@
-# NoMount — SUSFS-compatible variant
+# NoMount — SUSFS-compatible variant (mainline susfs4ksu)
 
 Same de-branded NoMount (ZeroMount) VFS driver as the parent directory, but
-diffed against a **SUSFS-applied** GKI tree (like upstream ZeroMount) instead of
-raw GKI. Use these when you want **NoMount *and* SUSFS in the same kernel**.
+re-anchored to a **mainline susfs4ksu** base so `apply susfs → apply nomount`
+is conflict-free on a SUSFS kernel. Use these when you want **NoMount *and*
+SUSFS in the same kernel**.
 
 | You want | Use |
 |----------|-----|
@@ -12,16 +13,23 @@ raw GKI. Use these when you want **NoMount *and* SUSFS in the same kernel**.
 The two sets are **not interchangeable** — the parent (raw-GKI) patches conflict
 if SUSFS is also applied, and these conflict on a tree without SUSFS.
 
+## Base
+
+Regenerated against **raw GKI + mainline susfs4ksu**
+(`gitlab.com/simonpunk/susfs4ksu`, `gki-android<ver>` branches) — *not* a
+vendor/ZeroMount SUSFS fork. Each patch's context reflects mainline susfs
+(e.g. `susfs_sus_kstat_spoof_show_map_vma`, `CONFIG_KSU_SUSFS_SUS_MAP`).
+
 ## Apply order (SUSFS first)
 
 ```sh
-# 1. apply your SUSFS patch to the kernel source first
-patch -p1 < 50_add_susfs_in_gki-<ver>.patch      # (your susfs4ksu patch)
+# 1. apply mainline susfs4ksu to your kernel source first
+patch -p1 < 50_add_susfs_in_gki-android16-6.12.patch
 # 2. then apply the matching NoMount patch
-patch -p1 < nomount-android16-6.12.patch          # pick your kernel version
+patch -p1 < nomount-android16-6.12.patch
 ```
 
-Then enable both configs (neither is bundled):
+Enable both (neither is bundled):
 
 ```
 CONFIG_NOMOUNT=y
@@ -30,17 +38,18 @@ CONFIG_KSU_SUSFS=y
 
 ## Runtime
 
-NoMount cooperates with SUSFS by design — the driver's hooks are guarded by
-`#ifdef CONFIG_KSU_SUSFS` and defer to `susfs_is_current_proc_umounted()`, so the
-mountless VFS injection and SUSFS's hiding run together without fighting.
+By design NoMount cooperates with SUSFS — its hooks are guarded by
+`#ifdef CONFIG_KSU_SUSFS` and defer to `susfs_is_current_proc_umounted()`, so
+mountless VFS injection and SUSFS hiding run together without fighting.
 
-## Notes / caveats
+## Caveats
 
-- These are diffed against the same post-SUSFS base as upstream ZeroMount
-  (Super-Builders' `50_add_susfs` layer). A substantially different SUSFS patch
-  may shift context; reconcile any `.rej` by hand if so.
-- De-brand only: `zeromount→nomount`, config/symbols/device (`/dev/nomount`),
-  ioctl magic value (`0x5A`) and wire ABI **unchanged** — pairs with the same
+- **Aligned to susfs4ksu HEAD + google-common GKI HEAD.** If your kernel source
+  revision or susfs4ksu revision differs meaningfully, expect a little fuzz or a
+  stray `.rej` to reconcile by hand — inherent to pre-baking against a moving
+  base. Verified: applies with **zero fuzz/offset** to that reference base, and
+  the injected NoMount code is byte-identical to upstream.
+- De-brand only: `zeromount→nomount`, config/symbols/device (`/dev/nomount`);
+  ioctl magic (`0x5A`) and wire ABI **unchanged** — pairs with the same
   `Bouteillepleine/nomount` userspace module.
-- **Apply-aligned to upstream, but not compile- or boot-tested here.** Build on
-  a throwaway first.
+- **Not compile- or boot-tested here.** Build on a throwaway first.
