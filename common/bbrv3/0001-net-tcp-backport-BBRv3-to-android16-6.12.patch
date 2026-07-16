@@ -1,8 +1,11 @@
-From 8635d7ae65cb51ebea8143f30e7ba0d1057a65ba Mon Sep 17 00:00:00 2001
+From 8b9f49aa2dbb5e1239a3149dd162906f50a60bc4 Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
 Date: Mon, 13 Jul 2026 14:11:25 +0200
 Subject: [PATCH] net: tcp: backport BBRv3 to android16-6.12 (KMI-safe,
  hardened)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Backport BBRv3 congestion control to the Android 16 / 6.12 GKI kernel.
 
@@ -55,17 +58,28 @@ NULL-safe on icsk_ca_ops (was the last icsk_ca_ops deref left unguarded
 after the ACK-path fix); order the TCP_ECN_ECT_PERMANENT setup before
 bbr->initialized = 1 so "publish last" holds with no post-publish mutation
 of BBR-relevant state.
+
+v8 (fail-closed alloc, no ABI/CRC change): when the private ctx allocation
+fails in bbr3_init() (rare, GFP_ATOMIC), the flow no longer degrades to a
+frozen cwnd — the guarded callbacks now dispatch to the exported Reno
+handlers (tcp_reno_cong_avoid/tcp_reno_ssthresh/tcp_reno_undo_cwnd), giving
+the socket real slow start, congestion avoidance and loss reaction. Chosen
+over reattaching icsk_ca_ops to &tcp_reno because the tcp_reno struct is not
+exported (would break CONFIG_TCP_CONG_BBR3=m) and an ops swap inside .init
+has module-refcount subtleties; behavioral dispatch has neither. PRR is not
+applied on this path (.cong_control bypasses it) — documented, acceptable
+for a should-never-happen degraded mode.
 ---
  include/net/tcp.h              |  178 ++-
  include/uapi/linux/rtnetlink.h |    4 +-
  net/ipv4/Kconfig               |   22 +
  net/ipv4/Makefile              |    1 +
- net/ipv4/tcp_bbr3.c            | 2377 ++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_bbr3.c            | 2388 ++++++++++++++++++++++++++++++++
  net/ipv4/tcp_input.c           |   73 +-
  net/ipv4/tcp_minisocks.c       |    2 +
  net/ipv4/tcp_output.c          |   43 +-
  net/ipv4/tcp_rate.c            |   40 +-
- 9 files changed, 2730 insertions(+), 10 deletions(-)
+ 9 files changed, 2741 insertions(+), 10 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr3.c
 
 diff --git a/include/net/tcp.h b/include/net/tcp.h
@@ -398,10 +412,10 @@ index ec36d2e..45324da 100644
  obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 new file mode 100644
-index 0000000..bdb02f9
+index 0000000..b65a91f
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr3.c
-@@ -0,0 +1,2377 @@
+@@ -0,0 +1,2388 @@
 +/* BBR (Bottleneck Bandwidth and RTT) congestion control
 + *
 + * BBR is a model-based congestion control algorithm that aims for low queues,
@@ -2391,8 +2405,19 @@ index 0000000..bdb02f9
 +	u32 bw, round_delivered;
 +	int ce_ratio = -1;
 +
-+	if (!bbr || !bbr->initialized)
++	if (!bbr || !bbr->initialized) {
++		/* Fail closed: the private ctx allocation failed in bbr3_init()
++		 * (rare, GFP_ATOMIC). Behave as Reno rather than leaving the
++		 * flow with a frozen cwnd: real slow start / congestion
++		 * avoidance, and the ssthresh/undo callbacks below fall back
++		 * to their Reno counterparts for loss reaction. (PRR is not
++		 * applied since .cong_control bypasses it — acceptable for
++		 * this degraded path.) tcp_reno_* are exported, so this also
++		 * works for CONFIG_TCP_CONG_BBR3=m.
++		 */
++		tcp_reno_cong_avoid(sk, ack, rs->acked_sacked);
 +		return;
++	}
 +
 +	round_delivered = bbr_update_round_start(sk, rs, &ctx);
 +	if (bbr->round_start) {
@@ -2441,7 +2466,7 @@ index 0000000..bdb02f9
 +
 +	bbr = kmem_cache_zalloc(bbr3_cache, GFP_ATOMIC | __GFP_NOWARN);
 +	if (unlikely(!bbr)) {
-+		net_warn_ratelimited("bbr3: alloc failed; flow continues with frozen cwnd, no BBRv3 control\n");
++		net_warn_ratelimited("bbr3: ctx alloc failed; flow falls back to Reno behavior\n");
 +		return;
 +	}
 +
@@ -2637,7 +2662,7 @@ index 0000000..bdb02f9
 +	struct bbr3 *bbr = bbr3_get_priv(sk);
 +
 +	if (!bbr || !bbr->initialized)
-+		return tcp_sk(sk)->snd_cwnd;
++		return tcp_reno_undo_cwnd(sk);	/* fail closed: Reno undo */
 +
 +	bbr_reset_full_bw(sk); /* spurious slow-down; reset full bw detector */
 +	bbr->loss_in_round = 0;
@@ -2656,7 +2681,7 @@ index 0000000..bdb02f9
 +	struct bbr3 *bbr = bbr3_get_priv(sk);
 +
 +	if (!bbr || !bbr->initialized)
-+		return tcp_sk(sk)->snd_ssthresh;
++		return tcp_reno_ssthresh(sk);	/* fail closed: Reno loss reaction */
 +
 +	bbr_save_cwnd(sk);
 +	/* For undo, save state that adapts based on loss signal. */
