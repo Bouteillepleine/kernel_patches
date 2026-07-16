@@ -1,0 +1,109 @@
+From 7fd6b7a76177469664556b7ac520031baf0ffb55 Mon Sep 17 00:00:00 2001
+From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 01:04:27 +0200
+Subject: [PATCH] TEST-ONLY: bbr3 ctx alloc-failure injection + Reno-fallback
+ counters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+NOT FOR PRODUCTION — local scratch patch to runtime-validate the v8
+fail-closed Reno fallback on a kernel without CONFIG_FAULT_INJECTION.
+
+  echo N > /sys/module/tcp_bbr3/parameters/fail_alloc
+      -> the next N bbr3_init() ctx allocations return NULL (deterministic).
+  cat /sys/module/tcp_bbr3/parameters/reno_fb_{cong,ssthresh,undo}
+      -> read-only counts proving the fallback callbacks executed.
+
+Stacks on 0001 v8 + 0002 v3. Drop this patch for daily/production builds.
+---
+ net/ipv4/tcp_bbr3.c | 43 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
+index 7baa6a4..a3c5a04 100644
+--- a/net/ipv4/tcp_bbr3.c
++++ b/net/ipv4/tcp_bbr3.c
+@@ -2053,6 +2053,7 @@ static void bbr3_main(struct sock *sk, u32 ack, int flag, const struct rate_samp
+ 		 * this degraded path.) tcp_reno_* are exported, so this also
+ 		 * works for CONFIG_TCP_CONG_BBR3=m.
+ 		 */
++		WRITE_ONCE(bbr3_reno_fb_cong, bbr3_reno_fb_cong + 1); /* TEST-ONLY */
+ 		tcp_reno_cong_avoid(sk, ack, rs->acked_sacked);
+ 		return;
+ 	}
+@@ -2091,6 +2092,37 @@ out:
+ 
+ static struct kmem_cache *bbr3_cache __read_mostly;
+ 
++/* ======================================================================
++ * TEST-ONLY (NOT FOR PRODUCTION): deterministic ctx alloc-failure injection
++ * to exercise the v8 fail-closed Reno fallback path at runtime, since this
++ * kernel has no CONFIG_FAULT_INJECTION/failslab.
++ *   echo N > /sys/module/tcp_bbr3/parameters/fail_alloc   -> next N bbr3_init
++ *                                                            ctx allocs fail.
++ *   cat  /sys/module/tcp_bbr3/parameters/reno_fb_{cong,ssthresh,undo}
++ *                                                          -> fallback hit counts
++ * Remove this whole block (and the two call sites below) before shipping.
++ */
++static atomic_t bbr3_fail_alloc = ATOMIC_INIT(0);
++module_param_named(fail_alloc, bbr3_fail_alloc.counter, int, 0644);
++MODULE_PARM_DESC(fail_alloc, "TEST: fail the next N bbr3 ctx allocations");
++static int bbr3_reno_fb_cong, bbr3_reno_fb_ssthresh, bbr3_reno_fb_undo;
++module_param_named(reno_fb_cong, bbr3_reno_fb_cong, int, 0444);
++module_param_named(reno_fb_ssthresh, bbr3_reno_fb_ssthresh, int, 0444);
++module_param_named(reno_fb_undo, bbr3_reno_fb_undo, int, 0444);
++
++static bool bbr3_should_fail_alloc(void)
++{
++	int old = atomic_read(&bbr3_fail_alloc);
++
++	while (old > 0) {
++		if (atomic_cmpxchg(&bbr3_fail_alloc, old, old - 1) == old)
++			return true;
++		old = atomic_read(&bbr3_fail_alloc);
++	}
++	return false;
++}
++/* ==================== end TEST-ONLY block ==================== */
++
+ #ifdef CONFIG_DEBUG_FS
+ /* debugfs introspection: read-time walk of the TCP established hash
+  * (the /proc/net/tcp pattern). No per-socket bookkeeping, no shared
+@@ -2178,7 +2210,10 @@ static void bbr3_init(struct sock *sk)
+ 
+ 	*bbr3_ptr = NULL;
+ 
+-	bbr = kmem_cache_zalloc(bbr3_cache, GFP_ATOMIC | __GFP_NOWARN);
++	if (unlikely(bbr3_should_fail_alloc()))	/* TEST-ONLY injection */
++		bbr = NULL;
++	else
++		bbr = kmem_cache_zalloc(bbr3_cache, GFP_ATOMIC | __GFP_NOWARN);
+ 	if (unlikely(!bbr)) {
+ 		net_warn_ratelimited("bbr3: ctx alloc failed; flow falls back to Reno behavior\n");
+ 		return;
+@@ -2376,7 +2411,10 @@ static u32 bbr3_undo_cwnd(struct sock *sk)
+ 	struct bbr3 *bbr = bbr3_get_priv(sk);
+ 
+ 	if (!bbr || !bbr->initialized)
++	{
++		WRITE_ONCE(bbr3_reno_fb_undo, bbr3_reno_fb_undo + 1); /* TEST-ONLY */
+ 		return tcp_reno_undo_cwnd(sk);	/* fail closed: Reno undo */
++	}
+ 
+ 	bbr_reset_full_bw(sk); /* spurious slow-down; reset full bw detector */
+ 	bbr->loss_in_round = 0;
+@@ -2395,7 +2433,10 @@ static u32 bbr3_ssthresh(struct sock *sk)
+ 	struct bbr3 *bbr = bbr3_get_priv(sk);
+ 
+ 	if (!bbr || !bbr->initialized)
++	{
++		WRITE_ONCE(bbr3_reno_fb_ssthresh, bbr3_reno_fb_ssthresh + 1); /* TEST-ONLY */
+ 		return tcp_reno_ssthresh(sk);	/* fail closed: Reno loss reaction */
++	}
+ 
+ 	bbr_save_cwnd(sk);
+ 	/* For undo, save state that adapts based on loss signal. */
+-- 
+2.54.0.windows.1
+
