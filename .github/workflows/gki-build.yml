@@ -87,8 +87,8 @@ jobs:
           cd gki
           export CCACHE_DIR="$PWD/.ccache"; mkdir -p "$CCACHE_DIR"
           if [ -x tools/bazel ]; then
-            echo "== kleaf build =="
-            tools/bazel build //common:kernel_aarch64 2>&1 | tail -500
+            echo "== kleaf build (lto=none to fit runner memory) =="
+            tools/bazel build //common:kernel_aarch64 --lto=none --jobs=3 2>&1 | tail -500
           else
             echo "== legacy build.sh (LTO=none to fit runner memory) =="
             LTO=none BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh 2>&1 | tail -400
