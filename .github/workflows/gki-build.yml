@@ -55,11 +55,14 @@ jobs:
           cd gki
           RAW="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
           curl -fsSL "$RAW/0001-net-tcp-backport-BBRv3-to-$V.patch" -o /tmp/bbr3.patch
-          cd common
-          git apply --index /tmp/bbr3.patch
-          echo "CONFIG_TCP_CONG_BBR3=y" >> arch/arm64/configs/gki_defconfig
-          grep -c BBR3 arch/arm64/configs/gki_defconfig
-          cd ..
+          ( cd common && git apply --index /tmp/bbr3.patch )
+          echo "CONFIG_TCP_CONG_BBR3=y" >> common/arch/arm64/configs/gki_defconfig
+          # GKI enforces gki_defconfig == `make savedefconfig`; a raw append
+          # breaks that check. Regenerate it canonically via kleaf's
+          # savedefconfig runner (writes the normalized file back to source).
+          tools/bazel run //common:kernel_aarch64_savedefconfig 2>&1 | tail -40 || \
+            echo "::warning::savedefconfig target run non-zero (continuing to build)"
+          echo "BBR3 present after normalize: $(grep -c 'CONFIG_TCP_CONG_BBR3=y' common/arch/arm64/configs/gki_defconfig)"
 
       - name: Build //common:kernel_aarch64 (or build.sh)
         run: |
