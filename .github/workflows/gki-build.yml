@@ -90,8 +90,8 @@ jobs:
             echo "== kleaf build =="
             tools/bazel build //common:kernel_aarch64 2>&1 | tail -500
           else
-            echo "== legacy build.sh =="
-            LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh 2>&1 | tail -400
+            echo "== legacy build.sh (LTO=none to fit runner memory) =="
+            LTO=none BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh 2>&1 | tail -400
           fi
 
       - name: Locate built Image + confirm tcp_bbr3.o compiled
