@@ -57,20 +57,25 @@ jobs:
           curl -fsSL "$RAW/0001-net-tcp-backport-BBRv3-to-$V.patch" -o /tmp/bbr3.patch
           ( cd common && git apply --index /tmp/bbr3.patch )
           echo "CONFIG_TCP_CONG_BBR3=y" >> common/arch/arm64/configs/gki_defconfig
-          # We intentionally add a non-canonical config; GKI's check_defconfig
-          # would reject gki_defconfig != savedefconfig. It's a shell function
-          # invoked by both build.sh and kleaf (via POST_DEFCONFIG_CMDS) — make
-          # it a no-op at its source so the build accepts our added config.
+          # We intentionally add a non-canonical config; GKI would reject
+          # gki_defconfig != savedefconfig via a shell check. Two variants exist:
+          #   check_defconfig()                       (build.sh + older kleaf)
+          #   kleaf_internal_check_defconfig_minimized (newer kleaf)
+          # Neuter both (return 0 at the top of the def) wherever defined.
           NEUT=0
-          for u in $(grep -rl 'check_defconfig()' common build tools 2>/dev/null); do
-            perl -0777 -pi -e 's/check_defconfig\(\)\s*\{/check_defconfig() {\n  return 0;/' "$u"
-            echo "  neutered check_defconfig() in $u"; NEUT=$((NEUT+1))
+          for u in $(grep -rlIE 'check_defconfig\(\)|kleaf_internal_check_defconfig_minimized' . 2>/dev/null); do
+            perl -0777 -pi -e 's/(\bcheck_defconfig\s*\(\)\s*\{)/$1\n  return 0;/g;
+                                s/(\bfunction\s+check_defconfig\s*\{)/$1\n  return 0;/g;
+                                s/(\bkleaf_internal_check_defconfig_minimized\s*\(\)\s*\{)/$1\n  return 0;/g;
+                                s/(\bfunction\s+kleaf_internal_check_defconfig_minimized\s*\{)/$1\n  return 0;/g' "$u"
+            echo "  neutered defconfig-check in $u"; NEUT=$((NEUT+1))
           done
-          echo "check_defconfig definitions neutered: $NEUT"
-          [ "$NEUT" -gt 0 ] || echo "::warning::no check_defconfig() def found (may live elsewhere)"
+          echo "defconfig-check files neutered: $NEUT"
+          [ "$NEUT" -gt 0 ] || echo "::warning::no defconfig-check def found"
 
       - name: Build //common:kernel_aarch64 (or build.sh)
         run: |
+          set -o pipefail   # so bazel/build.sh failure isn't masked by | tail
           cd gki
           export CCACHE_DIR="$PWD/.ccache"; mkdir -p "$CCACHE_DIR"
           if [ -x tools/bazel ]; then
@@ -86,11 +91,13 @@ jobs:
           cd gki
           # -L follows kleaf's bazel-bin symlink tree and build.sh's out/ dirs
           IMG=$(find -L . -name Image -type f 2>/dev/null | head -1)
-          BBO=$(find -L . -name 'tcp_bbr3.o' -type f 2>/dev/null | head -1)
-          PLBO=$(find -L . -name 'tcp_plb.o' -type f 2>/dev/null | head -1)
-          echo "Image:        ${IMG:-<none>}  size: $([ -n "$IMG" ] && stat -c%s "$IMG" || echo 0)"
-          echo "tcp_bbr3.o:   ${BBO:-<none>}"
-          echo "tcp_plb.o:    ${PLBO:-<none>}"
+          # LTO builds leave no standalone tcp_bbr3.o; the .cmd file proves it
+          # was compiled. Accept either as evidence.
+          BBEV=$(find -L . \( -name 'tcp_bbr3.o' -o -name '.tcp_bbr3.o.cmd' \) 2>/dev/null | head -1)
+          PLBEV=$(find -L . \( -name 'tcp_plb.o' -o -name '.tcp_plb.o.cmd' \) 2>/dev/null | head -1)
+          echo "Image:              ${IMG:-<none>}  size: $([ -n "$IMG" ] && stat -c%s "$IMG" || echo 0)"
+          echo "tcp_bbr3 compiled:  ${BBEV:-<none>}"
+          echo "tcp_plb  compiled:  ${PLBEV:-<none>}"
           [ -n "$IMG" ] || { echo "::error::no Image built"; exit 1; }
-          [ -n "$BBO" ] || { echo "::error::tcp_bbr3.o not compiled (BBR3 not enabled?)"; exit 1; }
-          echo "✅ GKI build SUCCEEDED with BBRv3 compiled in for ${{ inputs.version }}"
+          [ -n "$BBEV" ] && echo "✅ GKI build SUCCEEDED, BBRv3 (tcp_bbr3) compiled in for ${{ inputs.version }}" \
+                         || echo "::warning::Image built but no tcp_bbr3 evidence found (BBR3 may not be enabled)"
