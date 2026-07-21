@@ -31,8 +31,8 @@ jobs:
         run: |
           sudo apt-get -qq update
           sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
-            git curl python3 python3-pip flex bison libssl-dev libelf-dev bc \
-            rsync unzip zip ccache lld
+            build-essential git curl python3 python3-pip flex bison libssl-dev \
+            libelf-dev bc rsync unzip zip ccache lld
           mkdir -p ~/bin
           curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
@@ -56,13 +56,20 @@ jobs:
           RAW="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
           curl -fsSL "$RAW/0001-net-tcp-backport-BBRv3-to-$V.patch" -o /tmp/bbr3.patch
           ( cd common && git apply --index /tmp/bbr3.patch )
-          echo "CONFIG_TCP_CONG_BBR3=y" >> common/arch/arm64/configs/gki_defconfig
-          # GKI enforces gki_defconfig == `make savedefconfig`; a raw append
-          # breaks that check. Regenerate it canonically via kleaf's
-          # savedefconfig runner (writes the normalized file back to source).
-          tools/bazel run //common:kernel_aarch64_savedefconfig 2>&1 | tail -40 || \
-            echo "::warning::savedefconfig target run non-zero (continuing to build)"
-          echo "BBR3 present after normalize: $(grep -c 'CONFIG_TCP_CONG_BBR3=y' common/arch/arm64/configs/gki_defconfig)"
+          # Enable BBR3, then normalize gki_defconfig to canonical savedefconfig
+          # form — GKI's check_defconfig (both build.sh and kleaf) rejects a raw
+          # append. savedefconfig is pure kconfig (HOSTCC only, no cross/clang).
+          DEF=common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_TCP_CONG_BBR3=y" >> "$DEF"
+          # use the tree's clang so the normalize matches the build's clang savedefconfig
+          CLANGBIN=$(ls -d "$PWD"/prebuilts/clang/host/linux-x86/clang-*/bin 2>/dev/null | sort | tail -1)
+          if [ -n "$CLANGBIN" ]; then export PATH="$CLANGBIN:$PATH"; LLVMFLAG="LLVM=1"; else LLVMFLAG=""; fi
+          echo "normalize compiler: ${CLANGBIN:-host-gcc}"
+          make -C common ARCH=arm64 $LLVMFLAG O="$PWD/out_norm" gki_defconfig >/dev/null
+          make -C common ARCH=arm64 $LLVMFLAG O="$PWD/out_norm" savedefconfig >/dev/null
+          cp out_norm/defconfig "$DEF"
+          rm -rf out_norm
+          echo "BBR3 canonical in gki_defconfig: $(grep -c 'CONFIG_TCP_CONG_BBR3=y' "$DEF")"
 
       - name: Build //common:kernel_aarch64 (or build.sh)
         run: |
@@ -79,9 +86,13 @@ jobs:
       - name: Locate built Image + confirm tcp_bbr3.o compiled
         run: |
           cd gki
-          IMG=$(find . -path '*kernel_aarch64*' -name Image -o -name Image | head -1)
-          echo "Image: ${IMG:-<none>}  size: $([ -n "$IMG" ] && stat -c%s "$IMG" || echo 0)"
-          echo "tcp_bbr3.o built:  $(find . -name 'tcp_bbr3.o' | head -1)"
-          echo "tcp_plb.o (older): $(find . -name 'tcp_plb.o' | head -1)"
+          # -L follows kleaf's bazel-bin symlink tree and build.sh's out/ dirs
+          IMG=$(find -L . -name Image -type f 2>/dev/null | head -1)
+          BBO=$(find -L . -name 'tcp_bbr3.o' -type f 2>/dev/null | head -1)
+          PLBO=$(find -L . -name 'tcp_plb.o' -type f 2>/dev/null | head -1)
+          echo "Image:        ${IMG:-<none>}  size: $([ -n "$IMG" ] && stat -c%s "$IMG" || echo 0)"
+          echo "tcp_bbr3.o:   ${BBO:-<none>}"
+          echo "tcp_plb.o:    ${PLBO:-<none>}"
           [ -n "$IMG" ] || { echo "::error::no Image built"; exit 1; }
-          echo "✅ GKI build succeeded with BBRv3 for ${{ inputs.version }}"
+          [ -n "$BBO" ] || { echo "::error::tcp_bbr3.o not compiled (BBR3 not enabled?)"; exit 1; }
+          echo "✅ GKI build SUCCEEDED with BBRv3 compiled in for ${{ inputs.version }}"
