@@ -56,22 +56,13 @@ jobs:
           RAW="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
           curl -fsSL "$RAW/0001-net-tcp-backport-BBRv3-to-$V.patch" -o /tmp/bbr3.patch
           ( cd common && git apply --index /tmp/bbr3.patch )
-          echo "CONFIG_TCP_CONG_BBR3=y" >> common/arch/arm64/configs/gki_defconfig
-          # We intentionally add a non-canonical config; GKI would reject
-          # gki_defconfig != savedefconfig via a shell check. Two variants exist:
-          #   check_defconfig()                       (build.sh + older kleaf)
-          #   kleaf_internal_check_defconfig_minimized (newer kleaf)
-          # Neuter both (return 0 at the top of the def) wherever defined.
-          NEUT=0
-          for u in $(grep -rlIE 'check_defconfig\(\)|kleaf_internal_check_defconfig_minimized' . 2>/dev/null); do
-            perl -0777 -pi -e 's/(\bcheck_defconfig\s*\(\)\s*\{)/$1\n  return 0;/g;
-                                s/(\bfunction\s+check_defconfig\s*\{)/$1\n  return 0;/g;
-                                s/(\bkleaf_internal_check_defconfig_minimized\s*\(\)\s*\{)/$1\n  return 0;/g;
-                                s/(\bfunction\s+kleaf_internal_check_defconfig_minimized\s*\{)/$1\n  return 0;/g' "$u"
-            echo "  neutered defconfig-check in $u"; NEUT=$((NEUT+1))
-          done
-          echo "defconfig-check files neutered: $NEUT"
-          [ "$NEUT" -gt 0 ] || echo "::warning::no defconfig-check def found"
+          # Enable BBR3 WITHOUT touching gki_defconfig: flip its Kconfig
+          # `default n` -> `default y`. TCP_CONG_BBR3 is a tristate under
+          # TCP_CONG_ADVANCED (=y in gki_defconfig), so this compiles
+          # tcp_bbr3.c into the kernel on BOTH build.sh and kleaf, and since
+          # gki_defconfig is unchanged, check_defconfig stays satisfied.
+          perl -0777 -pi -e 's/(config TCP_CONG_BBR3\s*\n\s*tristate[^\n]*\n(?:\s*depends on[^\n]*\n)?(?:\s*select[^\n]*\n)*\s*)default n/${1}default y/' common/net/ipv4/Kconfig
+          echo "TCP_CONG_BBR3 default line:"; grep -A5 '^config TCP_CONG_BBR3' common/net/ipv4/Kconfig | grep -E 'default'
 
       - name: Build //common:kernel_aarch64 (or build.sh)
         run: |
