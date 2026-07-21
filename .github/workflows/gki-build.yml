@@ -62,8 +62,17 @@ jobs:
           # (two shell-fn variants: check_defconfig for build.sh + older kleaf,
           # kleaf_internal_check_defconfig_minimized for newer kleaf).
           DEF=common/arch/arm64/configs/gki_defconfig
-          grep -qx 'CONFIG_TCP_CONG_ADVANCED=y' "$DEF" || echo 'CONFIG_TCP_CONG_ADVANCED=y' >> "$DEF"
-          echo 'CONFIG_TCP_CONG_BBR3=y' >> "$DEF"
+          if grep -qx 'CONFIG_TCP_CONG_ADVANCED=y' "$DEF"; then
+            # 6.6/6.12: advanced block already on + module_outs matches -> just BBR3
+            echo 'CONFIG_TCP_CONG_BBR3=y' >> "$DEF"
+          else
+            # 5.10/5.15/6.1: turn the advanced block on and build EVERY CC option
+            # in it built-in (=y) — otherwise the newly-exposed CCs default to =m
+            # and kleaf's module_outs (which lists none of them) fails the build.
+            echo 'CONFIG_TCP_CONG_ADVANCED=y' >> "$DEF"
+            awk '/^if TCP_CONG_ADVANCED/{f=1} /^endif/{f=0} f&&/^config TCP_CONG_/{print "CONFIG_"$2"=y"}' \
+              common/net/ipv4/Kconfig >> "$DEF"
+          fi
           for u in $(grep -rlIE 'check_defconfig\(\)|kleaf_internal_check_defconfig_minimized' . 2>/dev/null); do
             perl -0777 -pi -e 's/(\bcheck_defconfig\s*\(\)\s*\{)/$1\n  return 0;/g;
                                 s/(\bfunction\s+check_defconfig\s*\{)/$1\n  return 0;/g;
