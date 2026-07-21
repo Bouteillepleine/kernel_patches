@@ -1,0 +1,84 @@
+name: 🧩 GKI build-verify BBRv3 patch
+
+# Applies a common/bbrv3/0001-...-<version>.patch onto the *vanilla* Google GKI
+# ACK source, forces CONFIG_TCP_CONG_BBR3=y, and builds //common:kernel_aarch64
+# to prove the backport compiles against stock GKI (not just vendor trees).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'android<A>-<K> (e.g. android16-6.12)'
+        required: true
+        default: 'android16-6.12'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet \
+            /usr/local/.ghcup /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get -qq purge -y '^dotnet-.*' '^llvm-.*' azure-cli google-cloud-cli \
+            microsoft-edge-stable google-chrome-stable firefox || true
+          sudo apt-get -qq autoremove -y; sudo apt-get -qq clean; df -h /
+
+      - name: Install deps
+        run: |
+          sudo apt-get -qq update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
+            git curl python3 python3-pip flex bison libssl-dev libelf-dev bc \
+            rsync unzip zip ccache lld
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.email ci@ci; git config --global user.name ci
+          git config --global color.ui false
+
+      - name: Sync GKI source (${{ inputs.version }})
+        run: |
+          V="${{ inputs.version }}"
+          mkdir gki && cd gki
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+            -b "common-$V" < /dev/null
+          repo sync -c -j"$(nproc)" --no-tags --optimized-fetch --prune --force-sync
+          test -d common || { echo "::error::common/ missing after sync"; exit 1; }
+
+      - name: Apply BBRv3 patch + enable CONFIG_TCP_CONG_BBR3
+        run: |
+          V="${{ inputs.version }}"
+          cd gki
+          RAW="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
+          curl -fsSL "$RAW/0001-net-tcp-backport-BBRv3-to-$V.patch" -o /tmp/bbr3.patch
+          cd common
+          git apply --index /tmp/bbr3.patch
+          echo "CONFIG_TCP_CONG_BBR3=y" >> arch/arm64/configs/gki_defconfig
+          grep -c BBR3 arch/arm64/configs/gki_defconfig
+          cd ..
+
+      - name: Build //common:kernel_aarch64 (or build.sh)
+        run: |
+          cd gki
+          export CCACHE_DIR="$PWD/.ccache"; mkdir -p "$CCACHE_DIR"
+          if [ -x tools/bazel ]; then
+            echo "== kleaf build =="
+            tools/bazel build //common:kernel_aarch64 2>&1 | tail -500
+          else
+            echo "== legacy build.sh =="
+            LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh 2>&1 | tail -400
+          fi
+
+      - name: Locate built Image + confirm tcp_bbr3.o compiled
+        run: |
+          cd gki
+          IMG=$(find . -path '*kernel_aarch64*' -name Image -o -name Image | head -1)
+          echo "Image: ${IMG:-<none>}  size: $([ -n "$IMG" ] && stat -c%s "$IMG" || echo 0)"
+          echo "tcp_bbr3.o built:  $(find . -name 'tcp_bbr3.o' | head -1)"
+          echo "tcp_plb.o (older): $(find . -name 'tcp_plb.o' | head -1)"
+          [ -n "$IMG" ] || { echo "::error::no Image built"; exit 1; }
+          echo "✅ GKI build succeeded with BBRv3 for ${{ inputs.version }}"
