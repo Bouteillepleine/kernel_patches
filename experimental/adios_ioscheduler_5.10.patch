@@ -1,8 +1,8 @@
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
-index 27f11320b8d12..e98585dd83e0f 100644
+index 2f2158e05..2fbe7c1d0 100644
 --- a/block/Kconfig.iosched
 +++ b/block/Kconfig.iosched
-@@ -16,6 +16,20 @@ config MQ_IOSCHED_KYBER
+@@ -18,6 +18,20 @@ config MQ_IOSCHED_KYBER
  	  synchronous writes, it will self-tune queue depths to achieve that
  	  goal.
  
@@ -22,25 +22,26 @@ index 27f11320b8d12..e98585dd83e0f 100644
 +
  config IOSCHED_BFQ
  	tristate "BFQ I/O scheduler"
- 	select BLK_ICQ
+ 	help
 diff --git a/block/Makefile b/block/Makefile
-index 46ada9dc8bbfe..2fd10afbaaeb9 100644
+index 8d841f5f9..f34bd75ba 100644
 --- a/block/Makefile
 +++ b/block/Makefile
-@@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
+@@ -21,6 +21,8 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
  obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
  obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
 +obj-$(CONFIG_MQ_IOSCHED_ADIOS)	+= adios.o
++CFLAGS_adios.o += -std=gnu11
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
 diff --git a/block/adios.c b/block/adios.c
-new file mode 100644
-index 0000000000000..a1b2c3d4e5f67
+new file mode 100755
+index 000000000..e2f6e9e27
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,2092 @@
+@@ -0,0 +1,2100 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -52,7 +53,7 @@ index 0000000000000..a1b2c3d4e5f67
 +#include <linux/fs.h>
 +#include <linux/init.h>
 +#include <linux/kernel.h>
-+#include <linux/math.h>
++#include <linux/math64.h>
 +#include <linux/module.h>
 +#include <linux/rbtree.h>
 +#include <linux/sbitmap.h>
@@ -62,11 +63,21 @@ index 0000000000000..a1b2c3d4e5f67
 +#include <linux/string.h>
 +#include <linux/list_sort.h>
 +#include <linux/rcupdate.h>
++#include <linux/elevator.h>
 +
-+#include "elevator.h"
 +#include "blk.h"
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
++
++/* 5.10 lacks blk_mq_free_requests(); free a list one request at a time. */
++static inline void adios_free_requests(struct list_head *list) {
++	while (!list_empty(list)) {
++		struct request *rq =
++			list_first_entry(list, struct request, queuelist);
++		list_del_init(&rq->queuelist);
++		blk_mq_free_request(rq);
++	}
++}
 +
 +#define ADIOS_VERSION "3.1.9"
 +
@@ -843,14 +854,14 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +// Convert a queue depth to the corresponding word depth for shallow allocation
 +static int to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth) {
-+	struct sbitmap_queue *bt = &hctx->sched_tags->bitmap_tags;
++	struct sbitmap_queue *bt = hctx->sched_tags->bitmap_tags;
 +	const unsigned int nrr = hctx->queue->nr_requests;
 +
 +	return ((qdepth << bt->sb.shift) + nrr - 1) / nrr;
 +}
 +
 +// We limit the depth of request allocation for asynchronous and write requests
-+static void adios_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data) {
++static void adios_limit_depth(unsigned int opf, struct blk_mq_alloc_data *data) {
 +	struct adios_data *ad = data->q->elevator->elevator_data;
 +
 +	// Do not throttle synchronous reads
@@ -868,7 +879,7 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +	ad->async_depth = q->nr_requests;
 +
-+	sbitmap_queue_min_shallow_depth(&tags->bitmap_tags, 1);
++	sbitmap_queue_min_shallow_depth(tags->bitmap_tags, 1);
 +}
 +
 +// Handle request merging after a merge operation
@@ -894,8 +905,9 @@ index 0000000000000..a1b2c3d4e5f67
 +}
 +
 +// Try to merge a bio into an existing rq before associating it with an rq
-+static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
++static bool adios_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio,
 +		unsigned int nr_segs) {
++	struct request_queue *q = hctx->queue;
 +	unsigned long flags;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +	struct request *free = NULL;
@@ -920,7 +932,7 @@ index 0000000000000..a1b2c3d4e5f67
 +		struct request *rq, struct request_queue *q, struct list_head *free) {
 +	bool dl_idx;
 +
-+	if (blk_mq_sched_try_insert_merge(q, rq, free))
++	if (blk_mq_sched_try_insert_merge(q, rq))
 +		return true;
 +
 +	dl_idx = adios_optype_not_read(rq);
@@ -1068,7 +1080,7 @@ index 0000000000000..a1b2c3d4e5f67
 +		spin_unlock_irqrestore(&ad->lock, flags);
 +	} while (!stop);
 +
-+	blk_mq_free_requests(&free);
++	adios_free_requests(&free);
 +}
 +
 +// Prepare a request before it is inserted into the scheduler
@@ -1098,7 +1110,7 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +// Comparison function for sorting requests by block address
 +static int cmp_rq_pos(void *priv,
-+		const struct list_head *a, const struct list_head *b) {
++		struct list_head *a, struct list_head *b) {
 +	struct request *rq_a = list_entry(a, struct request, queuelist);
 +	struct request *rq_b = list_entry(b, struct request, queuelist);
 +	u64 pos_a = blk_rq_pos(rq_a);
@@ -1435,7 +1447,7 @@ index 0000000000000..a1b2c3d4e5f67
 +		}
 +
 +		if (!list_empty(&free_list))
-+			blk_mq_free_requests(&free_list);
++			adios_free_requests(&free_list);
 +	}
 +
 +	return true;
@@ -1684,11 +1696,8 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +	timer_setup(&ad->update_timer, update_timer_callback, 0);
 +
-+	/* We dispatch from request queue wide instead of hw queue */
-+	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
-+
 +	ad->queue = q;
-+	blk_stat_enable_accounting(q);
++	blk_queue_flag_set(QUEUE_FLAG_STATS, q);
 +
 +	q->elevator = eq;
 +	return 0;
@@ -1742,7 +1751,7 @@ index 0000000000000..a1b2c3d4e5f67
 +	if (ad->dl_group_pool)
 +		kmem_cache_destroy(ad->dl_group_pool);
 +
-+	blk_stat_disable_accounting(ad->queue);
++	blk_queue_flag_clear(QUEUE_FLAG_STATS, ad->queue);
 +
 +	kfree(ad);
 +}
@@ -2134,28 +2143,22 @@ index 0000000000000..a1b2c3d4e5f67
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 diff --git a/block/elevator.c b/block/elevator.c
-index 5ff093cb3cf8f..1cbc62507c187 100644
+index 293c5c813..0d9c6dedf 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -556,10 +556,21 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
+@@ -621,10 +621,15 @@ static inline bool elv_support_iosched(struct request_queue *q)
+  */
+ static struct elevator_type *elevator_get_default(struct request_queue *q)
  {
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	struct elevator_type *e;
++	return elevator_get(q, "adios", false);
++#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 +
-+	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
-+		return NULL;
-+
-+	e = elevator_get(q, "adios", false);
-+	if (e)
-+		return e;
-+#endif
-+
- 	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
- 		return NULL;
- 
- 	if (q->nr_hw_queues != 1 &&
- 	    !blk_mq_is_shared_tags(q->tag_set->flags))
+ 	if (q->nr_hw_queues != 1)
  		return NULL;
  
  	return elevator_get(q, "mq-deadline", false);
++#endif // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
  }
+ 
+ /*

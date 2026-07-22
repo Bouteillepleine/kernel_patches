@@ -8,7 +8,7 @@ index 27f11320b8d12..e98585dd83e0f 100644
  
 +config MQ_IOSCHED_ADIOS
 +	tristate "Adaptive Deadline I/O scheduler"
-+	default m
++	default y
 +	help
 +	  The Adaptive Deadline I/O Scheduler (ADIOS) is a multi-queue I/O
 +	  scheduler with learning-based adaptive latency control.
@@ -40,7 +40,7 @@ new file mode 100644
 index 0000000000000..a1b2c3d4e5f67
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,2018 @@
+@@ -0,0 +1,2049 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -736,6 +736,10 @@ index 0000000000000..a1b2c3d4e5f67
 +static inline u32 eval_adios_state(struct adios_data *ad, u32 shift)
 +{ return eval_this_adios_state(get_adios_state(ad), shift); }
 +
++// Forward declaration: add_to_dl_tree() may fall back to the prio queue
++static void insert_to_prio_queue(
++		struct adios_data *ad, struct request *rq, bool pq_idx);
++
 +// Add a request to the deadline-sorted red-black tree
 +static void add_to_dl_tree(
 +		struct adios_data *ad, bool dl_idx, struct request *rq) {
@@ -782,8 +786,12 @@ index 0000000000000..a1b2c3d4e5f67
 +	dlg = rb_entry_safe(parent, struct dl_group, node);
 +	if (!dlg || dlg->deadline != deadline) {
 +		dlg = kmem_cache_zalloc(ad->dl_group_pool, GFP_ATOMIC);
-+		if (!dlg)
++		if (!dlg) {
++			/* Under memory pressure, fall back to the priority queue
++			 * so the request is still dispatched instead of lost. */
++			insert_to_prio_queue(ad, rq, 1);
 +			return;
++		}
 +		dlg->deadline = deadline;
 +		INIT_LIST_HEAD(&dlg->rqs);
 +		rb_link_node(&dlg->node, parent, link);
@@ -928,12 +936,15 @@ index 0000000000000..a1b2c3d4e5f67
 +		struct request *rq, bool pq_idx) {
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +
-+	/* We're sure that rd->managed == true */
-+	union adios_in_flight_rqs ifr = {
-+		.count          = 1,
-+		.total_pred_lat = rd->pred_lat,
-+	};
-+	atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
++	/* rd may be NULL if adios_prepare_request() failed to allocate it
++	 * under memory pressure; such a request is dispatched unmanaged. */
++	if (likely(rd)) {
++		union adios_in_flight_rqs ifr = {
++			.count          = 1,
++			.total_pred_lat = rd->pred_lat,
++		};
++		atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
++	}
 +
 +	scoped_guard(spinlock_irqsave, &ad->pq_lock) {
 +		bool was_empty = list_empty(&ad->prio_queue[pq_idx]);
@@ -951,6 +962,13 @@ index 0000000000000..a1b2c3d4e5f67
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +	u8 optype = adios_optype(rq);
 +	bool rq_is_flush;
++
++	/* rd alloc failed at prepare time: dispatch unmanaged via the prio
++	 * queue so the request is not lost. */
++	if (unlikely(!rd)) {
++		insert_to_prio_queue(ad, rq, !(insert_flags & BLK_MQ_INSERT_AT_HEAD));
++		return;
++	}
 +
 +	rd->managed = true;
 +	rd->block_size = blk_rq_bytes(rq);
@@ -992,6 +1010,12 @@ index 0000000000000..a1b2c3d4e5f67
 +	u8 optype = adios_optype(rq);
 +	u8 pq_idx = !(insert_flags & BLK_MQ_INSERT_AT_HEAD);
 +	bool stable = false;
++
++	/* rd alloc failed at prepare time: dispatch unmanaged. */
++	if (unlikely(!rd)) {
++		insert_to_prio_queue(ad, rq, pq_idx);
++		return;
++	}
 +
 +	rd->managed = true;
 +	rd->block_size = blk_rq_bytes(rq);
@@ -1433,6 +1457,11 @@ index 0000000000000..a1b2c3d4e5f67
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +	union adios_in_flight_rqs ifr = { .scalar = 0 };
 +
++	/* Unmanaged request (rd alloc failed at prepare time): nothing
++	 * was accounted for it, so there is nothing to reconcile. */
++	if (unlikely(!rd))
++		return;
++
 +	if (rd->managed) {
 +		union adios_in_flight_rqs ifr_to_sub = {
 +			.count          = 1,
@@ -1468,7 +1497,9 @@ index 0000000000000..a1b2c3d4e5f67
 +		if (ad->last_completed_pos > 0) {
 +			u64 seek_distance = abs(
 +				(s64)current_pos - (s64)ad->last_completed_pos);
-+			weight = 65 - __builtin_clzll(seek_distance);
++			/* __builtin_clzll(0) is undefined; a zero seek is sequential. */
++			weight = seek_distance ?
++				65 - __builtin_clzll(seek_distance) : 1;
 +		}
 +		// Update (or re-synchronize) our knowledge of the head position.
 +		ad->last_completed_pos = current_pos + blk_rq_sectors(rq);

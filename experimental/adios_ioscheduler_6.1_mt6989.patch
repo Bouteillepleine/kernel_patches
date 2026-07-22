@@ -8,7 +8,7 @@ index 27f11320b8d12..e98585dd83e0f 100644
  
 +config MQ_IOSCHED_ADIOS
 +	tristate "Adaptive Deadline I/O scheduler"
-+	default m
++	default y
 +	help
 +	  The Adaptive Deadline I/O Scheduler (ADIOS) is a multi-queue I/O
 +	  scheduler with learning-based adaptive latency control.
@@ -40,7 +40,7 @@ new file mode 100644
 index 0000000000000..a1b2c3d4e5f67
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,2035 @@
+@@ -0,0 +1,2092 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -736,6 +736,10 @@ index 0000000000000..a1b2c3d4e5f67
 +static inline u32 eval_adios_state(struct adios_data *ad, u32 shift)
 +{ return eval_this_adios_state(get_adios_state(ad), shift); }
 +
++// Forward declaration: add_to_dl_tree() may fall back to the prio queue
++static void insert_to_prio_queue(
++		struct adios_data *ad, struct request *rq, bool pq_idx);
++
 +// Add a request to the deadline-sorted red-black tree
 +static void add_to_dl_tree(
 +		struct adios_data *ad, bool dl_idx, struct request *rq) {
@@ -765,8 +769,9 @@ index 0000000000000..a1b2c3d4e5f67
 +	deadline = rd->deadline & ~((1ULL << ADIOS_QUANTUM_SHIFT) - 1);
 +
 +	while (*link) {
++		s64 diff;
 +		dlg = rb_entry(*link, struct dl_group, node);
-+		s64 diff = deadline - dlg->deadline;
++		diff = deadline - dlg->deadline;
 +
 +		parent = *link;
 +		if (diff < 0) {
@@ -782,8 +787,12 @@ index 0000000000000..a1b2c3d4e5f67
 +	dlg = rb_entry_safe(parent, struct dl_group, node);
 +	if (!dlg || dlg->deadline != deadline) {
 +		dlg = kmem_cache_zalloc(ad->dl_group_pool, GFP_ATOMIC);
-+		if (!dlg)
++		if (!dlg) {
++			/* Under memory pressure, fall back to the priority queue
++			 * so the request is still dispatched instead of lost. */
++			insert_to_prio_queue(ad, rq, 1);
 +			return;
++		}
 +		dlg->deadline = deadline;
 +		INIT_LIST_HEAD(&dlg->rqs);
 +		rb_link_node(&dlg->node, parent, link);
@@ -909,10 +918,12 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +static bool merge_or_insert_to_dl_tree(struct adios_data *ad,
 +		struct request *rq, struct request_queue *q, struct list_head *free) {
++	bool dl_idx;
++
 +	if (blk_mq_sched_try_insert_merge(q, rq, free))
 +		return true;
 +
-+	bool dl_idx = adios_optype_not_read(rq);
++	dl_idx = adios_optype_not_read(rq);
 +	add_to_dl_tree(ad, dl_idx, rq);
 +
 +	if (rq_mergeable(rq)) {
@@ -928,16 +939,20 @@ index 0000000000000..a1b2c3d4e5f67
 +		struct request *rq, bool pq_idx) {
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +	unsigned long flags;
++	bool was_empty;
 +
-+	/* We're sure that rd->managed == true */
-+	union adios_in_flight_rqs ifr = {
-+		.count          = 1,
-+		.total_pred_lat = rd->pred_lat,
-+	};
-+	atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
++	/* rd may be NULL if adios_prepare_request() failed to allocate it
++	 * under memory pressure; such a request is dispatched unmanaged. */
++	if (likely(rd)) {
++		union adios_in_flight_rqs ifr = {
++			.count          = 1,
++			.total_pred_lat = rd->pred_lat,
++		};
++		atomic64_add(ifr.scalar, &ad->in_flight_rqs.atomic);
++	}
 +
 +	spin_lock_irqsave(&ad->pq_lock, flags);
-+	bool was_empty = list_empty(&ad->prio_queue[pq_idx]);
++	was_empty = list_empty(&ad->prio_queue[pq_idx]);
 +	list_add_tail(&rq->queuelist, &ad->prio_queue[pq_idx]);
 +	if (was_empty)
 +		set_adios_state(ad, ADIOS_STATE_PQ, pq_idx, true);
@@ -952,6 +967,13 @@ index 0000000000000..a1b2c3d4e5f67
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +	u8 optype = adios_optype(rq);
 +	bool rq_is_flush;
++
++	/* rd alloc failed at prepare time: dispatch unmanaged via the prio
++	 * queue so the request is not lost. */
++	if (unlikely(!rd)) {
++		insert_to_prio_queue(ad, rq, !at_head);
++		return;
++	}
 +
 +	rd->managed = true;
 +	rd->block_size = blk_rq_bytes(rq);
@@ -994,6 +1016,12 @@ index 0000000000000..a1b2c3d4e5f67
 +	u8 optype = adios_optype(rq);
 +	u8 pq_idx = !at_head;
 +	bool stable = false;
++
++	/* rd alloc failed at prepare time: dispatch unmanaged. */
++	if (unlikely(!rd)) {
++		insert_to_prio_queue(ad, rq, pq_idx);
++		return;
++	}
 +
 +	rd->managed = true;
 +	rd->block_size = blk_rq_bytes(rq);
@@ -1086,22 +1114,27 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +// Update the elevator direction
 +static void update_elv_direction(struct adios_data *ad) {
++	bool page;
++	struct list_head *q;
++	struct request *rq_a, *rq_b;
++	u64 pos_a, pos_b, avg_rq_pos;
++
 +	if (!ad->is_rotational)
 +		return;
 +
-+	bool page = ad->bq_page;
-+	struct list_head *q = &ad->batch_queue[page][1];
++	page = ad->bq_page;
++	q = &ad->batch_queue[page][1];
 +	if (ad->bq_batch_order[page] < ADIOS_BO_ELEVATOR || list_empty(q)) {
 +		ad->elv_direction = 0;
 +		return;
 +	}
 +
 +	// Get first and last request positions in the queue
-+	struct request *rq_a = list_first_entry(q, struct request, queuelist);
-+	struct request *rq_b = list_last_entry (q, struct request, queuelist);
-+	u64 pos_a = blk_rq_pos(rq_a);
-+	u64 pos_b = blk_rq_pos(rq_b);
-+	u64 avg_rq_pos = (pos_a + pos_b) >> 1;
++	rq_a = list_first_entry(q, struct request, queuelist);
++	rq_b = list_last_entry (q, struct request, queuelist);
++	pos_a = blk_rq_pos(rq_a);
++	pos_b = blk_rq_pos(rq_b);
++	avg_rq_pos = (pos_a + pos_b) >> 1;
 +
 +	ad->elv_direction = !!(ad->head_pos > avg_rq_pos);
 +}
@@ -1244,10 +1277,12 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +static struct request *pop_next_bq_request_optype(struct adios_data *ad) {
 +	u32 bq_state = ad->bq_state[ad->bq_page];
++	struct request *rq;
++	u32 bq_idx;
++
 +	if (!bq_state) return NULL;
 +
-+	struct request *rq;
-+	u32 bq_idx = __builtin_ctz(bq_state);
++	bq_idx = __builtin_ctz(bq_state);
 +
 +	// Dispatch based on optype (FIFO within each) or single-queue elevator
 +	rq = pop_bq_request(ad, bq_idx, false);
@@ -1256,11 +1291,14 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +static struct request *pop_next_bq_request_elevator(struct adios_data *ad) {
 +	u32 bq_state = ad->bq_state[ad->bq_page];
++	struct request *rq;
++	u32 bq_idx;
++	bool direction;
++
 +	if (!bq_state) return NULL;
 +
-+	struct request *rq;
-+	u32 bq_idx = __builtin_ctz(bq_state);
-+	bool direction = (bq_idx == 1) & ad->elv_direction;
++	bq_idx = __builtin_ctz(bq_state);
++	direction = (bq_idx == 1) & ad->elv_direction;
 +
 +	// Tier-2 (sync) is always high priority
 +	// Tier-3 (async) uses the pre-calculated elevator direction
@@ -1282,15 +1320,17 @@ index 0000000000000..a1b2c3d4e5f67
 +static struct request *dispatch_from_bq(struct adios_data *ad) {
 +	struct request *rq;
 +	unsigned long flags;
++	u32 state, bq_state, bq_curr_page_has_rq;
++	union adios_in_flight_rqs ifr;
++	u64 tpl;
 +
 +	spin_lock_irqsave(&ad->bq_lock, flags);
 +
-+	u32 state = get_adios_state(ad);
-+	u32 bq_state = eval_this_adios_state(state, ADIOS_STATE_BQ);
-+	u32 bq_curr_page_has_rq = bq_page_has_rq(bq_state, ad->bq_page);
-+	union adios_in_flight_rqs ifr;
++	state = get_adios_state(ad);
++	bq_state = eval_this_adios_state(state, ADIOS_STATE_BQ);
++	bq_curr_page_has_rq = bq_page_has_rq(bq_state, ad->bq_page);
 +	ifr.scalar = atomic64_read(&ad->in_flight_rqs.atomic);
-+	u64 tpl = ifr.total_pred_lat;
++	tpl = ifr.total_pred_lat;
 +
 +	// Refill the batch queues if the back page is empty, dl_tree has work, and
 +	// current page is empty or the total ongoing latency is below the threshold
@@ -1325,11 +1365,14 @@ index 0000000000000..a1b2c3d4e5f67
 +static struct request *dispatch_from_pq(struct adios_data *ad) {
 +	struct request *rq = NULL;
 +	unsigned long flags;
++	u32 pq_state;
++	u8  pq_idx;
++	struct list_head *q;
 +
 +	spin_lock_irqsave(&ad->pq_lock, flags);
-+	u32 pq_state = eval_adios_state(ad, ADIOS_STATE_PQ);
-+	u8  pq_idx = pq_state >> 1;
-+	struct list_head *q = &ad->prio_queue[pq_idx];
++	pq_state = eval_adios_state(ad, ADIOS_STATE_PQ);
++	pq_idx = pq_state >> 1;
++	q = &ad->prio_queue[pq_idx];
 +
 +	if (unlikely(list_empty(q))) {
 +		spin_unlock_irqrestore(&ad->pq_lock, flags);
@@ -1450,6 +1493,15 @@ index 0000000000000..a1b2c3d4e5f67
 +	struct adios_data *ad = rq->q->elevator->elevator_data;
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +	union adios_in_flight_rqs ifr = { .scalar = 0 };
++	u8 optype;
++	u64 lct;
++	u64 latency;
++	u32 weight;
++
++	/* Unmanaged request (rd alloc failed at prepare time): nothing
++	 * was accounted for it, so there is nothing to reconcile. */
++	if (unlikely(!rd))
++		return;
 +
 +	if (rd->managed) {
 +		union adios_in_flight_rqs ifr_to_sub = {
@@ -1459,7 +1511,7 @@ index 0000000000000..a1b2c3d4e5f67
 +		ifr.scalar = atomic64_sub_return(
 +			ifr_to_sub.scalar, &ad->in_flight_rqs.atomic);
 +	}
-+	u8 optype = adios_optype(rq);
++	optype = adios_optype(rq);
 +
 +	if (optype == ADIOS_OTHER) {
 +		// Non-positional commands make the head position unpredictable.
@@ -1469,24 +1521,26 @@ index 0000000000000..a1b2c3d4e5f67
 +		return;
 +	}
 +
-+	u64 lct = ad->last_completed_time ?: rq->io_start_time_ns;
++	lct = ad->last_completed_time ?: rq->io_start_time_ns;
 +	ad->last_completed_time = (ifr.count) ? now : 0;
 +
 +	if (!rq->io_start_time_ns || !rd->block_size || unlikely(now < lct))
 +		return;
 +
-+	u64 latency = now - lct;
++	latency = now - lct;
 +	if (latency > ad->lat_model_latency_limit)
 +		return;
 +
-+	u32 weight = 1;
++	weight = 1;
 +	if (ad->is_rotational) {
 +		sector_t current_pos = blk_rq_pos(rq);
 +		// Only calculate seek distance if we have a valid last position.
 +		if (ad->last_completed_pos > 0) {
 +			u64 seek_distance = abs(
 +				(s64)current_pos - (s64)ad->last_completed_pos);
-+			weight = 65 - __builtin_clzll(seek_distance);
++			/* __builtin_clzll(0) is undefined; a zero seek is sequential. */
++			weight = seek_distance ?
++				65 - __builtin_clzll(seek_distance) : 1;
 +		}
 +		// Update (or re-synchronize) our knowledge of the head position.
 +		ad->last_completed_pos = current_pos + blk_rq_sectors(rq);
@@ -1630,8 +1684,11 @@ index 0000000000000..a1b2c3d4e5f67
 +
 +	timer_setup(&ad->update_timer, update_timer_callback, 0);
 +
++	/* We dispatch from request queue wide instead of hw queue */
++	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
++
 +	ad->queue = q;
-+	blk_queue_flag_set(QUEUE_FLAG_STATS, q);
++	blk_stat_enable_accounting(q);
 +
 +	q->elevator = eq;
 +	return 0;
@@ -1685,7 +1742,7 @@ index 0000000000000..a1b2c3d4e5f67
 +	if (ad->dl_group_pool)
 +		kmem_cache_destroy(ad->dl_group_pool);
 +
-+	blk_queue_flag_clear(QUEUE_FLAG_STATS, ad->queue);
++	blk_stat_disable_accounting(ad->queue);
 +
 +	kfree(ad);
 +}
@@ -1779,12 +1836,12 @@ index 0000000000000..a1b2c3d4e5f67
 +} \
 +static ssize_t adios_batch_limit_##name##_store( \
 +		struct elevator_queue *e, const char *page, size_t count) { \
++	struct adios_data *ad = e->elevator_data; \
 +	unsigned long max_batch; \
 +	int ret; \
 +	ret = kstrtoul(page, 10, &max_batch); \
 +	if (ret || max_batch == 0) \
 +		return -EINVAL; \
-+	struct adios_data *ad = e->elevator_data; \
 +	ad->batch_limit[optype] = max_batch; \
 +	return count; \
 +}
@@ -1989,7 +2046,7 @@ index 0000000000000..a1b2c3d4e5f67
 +#define AD_ATTR(name, show_func, store_func) \
 +	__ATTR(name, 0644, show_func, store_func)
 +#define AD_ATTR_RW(name) \
-+	__ATTR(name, 0444, adios_##name##_show, adios_##name##_store)
++	__ATTR(name, 0644, adios_##name##_show, adios_##name##_store)
 +#define AD_ATTR_RO(name) \
 +	__ATTR(name, 0444, adios_##name##_show, NULL)
 +#define AD_ATTR_WO(name) \
