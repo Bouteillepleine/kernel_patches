@@ -932,7 +932,7 @@ index 000000000..e2f6e9e27
 +		struct request *rq, struct request_queue *q, struct list_head *free) {
 +	bool dl_idx;
 +
-+	if (blk_mq_sched_try_insert_merge(q, rq, free))
++	if (blk_mq_sched_try_insert_merge(q, rq))
 +		return true;
 +
 +	dl_idx = adios_optype_not_read(rq);
