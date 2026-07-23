@@ -905,9 +905,9 @@ index 000000000..e2f6e9e27
 +}
 +
 +// Try to merge a bio into an existing rq before associating it with an rq
-+static bool adios_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio,
++static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 +		unsigned int nr_segs) {
-+	struct request_queue *q = hctx->queue;
++	// OnePlus's 5.10 backported the 5.15-era bio_merge signature (request_queue *q)
 +	unsigned long flags;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +	struct request *free = NULL;
@@ -932,7 +932,7 @@ index 000000000..e2f6e9e27
 +		struct request *rq, struct request_queue *q, struct list_head *free) {
 +	bool dl_idx;
 +
-+	if (blk_mq_sched_try_insert_merge(q, rq))
++	if (blk_mq_sched_try_insert_merge(q, rq, free))
 +		return true;
 +
 +	dl_idx = adios_optype_not_read(rq);
