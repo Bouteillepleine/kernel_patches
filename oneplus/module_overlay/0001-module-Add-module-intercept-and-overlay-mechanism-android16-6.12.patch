@@ -1,56 +1,51 @@
 From 226882247aadf8dfe7d8fab343b43b443426b0df Mon Sep 17 00:00:00 2001
 From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
 Date: Tue, 21 Jul 2026 12:07:07 +0530
-Subject: [PATCH] [HACK]module: Add module intercept and overlay mechanism This
- commit introduces a mechanism to intercept and replace specific kernel
- modules with embedded versions compiled directly into the kernel image. The
- primary goals are:
+Subject: [PATCH] [HACK] module: add module intercept and overlay mechanism
 
-- Ensure consistent use of specific module versions
-- Prevent loading of external modules when desired
+Intercept a module image supplied by userspace and replace it with a copy
+compiled into the kernel image, so that a known-good .ko is always the one
+that ends up being loaded.
 
-Key components:
+Components:
 
 1. `kernel/module/module_overlay/`:
-   - `Makefile`: Builds overlay support objects and generates
-     `overlay_files.c` from `.ko` files in `modules/`.
-   - `convert_overlay.sh`: Build script that converts `.ko` files into
-     C byte arrays using `xxd`, sanitizes output, extracts correct
-     lengths via `_len` parsing, and generates `overlay_file_list[]`.
-   - `overlay_files.h`: Defines `struct overlay_file` and public
-     intercept APIs.
-   - `module_intercept.c`: Implements `should_intercept_module()` and
-     `intercept_module_load()` to find and replace module data during
-     `load_module()`.
+   - `Makefile`: builds the overlay objects and generates `overlay_files.c`
+     from the `.ko` files in `modules/`.
+   - `convert_overlay.sh`: zstd-compresses each `.ko`, converts it to a C
+     byte array with `xxd`, and emits `overlay_file_list[]` carrying both
+     the compressed and the uncompressed length of every entry.
+   - `overlay_files.h`: `struct overlay_file` and the intercept API.
+   - `module_intercept.c`: `should_intercept_module()` and
+     `module_overlay_image()`, which decompresses an embedded image into a
+     fresh vmalloc() buffer.
 
-2. `kernel/module/main.c`: Integrates interception logic into
-   `load_module()` before signature checks and early module validation.
-   On match, replaces `info->hdr` with embedded data via `vmalloc()` and
-   `memcpy()`, then re-runs `module_sig_check()`.
+2. `kernel/module/main.c`: hooks the interception into `load_module()` once the
+   module name is known, then re-runs the signature check and re-caches the
+   section info from the replacement image.
 
-3. `kernel/module/Makefile`: Adds `module_overlay/` subdirectory to
-   build.
+3. `kernel/module/Makefile`: builds the `module_overlay/` subdirectory.
 
 Usage:
-- Place desired `.ko` files in `kernel/module/module_overlay/modules/`
-- Rebuild kernel; matching modules will be automatically embedded
-- Interception is 1:1 by module name (without `.ko`)
-- Success logged via `pr_info("module_overlay: %s replaced...")`
+- Place a `.ko` in `kernel/module/module_overlay/modules/`, named after the module it
+  replaces (the file name minus `.ko`, with `-` folded to `_`, must equal
+  the module's own MODULE_NAME).
+- Rebuild; matching modules are embedded automatically.
+- Success is logged as `module_overlay: %s replaced with embedded version`.
 
-The implementation is non-intrusive and only activates when a matching
-embedded module is found. No changes to existing module loading paths
-occur otherwise.
+Interception only engages when a matching embedded module is present; the
+module loading path is otherwise untouched.
 ---
  kernel/module/Makefile                        |   1 +
- kernel/module/main.c                          |  43 ++++++
- kernel/module/module_overlay/Makefile         |  14 ++
- .../module/module_overlay/convert_overlay.sh  | 132 ++++++++++++++++++
- .../module/module_overlay/module_intercept.c  |  83 +++++++++++
+ kernel/module/main.c                          |  57 +++++++++
+ kernel/module/module_overlay/Makefile         |  14 +++
+ .../module/module_overlay/convert_overlay.sh  | 117 ++++++++++++++++++
+ .../module/module_overlay/module_intercept.c  |  89 +++++++++++++
  kernel/module/module_overlay/modules/.gitkeep |   0
- kernel/module/module_overlay/overlay_files.h  |  22 +++
- 7 files changed, 295 insertions(+)
+ kernel/module/module_overlay/overlay_files.h  |  21 ++++
+ 7 files changed, 299 insertions(+)
  create mode 100644 kernel/module/module_overlay/Makefile
- create mode 100644 kernel/module/module_overlay/convert_overlay.sh
+ create mode 100755 kernel/module/module_overlay/convert_overlay.sh
  create mode 100644 kernel/module/module_overlay/module_intercept.c
  create mode 100644 kernel/module/module_overlay/modules/.gitkeep
  create mode 100644 kernel/module/module_overlay/overlay_files.h
@@ -65,19 +60,18 @@ index 50ffcc4..70064c1 100644
  obj-$(CONFIG_MODULE_STATS) += stats.o
 +obj-y += module_overlay/
 diff --git a/kernel/module/main.c b/kernel/module/main.c
-index f6efc62..ed1b91d 100644
+index 2de2981..318f330 100644
 --- a/kernel/module/main.c
 +++ b/kernel/module/main.c
-@@ -65,6 +65,8 @@
+@@ -61,6 +61,7 @@
+ #include <linux/execmem.h>
+ #include <uapi/linux/module.h>
+ #include "internal.h"
++#include "module_overlay/overlay_files.h"
+ 
  #define CREATE_TRACE_POINTS
  #include <trace/events/module.h>
- 
-+#include "module_overlay/overlay_files.h"
-+
- /*
-  * Mutex protects:
-  * 1) List of modules (also safely readable with preempt_disable),
-@@ -3334,6 +3336,47 @@ static int load_module(struct load_info *info, const char __user *uargs,
+@@ -3350,6 +3351,62 @@ static int load_module(struct load_info *info, const char __user *uargs,
  	if (err)
  		goto free_copy;
  
@@ -86,38 +80,53 @@ index f6efc62..ed1b91d 100644
 +	/****************************************************************/
 +	if (should_intercept_module(info->name)) {
 +		char name_buf[MODULE_NAME_LEN];
-+    	const char *name = name_buf;
++		void *image;
++		size_t image_len;
 +
 +		/*
-+		 * Save the module name in advance to prevent the logging of an
-+		 * incorrect module name after the data has been released.
++		 * info->name points into the copy that is about to be freed,
++		 * so stash the name before releasing anything.
 +		 */
-+    	strscpy(name_buf, info->name, sizeof(name_buf));
++		strscpy(name_buf, info->name, sizeof(name_buf));
 +
-+		/*
-+		 * Module name matched; performing replacement.
-+		 */
-+		if (!intercept_module_load(info, name)) {
-+			pr_err("Failed to intercept module %s\n", name);
++		image = module_overlay_image(name_buf, &image_len);
++		if (!image) {
++			pr_err("module_overlay: failed to intercept module %s\n",
++			       name_buf);
 +			err = -EINVAL;
 +			goto free_copy;
 +		}
 +
-+		pr_info("Module %s intercepted, re-running signature check\n", name);
++		/*
++		 * Release the caller's copy through its own teardown path:
++		 * it is either a plain vmalloc() buffer or a vmap() of pages
++		 * owned by the decompressor, and the two are not
++		 * interchangeable. Clear the flag afterwards so the final
++		 * free_copy() releases our vmalloc'd replacement instead.
++		 */
++		free_copy(info, flags);
++		flags &= ~MODULE_INIT_COMPRESSED_FILE;
++
++		info->hdr = image;
++		info->len = image_len;
++
++		pr_info("module_overlay: %s intercepted, re-running signature check\n",
++			name_buf);
 +		err = module_sig_check(info, flags);
 +		if (err) {
-+			pr_err("Module %s: signature check failed after intercept!\n", name);
++			pr_err("module_overlay: %s: signature check failed after intercept\n",
++			       name_buf);
 +			goto free_copy;
 +		}
 +
-+		/* Re-examine the module and cache module information. */
++		/* Re-examine the replacement and re-cache the module information. */
 +		err = elf_validity_cache_copy(info, flags);
 +		if (err) {
-+			pr_err("Module %s: ELF validity check failed after intercept!\n", name);
++			pr_err("module_overlay: %s: ELF validity check failed after intercept\n",
++			       name_buf);
 +			goto free_copy;
 +		}
 +	}
-+
 +	/****************************************************************/
 +	/*                 END OF MODULE INTERCEPTION                   */
 +	/****************************************************************/
@@ -127,17 +136,17 @@ index f6efc62..ed1b91d 100644
  		goto free_copy;
 diff --git a/kernel/module/module_overlay/Makefile b/kernel/module/module_overlay/Makefile
 new file mode 100644
-index 0000000..ecc8072
+index 0000000..027be67
 --- /dev/null
 +++ b/kernel/module/module_overlay/Makefile
 @@ -0,0 +1,14 @@
++# SPDX-License-Identifier: GPL-2.0
 +obj-y += overlay_files.o module_intercept.o
-+extra-y += overlay_files.c
 +
-+SOURCE_PATH = "$(srctree)/$(src)"
++targets += overlay_files.c
 +
 +quiet_cmd_genoverlay = GEN     $@
-+      cmd_genoverlay = $(srctree)/kernel/module/module_overlay/convert_overlay.sh $@ $(SOURCE_PATH)
++      cmd_genoverlay = $(srctree)/kernel/module/module_overlay/convert_overlay.sh $@ "$(srctree)/$(src)"
 +
 +PHONY += FORCE
 +FORCE:
@@ -145,256 +154,244 @@ index 0000000..ecc8072
 +$(obj)/overlay_files.c: FORCE
 +	$(Q)mkdir -p $(dir $@)
 +	$(call if_changed,genoverlay)
-\ No newline at end of file
 diff --git a/kernel/module/module_overlay/convert_overlay.sh b/kernel/module/module_overlay/convert_overlay.sh
-new file mode 100644
-index 0000000..e135300
+new file mode 100755
+index 0000000..4959bd9
 --- /dev/null
 +++ b/kernel/module/module_overlay/convert_overlay.sh
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,117 @@
 +#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++#
++# Generate overlay_files.c from the .ko images in modules/.
++#
++# Every .ko is zstd-compressed and emitted as a C byte array alongside a
++# descriptor carrying both the compressed and the uncompressed length. The
++# descriptor name is the module name as the kernel sees it at load time:
++# the file name minus the .ko suffix, with '-' folded to '_' exactly as
++# scripts/Makefile.lib does. A file whose name does not match the module's
++# own MODULE_NAME will therefore never be matched - see README.md.
 +
-+# === Path Configuration ===
++set -u
++
 +out_file="$1"
 +srctree="$2"
-+overlay_dir=$(echo "$srctree" | sed 's|//|/|g')
 +
-+if [[ "$overlay_dir" == ..* ]]; then
-+    overlay_dir="$overlay_dir"
-+else
-+    overlay_dir=$(echo "$overlay_dir" | sed 's|\(.*\)\1|\1|')
-+fi
++die() {
++	echo "convert_overlay: $*" >&2
++	exit 1
++}
 +
-+overlay_dir=$(echo "$overlay_dir" | sed 's|/modules$||; s|$|/modules|')
-+
-+> "$out_file"
-+
-+# === Write File Header ===
-+cat <<'EOF' > "$out_file"
-+#include "overlay_files.h"
-+#include <linux/stddef.h>
-+#include <linux/zstd.h>
-+
-+EOF
-+
-+# === Associative Arrays for Storing Info ===
-+declare -A name_map    # name -> array_name
-+declare -A count_map   # name -> element_count
-+declare -A orig_size_map   # name -> original_size
-+
-+# === Temporary File ===
-+tmp_xxd="/tmp/overlay_xxd_$$.c"
-+tmp_comp="/tmp/overlay_comp_$$.ko"
-+
-+# === Process All .ko Files ===
-+shopt -s nullglob
-+ko_files=("$overlay_dir"/*.ko)
-+file_idx=0
-+
-+for ko in "${ko_files[@]}"; do
-+    [ -f "$ko" ] || continue
-+
-+    base=$(basename "$ko")
-+    name="${base%.ko}" # Remove .ko extension
-+    # The kernel build system (scripts/Makefile.lib:123) replaces hyphens with underscores in module names,
-+    # and performs the same process here to maintain consistency with info->name.
-+    name="${name//-/_}"
-+    array_name="${name//[^a-zA-Z0-9]/_}_data" # Valid C identifier
-+    orig_size=$(stat -c%s "$ko") # Get the original size
-+
-+    # Use zstd for maximum compression
-+    if ! /usr/bin/zstd -22 -f "$ko" -o "$tmp_comp"; then
-+        echo "zstd compression failed: $ko" >&2
-+        continue
-+    fi
-+
-+    # Generate byte array
-+    if ! /usr/bin/xxd -i "$tmp_comp" > "$tmp_xxd.raw" 2>/dev/null; then
-+        echo "xxd failed: $ko" >&2
-+        continue
-+    fi
-+
-+    len_line=$(grep -E 'unsigned int[[:space:]]+.*_len[[:space:]]*=' "$tmp_xxd.raw")
-+    count=$(echo "$len_line" | awk -F'=' '{print $2}' | awk -F';' '{print $1}' | tr -d ' ')
-+
-+    if [ -z "$count" ]; then
-+        echo "Failed to extract _len from xxd output: $ko" >&2
-+        rm -f "$tmp_xxd.raw"
-+        continue
-+    fi
-+
-+    # Replacements:
-+    # 1. Replace the array definition line
-+    # 2. Convert 0x... to 0x...U
-+    # 3. Remove the _len definition line
-+    sed -E \
-+        -e "s/unsigned char[[:space:]]+([^[]+)[[:space:]]*\[([^]]*)\]/const unsigned char ${array_name}[\2]/" \
-+        -e 's/0x([0-9a-fA-F]{2})/0x\1U/g' \
-+        -e 's/-/_/g' \
-+        -e '/unsigned int[[:space:]]+.*_len[[:space:]]*=/d' \
-+        "$tmp_xxd.raw" > "$tmp_xxd" || { echo "sed failed: $ko" >&2; rm -f "$tmp_xxd.raw"; continue; }
-+
-+    rm -f "$tmp_xxd.raw" "$tmp_comp"
-+
-+    ((file_idx++))
-+
-+    # Record
-+    name_map["$name"]="$array_name"
-+    count_map["$name"]=$count
-+    orig_size_map["$name"]=$orig_size
-+
-+    # Append array definition to output file
-+    cat "$tmp_xxd" >> "$out_file"
-+    echo >> "$out_file"
++for tool in zstd xxd stat; do
++	command -v "$tool" >/dev/null 2>&1 ||
++		die "'$tool' not found in PATH but is required to embed overlay modules"
 +done
 +
-+# === Generate overlay_file_list array ===
-+cat <<EOF >> "$out_file"
-+// Descriptor table for all overlay modules
-+const struct overlay_file overlay_file_list[] = {
++overlay_dir=$(echo "$srctree" | sed 's|//|/|g')
++overlay_dir="${overlay_dir%/}"
++overlay_dir="${overlay_dir%/modules}/modules"
++
++tmp_dir=$(mktemp -d) || die "failed to create a temporary directory"
++trap 'rm -rf "$tmp_dir"' EXIT
++
++tmp_raw="$tmp_dir/overlay.raw.c"
++tmp_xxd="$tmp_dir/overlay.c"
++tmp_comp="$tmp_dir/overlay.ko.zst"
++
++cat <<'EOF' > "$out_file"
++// SPDX-License-Identifier: GPL-2.0
++/* Generated by convert_overlay.sh -- do not edit. */
++
++#include "overlay_files.h"
++#include <linux/stddef.h>
++
 +EOF
 +
++declare -A name_map
++declare -A count_map
++declare -A orig_size_map
++
++shopt -s nullglob
++file_idx=0
++
++for ko in "$overlay_dir"/*.ko; do
++	[ -f "$ko" ] || continue
++
++	base=$(basename "$ko")
++	name="${base%.ko}"
++	name="${name//-/_}"
++	array_name="${name//[^a-zA-Z0-9]/_}_data"
++
++	orig_size=$(stat -c%s "$ko") || die "stat failed: $ko"
++
++	zstd -q -f --ultra -22 "$ko" -o "$tmp_comp" || die "zstd compression failed: $ko"
++	xxd -i "$tmp_comp" > "$tmp_raw" || die "xxd failed: $ko"
++
++	len_line=$(grep -E 'unsigned int[[:space:]]+.*_len[[:space:]]*=' "$tmp_raw")
++	count=$(echo "$len_line" | awk -F'=' '{print $2}' | awk -F';' '{print $1}' | tr -d ' ')
++	[ -n "$count" ] || die "failed to extract _len from xxd output: $ko"
++
++	# Rename the array, make every byte unsigned, drop the _len definition.
++	sed -E \
++		-e "s/unsigned char[[:space:]]+([^[]+)[[:space:]]*\[([^]]*)\]/const unsigned char ${array_name}[\2]/" \
++		-e 's/0x([0-9a-fA-F]{2})/0x\1U/g' \
++		-e '/unsigned int[[:space:]]+.*_len[[:space:]]*=/d' \
++		"$tmp_raw" > "$tmp_xxd" || die "sed failed: $ko"
++
++	rm -f "$tmp_raw" "$tmp_comp"
++
++	file_idx=$((file_idx + 1))
++	name_map["$name"]="$array_name"
++	count_map["$name"]="$count"
++	orig_size_map["$name"]="$orig_size"
++
++	cat "$tmp_xxd" >> "$out_file"
++	echo >> "$out_file"
++done
++
++{
++	echo '/* Descriptor table for all overlay modules */'
++	echo 'const struct overlay_file overlay_file_list[] = {'
++} >> "$out_file"
++
 +if (( file_idx == 0 )); then
-+    echo "No .ko files found in $overlay_dir"
++	echo "convert_overlay: no .ko files found in $overlay_dir" >&2
++	# Keep one dummy entry: an empty initialiser list is not valid ISO C,
++	# and overlay_file_list_count of 0 means it is never dereferenced.
++	printf '\t{ .name = NULL, .data = NULL, .len = 0, .orig_size = 0 },\n' >> "$out_file"
 +else
-+    for name in "${!name_map[@]}"; do
-+        array_name="${name_map[$name]}"
-+        count="${count_map[$name]}"
-+        printf '    { .name = "%s", .data = %s, .len = %d, .orig_size = %d },\n' \
-+               "$name" "$array_name" "$count" "$orig_size" >> "$out_file"
-+    done
++	for name in "${!name_map[@]}"; do
++		printf '\t{ .name = "%s", .data = %s, .len = %s, .orig_size = %s },\n' \
++			"$name" "${name_map[$name]}" "${count_map[$name]}" \
++			"${orig_size_map[$name]}" >> "$out_file"
++	done
 +fi
 +
 +cat <<EOF >> "$out_file"
 +};
 +
 +const int overlay_file_list_count = $file_idx;
-+
 +EOF
 +
-+# === Clean up temporary files ===
-+rm -f "$tmp_xxd"
++# Uniform LF line endings.
++tr -d '\r' < "$out_file" > "$tmp_dir/out.c" && mv "$tmp_dir/out.c" "$out_file"
 +
-+# === Uniform line breaks are LF ===
-+if command -v dos2unix >/dev/null 2>&1; then
-+    dos2unix "$out_file" 2>/dev/null || true
-+else
-+    tr -d '\r' < "$out_file" > "${out_file}.tmp" 2>/dev/null && \
-+        mv "${out_file}.tmp" "$out_file"
-+fi
-+
-+echo "Generated $out_file: $file_idx overlay file(s) processed."
-\ No newline at end of file
++echo "convert_overlay: generated $out_file ($file_idx overlay module(s))"
 diff --git a/kernel/module/module_overlay/module_intercept.c b/kernel/module/module_overlay/module_intercept.c
 new file mode 100644
-index 0000000..1eb33c4
+index 0000000..98836a8
 --- /dev/null
 +++ b/kernel/module/module_overlay/module_intercept.c
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,89 @@
 +// SPDX-License-Identifier: GPL-2.0
++/*
++ * Module overlay: replace a module image supplied by userspace with a copy
++ * embedded in the kernel at build time.
++ */
 +#include <linux/module.h>
-+#include <linux/vmalloc.h>
++#include <linux/printk.h>
 +#include <linux/string.h>
++#include <linux/vmalloc.h>
 +#include <linux/zstd.h>
-+#include "../internal.h"
 +#include "overlay_files.h"
 +
 +static const struct overlay_file *find_overlay(const char *name)
 +{
-+    int i;
-+    for (i = 0; i < overlay_file_list_count; i++) {
-+        if (strcmp(overlay_file_list[i].name, name) == 0)
-+            return &overlay_file_list[i];
-+    }
-+    return NULL;
++	int i;
++
++	if (!name)
++		return NULL;
++
++	for (i = 0; i < overlay_file_list_count; i++) {
++		if (strcmp(overlay_file_list[i].name, name) == 0)
++			return &overlay_file_list[i];
++	}
++
++	return NULL;
 +}
 +
 +bool should_intercept_module(const char *name)
 +{
-+    return find_overlay(name) != NULL;
++	return find_overlay(name) != NULL;
 +}
 +
-+bool intercept_module_load(struct load_info *info, const char *name)
++/*
++ * Decompress the embedded image for @name into a fresh vmalloc() buffer and
++ * store its length in @len. Returns NULL on failure without having touched
++ * any caller state, so the caller's own copy is still valid and must still
++ * be released through its normal teardown path.
++ */
++void *module_overlay_image(const char *name, size_t *len)
 +{
-+    const struct overlay_file *ov;
-+    void *decompressed_data = NULL;
-+    size_t decompressed_size;
-+    zstd_dctx *dctx = NULL;
-+    void *workspace = NULL;
-+    size_t workspace_size;
++	const struct overlay_file *ov;
++	zstd_dctx *dctx;
++	void *workspace;
++	size_t workspace_size;
++	void *image;
++	size_t image_size;
 +
-+    ov = find_overlay(name);
-+    if (!ov)
-+        return false;
++	ov = find_overlay(name);
++	if (!ov)
++		return NULL;
 +
-+    /* Free data passed from user space. */
-+    vfree(info->hdr);
-+    info->hdr = NULL;
++	workspace_size = zstd_dctx_workspace_bound();
++	workspace = vzalloc(workspace_size);
++	if (!workspace) {
++		pr_err("module_overlay: failed to allocate workspace for %s\n", name);
++		return NULL;
++	}
 +
-+    /* Initialize zstd decompression context */
-+    workspace_size = zstd_dctx_workspace_bound();
-+    workspace = vzalloc(workspace_size);
-+    if (!workspace) {
-+        pr_err("module_overlay: Failed to allocate workspace for %s\n", name);
-+        return false;
-+    }
++	dctx = zstd_init_dctx(workspace, workspace_size);
++	if (!dctx) {
++		pr_err("module_overlay: failed to initialise dctx for %s\n", name);
++		vfree(workspace);
++		return NULL;
++	}
 +
-+    dctx = zstd_init_dctx(workspace, workspace_size);
-+    if (!dctx) {
-+        pr_err("module_overlay: Failed to initialize dctx for %s\n", name);
-+        vfree(workspace);
-+        return false;
-+    }
++	image = vmalloc(ov->orig_size);
++	if (!image) {
++		pr_err("module_overlay: vmalloc of %zu bytes failed for %s\n",
++		       ov->orig_size, name);
++		vfree(workspace);
++		return NULL;
++	}
 +
-+    /* Decompress data */
-+    decompressed_data = vmalloc(ov->orig_size);
-+    if (!decompressed_data) {
-+        pr_err("module_overlay: vmalloc failed for decompressed data of %s\n", name);
-+        vfree(workspace);
-+        return false;
-+    }
++	image_size = zstd_decompress_dctx(dctx, image, ov->orig_size, ov->data, ov->len);
++	vfree(workspace);
 +
-+    /* 解压缩数据 */
-+    decompressed_size = zstd_decompress_dctx(dctx, decompressed_data, ov->orig_size, ov->data, ov->len);
-+    if (zstd_is_error(decompressed_size)) {
-+        pr_err("module_overlay: zstd decompress failed for %s: %zu\n", name, decompressed_size);
-+        vfree(decompressed_data);
-+        vfree(workspace);
-+        return false;
-+    }
++	if (zstd_is_error(image_size)) {
++		pr_err("module_overlay: zstd decompress failed for %s\n", name);
++		vfree(image);
++		return NULL;
++	}
 +
-+    vfree(workspace);
++	*len = image_size;
 +
-+    /* Configure the decompressed data */
-+    info->hdr = decompressed_data;
-+    info->len = decompressed_size;
++	pr_info("module_overlay: %s replaced with embedded version (%zu -> %zu bytes)\n",
++		name, ov->len, image_size);
 +
-+    pr_info("module_overlay: %s replaced with embedded version (%zu -> %zu bytes)\n",
-+            name, ov->len, decompressed_size);
-+
-+    return true;
++	return image;
 +}
 diff --git a/kernel/module/module_overlay/modules/.gitkeep b/kernel/module/module_overlay/modules/.gitkeep
 new file mode 100644
 index 0000000..e69de29
 diff --git a/kernel/module/module_overlay/overlay_files.h b/kernel/module/module_overlay/overlay_files.h
 new file mode 100644
-index 0000000..d9f5be9
+index 0000000..cf721fd
 --- /dev/null
 +++ b/kernel/module/module_overlay/overlay_files.h
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __OVERLAY_FILES_H__
 +#define __OVERLAY_FILES_H__
 +
 +#include <linux/types.h>
 +
-+struct load_info;
-+
 +struct overlay_file {
-+    const char *name;            /* Module name without .ko extension */
-+    const unsigned char *data;   /* Raw .ko byte stream */
-+    size_t len;                  /* Length in bytes */
-+    size_t orig_size;            /* Original size */
++	const char *name;		/* Module name, '-' folded to '_' */
++	const unsigned char *data;	/* zstd-compressed .ko image */
++	size_t len;			/* Compressed length in bytes */
++	size_t orig_size;		/* Uncompressed length in bytes */
 +};
 +
 +extern const struct overlay_file overlay_file_list[];
@@ -402,10 +399,6 @@ index 0000000..d9f5be9
 +
 +/* Interception interfaces */
 +bool should_intercept_module(const char *name);
-+bool intercept_module_load(struct load_info *info, const char *name);
++void *module_overlay_image(const char *name, size_t *len);
 +
 +#endif /* __OVERLAY_FILES_H__ */
-\ No newline at end of file
--- 
-2.47.3
-
