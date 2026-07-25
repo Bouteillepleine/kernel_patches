@@ -593,7 +593,7 @@ index 0000000..3d97526
 +		kfree(b);
 +}
 +
-+void __init sched_bore_init(void) {
++void sched_bore_init(void) {
 +	printk(KERN_INFO "BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification %s by Masahito Suzuki", SCHED_BORE_VERSION);
 +	init_task.se.bore = &init_task_bore;
 +	reset_task_bore(&init_task);
