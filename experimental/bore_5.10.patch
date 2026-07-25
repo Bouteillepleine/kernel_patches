@@ -1,11 +1,13 @@
 From: firelzrd <firelzrd@gmail.com> (BORE CFS, rebased + KMI-safe for Android GKI)
 Subject: [PATCH] sched: BORE 5.1.0 (CFS) for android12-5.10, KMI-safe
 
-firelzrd BORE 5.1.0 (CFS) on Google GKI android12-5.10. KMI/ABI-safe: per-entity state in a heap
-struct via ANDROID_KABI_USE(1, struct sched_burst *bore) (sched_entity byte-identical to
-stock, verified). Alloc in sched_post_fork_bore() (sleepable), NULLed in dup_task_struct(),
-freed in free_task(); all accesses NULL-guarded; decls block-ordered for -Werror trees. 5.10 reweight_task takes load_weight* (adapted).
-CONFIG_SCHED_BORE=y. NOT boot-verified beyond GKI CI.
+firelzrd BORE 5.1.0 (CFS, from the 5.15 base) on Google GKI android12-5.10,
+KMI/ABI-safe via ANDROID_KABI_USE(1, struct sched_burst *bore); sched_entity
+verified byte-identical to stock. 5.10 specifics: reweight_task() takes a
+load_weight* (adapted); task_of() is defined late in fair.c so BORE gets a
+static-inline forward declaration; decls block-ordered for
+-Werror=declaration-after-statement. Alloc in sched_post_fork_bore(), NULLed in
+dup_task_struct(), freed in free_task(); NULL-guarded. CONFIG_SCHED_BORE=y.
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index a91227e..e77a504 100644
@@ -296,7 +298,7 @@ index f799bcb..030356e 100644
  	SEQ_printf(m, " %d %d", task_node(p), task_numa_group_id(p));
  #endif
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index d559f63..2021b86 100644
+index d559f63..8e19eb7 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -19,6 +19,9 @@
@@ -309,11 +311,15 @@ index d559f63..2021b86 100644
   */
  #include "sched.h"
  
-@@ -90,6 +93,84 @@ static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
+@@ -90,6 +93,83 @@ static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
  
  const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
  
 +#ifdef CONFIG_SCHED_BORE
++/* 5.10: task_of() is defined later in this file (both FAIR_GROUP_SCHED
++ * variants); forward-declare it for the BORE helpers above them. */
++static inline struct task_struct *task_of(struct sched_entity *se);
++
 +bool __read_mostly sched_bore                   = 1;
 +bool __read_mostly sched_burst_smoothness_long  = 1;
 +bool __read_mostly sched_burst_smoothness_short = 0;
@@ -358,13 +364,8 @@ index d559f63..2021b86 100644
 +	se->bore->burst_score = se->bore->burst_penalty >> 2;
 +
 +	new_prio = min(39, prio + se->bore->burst_score);
-+	if (new_prio != prev_prio) {
-+		struct load_weight lw = {
-+			.weight = scale_load(sched_prio_to_weight[new_prio]),
-+			.inv_weight = sched_prio_to_wmult[new_prio],
-+		};
-+		reweight_task(p, &lw);
-+	}
++	if (new_prio != prev_prio)
++		reweight_task(p, new_prio);
 +}
 +
 +static void update_burst_penalty(struct sched_entity *se) {
@@ -394,7 +395,7 @@ index d559f63..2021b86 100644
  int sched_thermal_decay_shift;
  static int __init setup_sched_thermal_decay_shift(char *str)
  {
-@@ -680,7 +761,6 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
+@@ -680,7 +760,6 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
  {
  	if (unlikely(se->load.weight != NICE_0_LOAD))
  		delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
@@ -402,7 +403,7 @@ index d559f63..2021b86 100644
  	return delta;
  }
  
-@@ -880,7 +960,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
+@@ -880,7 +959,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
  	curr->sum_exec_runtime += delta_exec;
  	schedstat_add(cfs_rq->exec_clock, delta_exec);
  
@@ -418,7 +419,7 @@ index d559f63..2021b86 100644
  	update_min_vruntime(cfs_rq);
  
  	if (entity_is_task(curr)) {
-@@ -5837,6 +5925,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -5837,6 +5924,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  	bool was_sched_idle = sched_idle_rq(rq);
  
  	util_est_dequeue(&rq->cfs, p);
@@ -433,7 +434,7 @@ index d559f63..2021b86 100644
  
  	for_each_sched_entity(se) {
  		cfs_rq = cfs_rq_of(se);
-@@ -7529,24 +7625,31 @@ static void yield_task_fair(struct rq *rq)
+@@ -7529,24 +7624,31 @@ static void yield_task_fair(struct rq *rq)
  	/*
  	 * Are we the only task in the tree?
  	 */
@@ -478,7 +479,7 @@ index d559f63..2021b86 100644
  
  	set_skip_buddy(se);
  }
-@@ -11139,6 +11242,9 @@ static void task_fork_fair(struct task_struct *p)
+@@ -11139,6 +11241,9 @@ static void task_fork_fair(struct task_struct *p)
  		update_curr(cfs_rq);
  		se->vruntime = curr->vruntime;
  	}

@@ -1,14 +1,13 @@
 From: firelzrd <firelzrd@gmail.com> (BORE 5.9.6, rebased + KMI-safe for Android GKI)
 Subject: [PATCH] sched: BORE 5.9.6 for android15-6.6, KMI-safe
 
-firelzrd BORE 5.9.6 (EEVDF) rebased onto Google GKI android15-6.6, KMI/ABI-safe:
-per-entity state in a heap struct via ANDROID_KABI_USE(1, struct sched_burst *bore)
-so sched_entity/task_struct stay byte-identical to stock GKI (verified). The
-rel_deadline / PLACE_REL_DEADLINE EEVDF refinement that upstream BORE bundles is
-STRIPPED here (GKI android15-6.6 has neither the field, the feature, nor the
-on_rq repack — keeping them would change sched_entity's CRC). Alloc in
-sched_clone_bore(), NULLed in dup_task_struct(), freed in free_task(); all
-accesses NULL-guarded. CONFIG_SCHED_BORE=y. Validate on-device before shipping.
+firelzrd BORE 5.9.6 (EEVDF) on Google GKI android15-6.6, KMI/ABI-safe via
+ANDROID_KABI_USE(1, struct sched_burst *bore); sched_entity verified byte-identical
+to stock. The rel_deadline/PLACE_REL_DEADLINE refinement + on_rq repack that
+upstream BORE bundles is stripped (GKI 6.6 lacks them; they would change the CRC),
+including the now-orphaned bool sleep decl in dequeue_entity. Alloc in
+sched_clone_bore(), NULLed in dup_task_struct(), freed in free_task(); NULL-guarded.
+CONFIG_SCHED_BORE=y.
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index 6d68247..4de4fee 100644
@@ -844,7 +843,7 @@ index 2c1248e..804b0bb 100644
  	P(se.avg.runnable_sum);
  	P(se.avg.util_sum);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 5965e9c..94b4df7 100644
+index 5965e9c..f14ba94 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -62,6 +62,8 @@
@@ -997,15 +996,7 @@ index 5965e9c..94b4df7 100644
  	 * on average, halfway through their slice, as such start tasks
  	 * off with half a slice to ease into the competition.
  	 */
-@@ -5401,6 +5447,7 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
- static void
- dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
- {
-+	bool sleep = flags & DEQUEUE_SLEEP;
- 	int action = UPDATE_TG;
- 
- 	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
-@@ -6881,6 +6928,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -6881,6 +6927,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  	bool was_sched_idle = sched_idle_rq(rq);
  
  	util_est_dequeue(&rq->cfs, p);
@@ -1020,7 +1011,7 @@ index 5965e9c..94b4df7 100644
  
  	for_each_sched_entity(se) {
  		cfs_rq = cfs_rq_of(se);
-@@ -8668,16 +8723,25 @@ static void yield_task_fair(struct rq *rq)
+@@ -8668,16 +8722,25 @@ static void yield_task_fair(struct rq *rq)
  	/*
  	 * Are we the only task in the tree?
  	 */
@@ -1046,7 +1037,7 @@ index 5965e9c..94b4df7 100644
  	/*
  	 * Tell update_rq_clock() that we've just updated,
  	 * so we don't do microscopic update in schedule()
-@@ -12823,6 +12887,9 @@ static void task_fork_fair(struct task_struct *p)
+@@ -12823,6 +12886,9 @@ static void task_fork_fair(struct task_struct *p)
  	curr = cfs_rq->curr;
  	if (curr)
  		update_curr(cfs_rq);
@@ -1056,7 +1047,7 @@ index 5965e9c..94b4df7 100644
  	place_entity(cfs_rq, se, ENQUEUE_INITIAL);
  	rq_unlock(rq, &rf);
  }
-@@ -12935,6 +13002,9 @@ static void attach_task_cfs_rq(struct task_struct *p)
+@@ -12935,6 +13001,9 @@ static void attach_task_cfs_rq(struct task_struct *p)
  
  static void switched_from_fair(struct rq *rq, struct task_struct *p)
  {
