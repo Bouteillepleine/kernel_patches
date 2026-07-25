@@ -74,11 +74,20 @@ jobs:
           echo "CONFIG_SCHED_BORE lines in gki_defconfig: $(grep -c 'CONFIG_SCHED_BORE=y' "$DEF")"
           # The compile-verify builds with lto=none (runner memory), which drops the
           # CFI exports (__cfi_slowpath_diag etc.) from ksymtab and trips kleaf's
-          # kmi_symbol_list_strict_mode on some branches (seen on 5.15). That is an
-          # artifact of lto=none, not of the patch (BORE adds no exports — the
-          # "missing from symbol list" side is empty). Disable the strict gate for
-          # both kleaf (BUILD.bazel attr) and build.sh (env) paths.
-          sed -i 's/kmi_symbol_list_strict_mode = True/kmi_symbol_list_strict_mode = False/' common/BUILD.bazel || true
+          # KMI strict-symbol check on branches where it is enabled (explicitly on
+          # 6.12; implicitly whenever a kmi_symbol_list is set, e.g. 5.15). That is
+          # an artifact of lto=none, not of the patch — BORE adds NO exports (the
+          # "missing from symbol list" side is always empty; our own KMI gate proves
+          # sched_entity stays byte-identical). This job only proves BORE COMPILES,
+          # so strip the KMI-symbol-list machinery across all bazel files: flip any
+          # explicit strict=True and remove the kmi_symbol_list attrs (no list =>
+          # no strict check).
+          for bz in $(grep -rlIE 'kmi_symbol_list' --include='*.bazel' --include='*.bzl' . 2>/dev/null); do
+            sed -i -E 's/kmi_symbol_list_strict_mode([[:space:]]*=[[:space:]]*)True/kmi_symbol_list_strict_mode\1False/g' "$bz"
+            sed -i -E '/^[[:space:]]*"?kmi_symbol_list"?[[:space:]]*[:=]/d;
+                       /^[[:space:]]*"?additional_kmi_symbol_lists"?[[:space:]]*[:=]/d;
+                       /^[[:space:]]*"?kmi_symbol_list_add_only"?[[:space:]]*[:=]/d' "$bz"
+          done
           echo "KMI_SYMBOL_LIST_STRICT_MODE=0" >> "$GITHUB_ENV"
 
       - name: Build //common:kernel_aarch64 (or build.sh)
