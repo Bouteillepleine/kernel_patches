@@ -899,18 +899,6 @@ index 4d97065..95aad74 100644
  
  	return clamp(vlag, -limit, limit);
  }
-@@ -960,7 +986,11 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
-  */
- static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
- {
-+#ifdef CONFIG_SCHED_BORE
-+	u64 slice = sysctl_sched_base_slice;
-+#else
- 	u64 slice = normalized_sysctl_sched_base_slice;
-+#endif
- 	u64 vprot = se->deadline;
- 
- 	if (sched_feat(RUN_TO_PARITY))
 @@ -1028,6 +1058,10 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
  		curr = NULL;
  

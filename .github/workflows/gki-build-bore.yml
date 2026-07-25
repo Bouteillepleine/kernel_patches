@@ -60,6 +60,13 @@ jobs:
           # fuzz-tolerant apply (synced GKI may be a newer sublevel than the patch
           # was generated against); matches the OnePlus builder's apply method.
           ( cd common && patch -p1 --ignore-whitespace -F3 < /tmp/bore.patch )
+          # set_protect_slice(): moved out of the patch to a sed because OnePlus
+          # vendor trees perturb its surrounding context per-SoC (sm8850/canoe
+          # rejected the hunk). Apply the same transform here so the pristine-GKI
+          # check matches shipped behaviour. The target line is unique. 6.12 only.
+          if [ "$K" = "6.12" ]; then
+            sed -i -E 's/^([[:space:]]*)u64 slice = normalized_sysctl_sched_base_slice;/\1u64 slice = sysctl_sched_base_slice;/' common/kernel/sched/fair.c || true
+          fi
           DEF=common/arch/arm64/configs/gki_defconfig
           echo 'CONFIG_SCHED_BORE=y' >> "$DEF"
           # SCHED_BORE is `default y`, so savedefconfig canonicalization drops it and
