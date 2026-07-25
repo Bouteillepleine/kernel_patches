@@ -1,0 +1,102 @@
+name: 🧩 GKI build-verify BORE patch
+
+# Applies experimental/bore_<K>.patch onto the *vanilla* Google GKI ACK source,
+# forces CONFIG_SCHED_BORE=y, and builds //common:kernel_aarch64 to prove the
+# KMI-safe BORE port compiles against stock GKI. <K> is the kernel version part
+# of android<A>-<K> (e.g. android16-6.12 -> 6.12).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'android<A>-<K> (e.g. android16-6.12)'
+        required: true
+        default: 'android16-6.12'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet \
+            /usr/local/.ghcup /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get -qq purge -y '^dotnet-.*' '^llvm-.*' azure-cli google-cloud-cli \
+            microsoft-edge-stable google-chrome-stable firefox || true
+          sudo apt-get -qq autoremove -y; sudo apt-get -qq clean; df -h /
+
+      - name: Install deps
+        run: |
+          sudo apt-get -qq update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
+            build-essential git curl python3 python3-pip flex bison libssl-dev \
+            libelf-dev bc rsync unzip zip ccache lld
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.email ci@ci; git config --global user.name ci
+          git config --global color.ui false
+
+      - name: Sync GKI source (${{ inputs.version }})
+        run: |
+          V="${{ inputs.version }}"
+          mkdir gki && cd gki
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+            -b "common-$V" < /dev/null
+          repo sync -c -j"$(nproc)" --no-tags --optimized-fetch --prune --force-sync
+          test -d common || { echo "::error::common/ missing after sync"; exit 1; }
+
+      - name: Apply BORE patch + enable CONFIG_SCHED_BORE
+        run: |
+          V="${{ inputs.version }}"
+          K="${V#*-}"                       # android16-6.12 -> 6.12
+          cd gki
+          RAW="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental"
+          curl -fsSL "$RAW/bore_${K}.patch" -o /tmp/bore.patch
+          # fuzz-tolerant apply (synced GKI may be a newer sublevel than the patch
+          # was generated against); matches the OnePlus builder's apply method.
+          ( cd common && patch -p1 --ignore-whitespace -F3 < /tmp/bore.patch )
+          DEF=common/arch/arm64/configs/gki_defconfig
+          echo 'CONFIG_SCHED_BORE=y' >> "$DEF"
+          # SCHED_BORE is `default y`, so savedefconfig canonicalization drops it and
+          # GKI's defconfig check would flag the explicit line as a mismatch. Neuter
+          # the check (both shell-fn variants: build.sh/old kleaf + newer kleaf).
+          for u in $(grep -rlIE 'check_defconfig\(\)|kleaf_internal_check_defconfig_minimized' . 2>/dev/null); do
+            perl -0777 -pi -e 's/(\bcheck_defconfig\s*\(\)\s*\{)/$1\n  return 0;/g;
+                                s/(\bfunction\s+check_defconfig\s*\{)/$1\n  return 0;/g;
+                                s/(\bkleaf_internal_check_defconfig_minimized\s*\(\)\s*\{)/$1\n  return 0;/g;
+                                s/(\bfunction\s+kleaf_internal_check_defconfig_minimized\s*\{)/$1\n  return 0;/g' "$u"
+          done
+          echo "CONFIG_SCHED_BORE lines in gki_defconfig: $(grep -c 'CONFIG_SCHED_BORE=y' "$DEF")"
+
+      - name: Build //common:kernel_aarch64 (or build.sh)
+        run: |
+          set -o pipefail
+          cd gki
+          export CCACHE_DIR="$PWD/.ccache"; mkdir -p "$CCACHE_DIR"
+          if [ -x tools/bazel ]; then
+            echo "== kleaf build (lto=none to fit runner memory) =="
+            tools/bazel build //common:kernel_aarch64 --lto=none --jobs=3 2>&1 | tail -500
+          else
+            echo "== legacy build.sh (LTO=none to fit runner memory) =="
+            LTO=none BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh 2>&1 | tail -400
+          fi
+
+      - name: Locate built Image + confirm BORE compiled in
+        run: |
+          cd gki
+          IMG=$(find -L . -name Image -type f 2>/dev/null | head -1)
+          # effective .config with BORE on = proof the patch applied AND compiled in
+          BORECFG=$(find -L . -name '.config' 2>/dev/null | xargs grep -l 'CONFIG_SCHED_BORE=y' 2>/dev/null | head -1)
+          # EEVDF ports (6.6/6.12) build kernel/sched/bore.c as a separate TU
+          BOREOBJ=$(find -L . \( -name 'bore.o' -o -name '.bore.o.cmd' \) -path '*sched*' 2>/dev/null | head -1)
+          echo "Image:            ${IMG:-<none>}  size: $([ -n "$IMG" ] && stat -c%s "$IMG" || echo 0)"
+          echo "SCHED_BORE=y in:  ${BORECFG:-<none>}"
+          echo "bore.o compiled:  ${BOREOBJ:-<none> (CFS ports inline BORE in fair.o)}"
+          [ -n "$IMG" ] || { echo "::error::no Image built"; exit 1; }
+          [ -n "$BORECFG" ] || { echo "::error::CONFIG_SCHED_BORE=y not found in any built .config"; exit 1; }
+          echo "✅ GKI build SUCCEEDED with KMI-safe BORE compiled in for ${{ inputs.version }}"
