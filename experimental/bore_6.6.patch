@@ -880,7 +880,7 @@ index 5965e9c..f14ba94 100644
 +#ifdef CONFIG_SCHED_BORE
 +static const unsigned int nsecs_per_tick       = 1000000000ULL / HZ;
 +unsigned int sysctl_sched_min_base_slice       = CONFIG_MIN_BASE_SLICE_NS;
-+__read_mostly uint sysctl_sched_base_slice     = nsecs_per_tick;
++unsigned int sysctl_sched_base_slice           = nsecs_per_tick;
 +#else // !CONFIG_SCHED_BORE
  unsigned int sysctl_sched_base_slice			= 700000ULL;
 -EXPORT_SYMBOL_GPL(sysctl_sched_base_slice);
@@ -1079,7 +1079,7 @@ index 7f9d5bb..5574b77 100644
  
 +#ifdef CONFIG_SCHED_BORE
 +extern unsigned int sysctl_sched_min_base_slice;
-+extern __read_mostly uint sysctl_sched_base_slice;
++extern unsigned int sysctl_sched_base_slice;
 +#else // !CONFIG_SCHED_BORE
  extern unsigned int sysctl_sched_base_slice;
 +#endif // CONFIG_SCHED_BORE
