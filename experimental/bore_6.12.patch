@@ -1,62 +1,31 @@
 From: firelzrd <firelzrd@gmail.com> (BORE 5.9.6, rebased + KMI-safe for Android GKI)
-Subject: [PATCH] sched: BORE (Burst-Oriented Response Enhancer) 5.9.6 for android16-6.12, KMI-safe
+Subject: [PATCH] sched: BORE 5.9.6 for android16-6.12, KMI-safe (Rust-bindgen clean)
 
-Burst-Oriented Response Enhancer CPU scheduler by Masahito Suzuki (firelzrd),
-BORE 5.9.6, rebased onto Google GKI android16-6.12 AND made KMI/ABI-safe.
-
-KMI/ABI strategy (keeps struct sched_entity / task_struct byte-identical to stock
-GKI so prebuilt vendor modules load and read every field at unchanged offsets):
-  * per-entity BORE state is NOT added inline to struct sched_entity; it lives in a
-    heap struct (struct sched_burst) referenced by a pointer that consumes ONE
-    existing reserve slot via ANDROID_KABI_USE(1, ...). Size/offset/CRC of
-    sched_entity are unchanged; STG-whitelisted (same pattern as the tcp_sock
-    ANDROID_KABI_USE2 used for the BBRv3 backport).
-  * se->bore is NULLed in dup_task_struct() (so a child never inherits the parent's
-    pointer, closing an early-fork-failure double-free), allocated (GFP_KERNEL) in
-    sched_clone_bore(), freed in free_task(), and statically backed for init_task.
-    Invariant: NULL se->bore => BORE inactive for that entity; every access is
-    NULL-guarded, so a missed alloc degrades gracefully instead of crashing.
-
-GKI-6.12 rebase deltas vs upstream vanilla-6.12 BORE 5.9.6 (all in fair.c):
-  * base-slice / tunable-scaling decls use GKI's 700000ULL default and KEEP
-    EXPORT_SYMBOL_GPL(sysctl_sched_base_slice).
-  * pick-parity guard rewired around GKI's newer run-to-parity form
-    "if (curr && protect && protect_slice(curr)) return curr;".
-  * set_protect_slice() uses sysctl_sched_base_slice under CONFIG_SCHED_BORE.
-
-Enable with CONFIG_SCHED_BORE=y. NOT boot-tested; validate on-device (boot +
-`dmesg | grep "disagrees about version"` + full vendor-module load) before shipping.
+firelzrd BORE 5.9.6 (EEVDF) on Google GKI android16-6.12, KMI/ABI-safe via
+ANDROID_KABI_USE(1, struct sched_burst *bore); sched_entity byte-identical to stock.
+struct sched_burst{,_cache} are DEFINED in the private include/linux/sched/bore.h and
+only FORWARD-DECLARED in include/linux/sched.h — sched.h is a Rust bindgen input
+(rust/bindings/bindings_helper.h), and defining new types there regenerates the
+bindings_raw crate and churns ~all its CRCs on 6.12+Rust. Forward-decl keeps the
+bindgen view unchanged. Alloc in sched_clone_bore(), NULLed in dup_task_struct(),
+freed in free_task(); NULL-guarded. CONFIG_SCHED_BORE=y.
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index e76f6b6..8dc4dff 100644
+index e76f6b6..c195c4a 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -544,6 +544,24 @@ struct sched_statistics {
+@@ -544,6 +544,10 @@ struct sched_statistics {
  #endif /* CONFIG_SCHEDSTATS */
  } ____cacheline_aligned;
  
 +#ifdef CONFIG_SCHED_BORE
-+struct sched_burst_cache {
-+	u8				score;
-+	u32				count;
-+	u64				timestamp;
-+    spinlock_t		lock;
-+};
-+struct sched_burst {
-+	u64				burst_time;
-+	u8				prev_burst_penalty;
-+	u8				curr_burst_penalty;
-+	u8				burst_penalty;
-+	u8				burst_score;
-+	struct sched_burst_cache child_burst;
-+	struct sched_burst_cache group_burst;
-+};
++struct sched_burst;
 +#endif // CONFIG_SCHED_BORE
 +
  struct sched_entity {
  	/* For load-balancing: */
  	struct load_weight		load;
-@@ -597,7 +615,11 @@ struct sched_entity {
+@@ -597,7 +601,11 @@ struct sched_entity {
  	struct sched_avg		avg;
  #endif
  
@@ -70,10 +39,10 @@ index e76f6b6..8dc4dff 100644
  	ANDROID_KABI_RESERVE(4);
 diff --git a/include/linux/sched/bore.h b/include/linux/sched/bore.h
 new file mode 100644
-index 0000000..134bcef
+index 0000000..476636d
 --- /dev/null
 +++ b/include/linux/sched/bore.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,56 @@
 +
 +#include <linux/sched.h>
 +#include <linux/sched/cputime.h>
@@ -83,6 +52,21 @@ index 0000000..134bcef
 +#define SCHED_BORE_VERSION "5.9.6"
 +
 +#ifdef CONFIG_SCHED_BORE
++struct sched_burst_cache {
++	u8				score;
++	u32				count;
++	u64				timestamp;
++	spinlock_t		lock;
++};
++struct sched_burst {
++	u64				burst_time;
++	u8				prev_burst_penalty;
++	u8				curr_burst_penalty;
++	u8				burst_penalty;
++	u8				burst_score;
++	struct sched_burst_cache child_burst;
++	struct sched_burst_cache group_burst;
++};
 +extern u8   __read_mostly sched_bore;
 +extern u8   __read_mostly sched_burst_exclude_kthreads;
 +extern u8   __read_mostly sched_burst_smoothness_long;
@@ -748,10 +732,18 @@ index 692dc5e..07b08ac 100644
  
  #ifdef CONFIG_FAIR_GROUP_SCHED
 diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
-index 69b571d..a4f1064 100644
+index 69b571d..97e146f 100644
 --- a/kernel/sched/debug.c
 +++ b/kernel/sched/debug.c
-@@ -169,7 +169,53 @@ static const struct file_operations sched_feat_fops = {
+@@ -49,6 +49,7 @@ static unsigned long nsec_low(unsigned long long nsec)
+ 
+ const char * const sched_feat_names[] = {
+ #include "features.h"
++#include <linux/sched/bore.h>
+ };
+ EXPORT_SYMBOL_GPL(sched_feat_names);
+ 
+@@ -169,7 +170,53 @@ static const struct file_operations sched_feat_fops = {
  };
  
  #ifdef CONFIG_SMP
@@ -805,7 +797,7 @@ index 69b571d..a4f1064 100644
  static ssize_t sched_scaling_write(struct file *filp, const char __user *ubuf,
  				   size_t cnt, loff_t *ppos)
  {
-@@ -215,7 +261,7 @@ static const struct file_operations sched_scaling_fops = {
+@@ -215,7 +262,7 @@ static const struct file_operations sched_scaling_fops = {
  	.llseek		= seq_lseek,
  	.release	= single_release,
  };
@@ -814,7 +806,7 @@ index 69b571d..a4f1064 100644
  #endif /* SMP */
  
  #ifdef CONFIG_PREEMPT_DYNAMIC
-@@ -505,13 +551,20 @@ static __init int sched_init_debug(void)
+@@ -505,13 +552,20 @@ static __init int sched_init_debug(void)
  	debugfs_create_file("preempt", 0644, debugfs_sched, NULL, &sched_dynamic_fops);
  #endif
  
@@ -835,7 +827,7 @@ index 69b571d..a4f1064 100644
  	debugfs_create_u32("migration_cost_ns", 0644, debugfs_sched, &sysctl_sched_migration_cost);
  	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
  
-@@ -756,6 +809,9 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
+@@ -756,6 +810,9 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
  		SPLIT_NS(schedstat_val_or_zero(p->stats.sum_sleep_runtime)),
  		SPLIT_NS(schedstat_val_or_zero(p->stats.sum_block_runtime)));
  
@@ -845,7 +837,7 @@ index 69b571d..a4f1064 100644
  #ifdef CONFIG_NUMA_BALANCING
  	SEQ_printf(m, "   %d      %d", task_node(p), task_numa_group_id(p));
  #endif
-@@ -1249,6 +1305,9 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+@@ -1249,6 +1306,9 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
  
  	P(se.load.weight);
  #ifdef CONFIG_SMP
