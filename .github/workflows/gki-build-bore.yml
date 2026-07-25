@@ -82,17 +82,18 @@ jobs:
           # so strip the KMI-symbol-list machinery across all bazel files: flip any
           # explicit strict=True and remove the kmi_symbol_list attrs (no list =>
           # no strict check).
-          # IMPORTANT: only touch the GKI kernel-definition BUILD.bazel files, NOT
-          # build/kernel/kleaf/** (there 'kmi_symbol_list' is the macro's own
-          # parameter name — deleting those lines breaks the build engine). The GKI
-          # kernel_aarch64 stanza lives in common/BUILD.bazel; remove its symbol-list
-          # keys (no list => no strict check) and flip any explicit strict=True.
-          for bz in $(grep -rlIE '"kmi_symbol_list"' --include='BUILD.bazel' . 2>/dev/null | grep -vE '/build/kernel/'); do
-            echo "  neutering KMI list in $bz"
+          # Force strict mode OFF without removing the symbol list (removing it
+          # leaves the raw_kmi_symbol_list target with None -> AttributeError). Only
+          # the GKI kernel-def BUILD.bazel (common/), never build/kernel/kleaf/**
+          # (there the names are the macro's own params). Handle both forms:
+          #   dict form (5.15/older: define_common_kernels): inject a dict key after
+          #     the "kmi_symbol_list": line, and relax add_only.
+          #   kwarg form (6.x: kernel_build): flip strict=True -> False.
+          for bz in $(grep -rlIE '"kmi_symbol_list"[[:space:]]*:' --include='BUILD.bazel' . 2>/dev/null | grep -vE '/build/kernel/'); do
+            echo "  relaxing KMI strict mode in $bz"
             sed -i -E 's/kmi_symbol_list_strict_mode([[:space:]]*=[[:space:]]*)True/kmi_symbol_list_strict_mode\1False/g' "$bz"
-            sed -i -E '/^[[:space:]]*"kmi_symbol_list"[[:space:]]*:/d;
-                       /^[[:space:]]*"additional_kmi_symbol_lists"[[:space:]]*:/d;
-                       /^[[:space:]]*"kmi_symbol_list_add_only"[[:space:]]*:/d' "$bz"
+            sed -i -E 's/("kmi_symbol_list_add_only"[[:space:]]*:[[:space:]]*)True/\1False/g' "$bz"
+            sed -i -E '/^([[:space:]]*)"kmi_symbol_list"[[:space:]]*:/a\\1"kmi_symbol_list_strict_mode": False,' "$bz"
           done
 
       - name: Build //common:kernel_aarch64 (or build.sh)
