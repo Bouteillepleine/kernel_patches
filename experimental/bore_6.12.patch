@@ -1,14 +1,11 @@
-From: firelzrd <firelzrd@gmail.com> (BORE 5.9.6, rebased + KMI-safe for Android GKI)
+From: firelzrd <firelzrd@gmail.com> (BORE 5.9.6, KMI-safe + Rust-bindgen clean)
 Subject: [PATCH] sched: BORE 5.9.6 for android16-6.12, KMI-safe (Rust-bindgen clean)
 
-firelzrd BORE 5.9.6 (EEVDF) on Google GKI android16-6.12, KMI/ABI-safe via
-ANDROID_KABI_USE(1, struct sched_burst *bore); sched_entity byte-identical to stock.
-struct sched_burst{,_cache} are DEFINED in the private include/linux/sched/bore.h and
-only FORWARD-DECLARED in include/linux/sched.h — sched.h is a Rust bindgen input
-(rust/bindings/bindings_helper.h), and defining new types there regenerates the
-bindings_raw crate and churns ~all its CRCs on 6.12+Rust. Forward-decl keeps the
-bindgen view unchanged. Alloc in sched_clone_bore(), NULLed in dup_task_struct(),
-freed in free_task(); NULL-guarded. CONFIG_SCHED_BORE=y.
+BORE 5.9.6 (EEVDF) on GKI android16-6.12. struct sched_burst{,_cache} live in the
+private include/linux/sched/bore.h (pulled in via kernel/sched/sched.h) and are only
+forward-declared in include/linux/sched.h, which is a Rust bindgen input — defining
+new types there churns the bindings_raw crate CRCs on 6.12+Rust. sched_entity
+byte-identical; ANDROID_KABI_USE(1) pointer. CONFIG_SCHED_BORE=y.
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index e76f6b6..c195c4a 100644
@@ -732,18 +729,10 @@ index 692dc5e..07b08ac 100644
  
  #ifdef CONFIG_FAIR_GROUP_SCHED
 diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
-index 69b571d..97e146f 100644
+index 69b571d..a4f1064 100644
 --- a/kernel/sched/debug.c
 +++ b/kernel/sched/debug.c
-@@ -49,6 +49,7 @@ static unsigned long nsec_low(unsigned long long nsec)
- 
- const char * const sched_feat_names[] = {
- #include "features.h"
-+#include <linux/sched/bore.h>
- };
- EXPORT_SYMBOL_GPL(sched_feat_names);
- 
-@@ -169,7 +170,53 @@ static const struct file_operations sched_feat_fops = {
+@@ -169,7 +169,53 @@ static const struct file_operations sched_feat_fops = {
  };
  
  #ifdef CONFIG_SMP
@@ -797,7 +786,7 @@ index 69b571d..97e146f 100644
  static ssize_t sched_scaling_write(struct file *filp, const char __user *ubuf,
  				   size_t cnt, loff_t *ppos)
  {
-@@ -215,7 +262,7 @@ static const struct file_operations sched_scaling_fops = {
+@@ -215,7 +261,7 @@ static const struct file_operations sched_scaling_fops = {
  	.llseek		= seq_lseek,
  	.release	= single_release,
  };
@@ -806,7 +795,7 @@ index 69b571d..97e146f 100644
  #endif /* SMP */
  
  #ifdef CONFIG_PREEMPT_DYNAMIC
-@@ -505,13 +552,20 @@ static __init int sched_init_debug(void)
+@@ -505,13 +551,20 @@ static __init int sched_init_debug(void)
  	debugfs_create_file("preempt", 0644, debugfs_sched, NULL, &sched_dynamic_fops);
  #endif
  
@@ -827,7 +816,7 @@ index 69b571d..97e146f 100644
  	debugfs_create_u32("migration_cost_ns", 0644, debugfs_sched, &sysctl_sched_migration_cost);
  	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
  
-@@ -756,6 +810,9 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
+@@ -756,6 +809,9 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
  		SPLIT_NS(schedstat_val_or_zero(p->stats.sum_sleep_runtime)),
  		SPLIT_NS(schedstat_val_or_zero(p->stats.sum_block_runtime)));
  
@@ -837,7 +826,7 @@ index 69b571d..97e146f 100644
  #ifdef CONFIG_NUMA_BALANCING
  	SEQ_printf(m, "   %d      %d", task_node(p), task_numa_group_id(p));
  #endif
-@@ -1249,6 +1306,9 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+@@ -1249,6 +1305,9 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
  
  	P(se.load.weight);
  #ifdef CONFIG_SMP
@@ -1075,10 +1064,18 @@ index 4d97065..95aad74 100644
  }
  
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 43cc80d..d65abf3 100644
+index 43cc80d..e64e42c 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -2206,7 +2206,11 @@ static inline void update_sched_domain_debugfs(void) { }
+@@ -10,6 +10,7 @@
+ #include <linux/sched/cpufreq.h>
+ #include <linux/sched/deadline.h>
+ #include <linux/sched.h>
++#include <linux/sched/bore.h>
+ #include <linux/sched/loadavg.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/rseq_api.h>
+@@ -2206,7 +2207,11 @@ static inline void update_sched_domain_debugfs(void) { }
  static inline void dirty_sched_domain_sysctl(int cpu) { }
  #endif
  
@@ -1090,7 +1087,7 @@ index 43cc80d..d65abf3 100644
  
  static inline const struct cpumask *task_user_cpus(struct task_struct *p)
  {
-@@ -3002,7 +3006,12 @@ static inline void __attach_tasks(struct rq *rq, struct list_head *tasks)
+@@ -3002,7 +3007,12 @@ static inline void __attach_tasks(struct rq *rq, struct list_head *tasks)
  extern const_debug unsigned int sysctl_sched_nr_migrate;
  extern const_debug unsigned int sysctl_sched_migration_cost;
  
