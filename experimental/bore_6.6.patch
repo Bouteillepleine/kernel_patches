@@ -1,15 +1,17 @@
 From: firelzrd <firelzrd@gmail.com> (BORE 5.9.6, rebased + KMI-safe for Android GKI)
 Subject: [PATCH] sched: BORE 5.9.6 for android15-6.6, KMI-safe
 
-firelzrd BORE 5.9.6 (EEVDF), rebased onto Google GKI android15-6.6 and made KMI/ABI-safe.
-Per-entity state is held in a heap struct via ANDROID_KABI_USE(1, struct sched_burst *bore)
-so struct sched_entity/task_struct stay byte-identical to stock GKI (vendor modules load and
-read all fields at unchanged offsets). Alloc in sched_clone_bore(), NULLed in dup_task_struct(),
-freed in free_task(), static for init_task; every access NULL-guarded. Enable CONFIG_SCHED_BORE=y.
-NOT boot-tested; validate on-device (module load + dmesg) before shipping.
+firelzrd BORE 5.9.6 (EEVDF) rebased onto Google GKI android15-6.6, KMI/ABI-safe:
+per-entity state in a heap struct via ANDROID_KABI_USE(1, struct sched_burst *bore)
+so sched_entity/task_struct stay byte-identical to stock GKI (verified). The
+rel_deadline / PLACE_REL_DEADLINE EEVDF refinement that upstream BORE bundles is
+STRIPPED here (GKI android15-6.6 has neither the field, the feature, nor the
+on_rq repack — keeping them would change sched_entity's CRC). Alloc in
+sched_clone_bore(), NULLed in dup_task_struct(), freed in free_task(); all
+accesses NULL-guarded. CONFIG_SCHED_BORE=y. Validate on-device before shipping.
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 6d68247..48cb383 100644
+index 6d68247..4de4fee 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
 @@ -526,6 +526,24 @@ struct sched_statistics {
@@ -37,17 +39,7 @@ index 6d68247..48cb383 100644
  struct sched_entity {
  	/* For load-balancing: */
  	struct load_weight		load;
-@@ -534,7 +552,8 @@ struct sched_entity {
- 	u64				min_vruntime;
- 
- 	struct list_head		group_node;
--	unsigned int			on_rq;
-+	unsigned char			on_rq;
-+	unsigned char			rel_deadline;
- 
- 	u64				exec_start;
- 	u64				sum_exec_runtime;
-@@ -566,7 +585,11 @@ struct sched_entity {
+@@ -566,7 +584,11 @@ struct sched_entity {
  	struct sched_avg		avg;
  #endif
  
@@ -852,7 +844,7 @@ index 2c1248e..804b0bb 100644
  	P(se.avg.runnable_sum);
  	P(se.avg.util_sum);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 5965e9c..fa588ae 100644
+index 5965e9c..94b4df7 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -62,6 +62,8 @@
@@ -990,17 +982,12 @@ index 5965e9c..fa588ae 100644
  	if (sched_feat(PLACE_LAG) && cfs_rq->nr_running) {
  		struct sched_entity *curr = cfs_rq->curr;
  		unsigned long load;
-@@ -5291,8 +5332,18 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+@@ -5291,8 +5332,13 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
  
  	se->vruntime = vruntime - lag;
  
-+	if (sched_feat(PLACE_REL_DEADLINE) && se->rel_deadline) {
-+		se->deadline += se->vruntime;
-+		se->rel_deadline = 0;
-+		return;
-+	}
 +#ifdef CONFIG_SCHED_BORE
-+	else if (likely(sched_bore))
++	if (likely(sched_bore))
 +		vslice >>= !!(flags & sched_deadline_boost_mask);
 +	else
 +#endif // CONFIG_SCHED_BORE
@@ -1010,7 +997,7 @@ index 5965e9c..fa588ae 100644
  	 * on average, halfway through their slice, as such start tasks
  	 * off with half a slice to ease into the competition.
  	 */
-@@ -5401,6 +5452,7 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
+@@ -5401,6 +5447,7 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
  static void
  dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
  {
@@ -1018,19 +1005,7 @@ index 5965e9c..fa588ae 100644
  	int action = UPDATE_TG;
  
  	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
-@@ -5428,6 +5480,11 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
- 	clear_buddies(cfs_rq, se);
- 
- 	update_entity_lag(cfs_rq, se);
-+	if (sched_feat(PLACE_REL_DEADLINE) && !sleep) {
-+		se->deadline -= se->vruntime;
-+		se->rel_deadline = 1;
-+	}
-+
- 	if (se != cfs_rq->curr)
- 		__dequeue_entity(cfs_rq, se);
- 	se->on_rq = 0;
-@@ -6881,6 +6938,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -6881,6 +6928,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  	bool was_sched_idle = sched_idle_rq(rq);
  
  	util_est_dequeue(&rq->cfs, p);
@@ -1045,7 +1020,7 @@ index 5965e9c..fa588ae 100644
  
  	for_each_sched_entity(se) {
  		cfs_rq = cfs_rq_of(se);
-@@ -8668,16 +8733,25 @@ static void yield_task_fair(struct rq *rq)
+@@ -8668,16 +8723,25 @@ static void yield_task_fair(struct rq *rq)
  	/*
  	 * Are we the only task in the tree?
  	 */
@@ -1071,7 +1046,7 @@ index 5965e9c..fa588ae 100644
  	/*
  	 * Tell update_rq_clock() that we've just updated,
  	 * so we don't do microscopic update in schedule()
-@@ -12823,6 +12897,9 @@ static void task_fork_fair(struct task_struct *p)
+@@ -12823,6 +12887,9 @@ static void task_fork_fair(struct task_struct *p)
  	curr = cfs_rq->curr;
  	if (curr)
  		update_curr(cfs_rq);
@@ -1081,11 +1056,10 @@ index 5965e9c..fa588ae 100644
  	place_entity(cfs_rq, se, ENQUEUE_INITIAL);
  	rq_unlock(rq, &rf);
  }
-@@ -12935,6 +13012,10 @@ static void attach_task_cfs_rq(struct task_struct *p)
+@@ -12935,6 +13002,9 @@ static void attach_task_cfs_rq(struct task_struct *p)
  
  static void switched_from_fair(struct rq *rq, struct task_struct *p)
  {
-+	p->se.rel_deadline = 0;
 +#ifdef CONFIG_SCHED_BORE
 +	reset_task_bore(p);
 +#endif // CONFIG_SCHED_BORE

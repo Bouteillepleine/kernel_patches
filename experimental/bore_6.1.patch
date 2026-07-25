@@ -1,12 +1,11 @@
-From: firelzrd <firelzrd@gmail.com> (BORE 5.1.0 CFS, rebased + KMI-safe for Android GKI)
+From: firelzrd <firelzrd@gmail.com> (BORE CFS, rebased + KMI-safe for Android GKI)
 Subject: [PATCH] sched: BORE 5.1.0 (CFS) for android14-6.1, KMI-safe
 
-firelzrd BORE 5.1.0 (CFS-era) rebased onto Google GKI android14-6.1, KMI/ABI-safe: per-entity
-state moved into a heap struct via ANDROID_KABI_USE(1, struct sched_burst *bore) so
-sched_entity/task_struct stay byte-identical to stock GKI. Allocated in sched_post_fork_bore()
-(always sleepable; NOT sched_fork_bore() which also runs from init_idle() under rq-lock), NULLed
-in dup_task_struct(), freed in free_task(), static for init_task; all accesses NULL-guarded.
-Enable CONFIG_SCHED_BORE=y. NOT boot-tested; validate on-device before shipping.
+firelzrd BORE 5.1.0 (CFS) on Google GKI android14-6.1. KMI/ABI-safe: per-entity state in a heap
+struct via ANDROID_KABI_USE(1, struct sched_burst *bore) (sched_entity byte-identical to
+stock, verified). Alloc in sched_post_fork_bore() (sleepable), NULLed in dup_task_struct(),
+freed in free_task(); all accesses NULL-guarded; decls block-ordered for -Werror trees.
+CONFIG_SCHED_BORE=y. NOT boot-verified beyond GKI CI.
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index 9f55457..9db225b 100644
@@ -74,7 +73,7 @@ index 0688f9b..fd43042 100644
  	bool "Automatic process group scheduling"
  	select CGROUPS
 diff --git a/kernel/fork.c b/kernel/fork.c
-index db6a796..d70d172 100644
+index db6a796..50714b2 100644
 --- a/kernel/fork.c
 +++ b/kernel/fork.c
 @@ -609,6 +609,9 @@ void put_task_stack(struct task_struct *tsk)
@@ -87,21 +86,21 @@ index db6a796..d70d172 100644
  #ifdef CONFIG_SECCOMP
  	WARN_ON_ONCE(tsk->seccomp.filter);
  #endif
-@@ -1081,6 +1084,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+@@ -1079,6 +1082,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 		return NULL;
+ 
  	err = arch_dup_task_struct(tsk, orig);
++#ifdef CONFIG_SCHED_BORE
++	tsk->se.bore = NULL; /* do not inherit parent's heap BORE state pointer (freed via free_task) */
++#endif
  	if (err)
  		goto free_tsk;
-+#ifdef CONFIG_SCHED_BORE
-+	tsk->se.bore = NULL; /* do not inherit parent's heap BORE state pointer */
-+#endif
  
- 	err = alloc_thread_stack_node(tsk, node);
- 	if (err)
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 31fabf8..3c13e94 100644
+index 31fabf8..073e3b4 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -4535,6 +4535,147 @@ int wake_up_state(struct task_struct *p, unsigned int state)
+@@ -4535,6 +4535,148 @@ int wake_up_state(struct task_struct *p, unsigned int state)
  }
  EXPORT_SYMBOL(wake_up_state);
  
@@ -138,8 +137,9 @@ index 31fabf8..3c13e94 100644
 +}
 +
 +static inline bool child_burst_cache_expired(struct task_struct *p, u64 now) {
++	u64 expiration_time;
 +	if (!p->se.bore) return true;
-+	u64 expiration_time =
++	expiration_time =
 +		p->se.bore->child_burst_last_cached + sched_burst_cache_lifetime;
 +	return ((s64)(expiration_time - now) < 0);
 +}
@@ -249,7 +249,7 @@ index 31fabf8..3c13e94 100644
  /*
   * Perform scheduler related setup for a newly forked process p.
   * p is forked by current.
-@@ -4551,6 +4692,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+@@ -4551,6 +4693,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
  	p->se.prev_sum_exec_runtime	= 0;
  	p->se.nr_migrations		= 0;
  	p->se.vruntime			= 0;
@@ -259,7 +259,7 @@ index 31fabf8..3c13e94 100644
  	INIT_LIST_HEAD(&p->se.group_node);
  
  #ifdef CONFIG_FAIR_GROUP_SCHED
-@@ -4862,6 +5006,9 @@ void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
+@@ -4862,6 +5007,9 @@ void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
  
  void sched_post_fork(struct task_struct *p)
  {
@@ -269,7 +269,7 @@ index 31fabf8..3c13e94 100644
  	uclamp_post_fork(p);
  }
  
-@@ -9958,6 +10105,11 @@ void __init sched_init(void)
+@@ -9958,6 +10106,11 @@ void __init sched_init(void)
  	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
  #endif
  
@@ -296,7 +296,7 @@ index 3ceee0e..e4ba931 100644
  	SEQ_printf(m, " %d %d", task_node(p), task_numa_group_id(p));
  #endif
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index d39dece..911d467 100644
+index d39dece..49be2c5 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -19,6 +19,9 @@
@@ -309,7 +309,7 @@ index d39dece..911d467 100644
   */
  #include <linux/energy_model.h>
  #include <linux/mmap_lock.h>
-@@ -134,6 +137,79 @@ static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
+@@ -134,6 +137,81 @@ static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
  
  const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
  
@@ -350,14 +350,16 @@ index d39dece..911d467 100644
 +}
 +
 +static void update_burst_score(struct sched_entity *se) {
++	struct task_struct *p;
++	u8 prio, prev_prio, new_prio;
 +	if (!entity_is_task(se) || !se->bore) return;
-+	struct task_struct *p = task_of(se);
-+	u8 prio = p->static_prio - MAX_RT_PRIO;
-+	u8 prev_prio = min(39, prio + se->bore->burst_score);
++	p = task_of(se);
++	prio = p->static_prio - MAX_RT_PRIO;
++	prev_prio = min(39, prio + se->bore->burst_score);
 +
 +	se->bore->burst_score = se->bore->burst_penalty >> 2;
 +
-+	u8 new_prio = min(39, prio + se->bore->burst_score);
++	new_prio = min(39, prio + se->bore->burst_score);
 +	if (new_prio != prev_prio)
 +		reweight_task(p, new_prio);
 +}
@@ -389,7 +391,7 @@ index d39dece..911d467 100644
  int sched_thermal_decay_shift;
  static int __init setup_sched_thermal_decay_shift(char *str)
  {
-@@ -188,6 +264,69 @@ static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
+@@ -188,6 +266,69 @@ static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
  
  #ifdef CONFIG_SYSCTL
  static struct ctl_table sched_fair_sysctls[] = {
@@ -459,7 +461,7 @@ index d39dece..911d467 100644
  	{
  		.procname       = "sched_child_runs_first",
  		.data           = &sysctl_sched_child_runs_first,
-@@ -705,7 +844,6 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
+@@ -705,7 +846,6 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
  {
  	if (unlikely(se->load.weight != NICE_0_LOAD))
  		delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
@@ -467,7 +469,7 @@ index d39dece..911d467 100644
  	return delta;
  }
  
-@@ -918,7 +1056,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
+@@ -918,7 +1058,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
  	curr->sum_exec_runtime += delta_exec;
  	schedstat_add(cfs_rq->exec_clock, delta_exec);
  
@@ -483,7 +485,7 @@ index d39dece..911d467 100644
  	update_min_vruntime(cfs_rq);
  
  	if (entity_is_task(curr)) {
-@@ -6257,6 +6403,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -6257,6 +6405,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  	bool was_sched_idle = sched_idle_rq(rq);
  
  	util_est_dequeue(&rq->cfs, p);
@@ -498,7 +500,7 @@ index d39dece..911d467 100644
  
  	for_each_sched_entity(se) {
  		cfs_rq = cfs_rq_of(se);
-@@ -8070,24 +8224,31 @@ static void yield_task_fair(struct rq *rq)
+@@ -8070,24 +8226,31 @@ static void yield_task_fair(struct rq *rq)
  	/*
  	 * Are we the only task in the tree?
  	 */
@@ -543,7 +545,7 @@ index d39dece..911d467 100644
  
  	set_skip_buddy(se);
  }
-@@ -12044,6 +12205,9 @@ static void task_fork_fair(struct task_struct *p)
+@@ -12044,6 +12207,9 @@ static void task_fork_fair(struct task_struct *p)
  		update_curr(cfs_rq);
  		se->vruntime = curr->vruntime;
  	}
