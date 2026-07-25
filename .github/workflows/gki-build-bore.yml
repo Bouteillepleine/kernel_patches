@@ -93,7 +93,7 @@ jobs:
             echo "  relaxing KMI strict mode in $bz"
             sed -i -E 's/kmi_symbol_list_strict_mode([[:space:]]*=[[:space:]]*)True/kmi_symbol_list_strict_mode\1False/g' "$bz"
             sed -i -E 's/("kmi_symbol_list_add_only"[[:space:]]*:[[:space:]]*)True/\1False/g' "$bz"
-            sed -i -E '/^([[:space:]]*)"kmi_symbol_list"[[:space:]]*:/a\\1"kmi_symbol_list_strict_mode": False,' "$bz"
+            sed -i -E '/^[[:space:]]*"kmi_symbol_list"[[:space:]]*:/a\        "kmi_symbol_list_strict_mode": False,' "$bz"
           done
 
       - name: Build //common:kernel_aarch64 (or build.sh)
