@@ -45,7 +45,7 @@ index 0000000..476636d
 + * every task_struct-referencing CRC. Keep sched_entity byte- AND type-
 + * identical to stock and stash the per-entity BORE pointer inside the raw
 + * reserved u64 -> DWARF unchanged -> 0 CRC. Lvalue macro (read + assign). */
-+#define se_bore(se) (*(struct sched_burst **)&(se)->android_kabi_reserved1)
++#define se_bore(se) (*(struct sched_burst **)&(se)->__kabi_reserved1)
 +extern u8   __read_mostly sched_bore;
 +extern u8   __read_mostly sched_burst_exclude_kthreads;
 +extern u8   __read_mostly sched_burst_smoothness_long;
