@@ -82,13 +82,18 @@ jobs:
           # so strip the KMI-symbol-list machinery across all bazel files: flip any
           # explicit strict=True and remove the kmi_symbol_list attrs (no list =>
           # no strict check).
-          for bz in $(grep -rlIE 'kmi_symbol_list' --include='*.bazel' --include='*.bzl' . 2>/dev/null); do
+          # IMPORTANT: only touch the GKI kernel-definition BUILD.bazel files, NOT
+          # build/kernel/kleaf/** (there 'kmi_symbol_list' is the macro's own
+          # parameter name — deleting those lines breaks the build engine). The GKI
+          # kernel_aarch64 stanza lives in common/BUILD.bazel; remove its symbol-list
+          # keys (no list => no strict check) and flip any explicit strict=True.
+          for bz in $(grep -rlIE '"kmi_symbol_list"' --include='BUILD.bazel' . 2>/dev/null | grep -vE '/build/kernel/'); do
+            echo "  neutering KMI list in $bz"
             sed -i -E 's/kmi_symbol_list_strict_mode([[:space:]]*=[[:space:]]*)True/kmi_symbol_list_strict_mode\1False/g' "$bz"
-            sed -i -E '/^[[:space:]]*"?kmi_symbol_list"?[[:space:]]*[:=]/d;
-                       /^[[:space:]]*"?additional_kmi_symbol_lists"?[[:space:]]*[:=]/d;
-                       /^[[:space:]]*"?kmi_symbol_list_add_only"?[[:space:]]*[:=]/d' "$bz"
+            sed -i -E '/^[[:space:]]*"kmi_symbol_list"[[:space:]]*:/d;
+                       /^[[:space:]]*"additional_kmi_symbol_lists"[[:space:]]*:/d;
+                       /^[[:space:]]*"kmi_symbol_list_add_only"[[:space:]]*:/d' "$bz"
           done
-          echo "KMI_SYMBOL_LIST_STRICT_MODE=0" >> "$GITHUB_ENV"
 
       - name: Build //common:kernel_aarch64 (or build.sh)
         run: |
