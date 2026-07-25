@@ -91,9 +91,15 @@ jobs:
           #   kwarg form (6.x: kernel_build): flip strict=True -> False.
           for bz in $(grep -rlIE '"kmi_symbol_list"[[:space:]]*:' --include='BUILD.bazel' . 2>/dev/null | grep -vE '/build/kernel/'); do
             echo "  relaxing KMI strict mode in $bz"
-            sed -i -E 's/kmi_symbol_list_strict_mode([[:space:]]*=[[:space:]]*)True/kmi_symbol_list_strict_mode\1False/g' "$bz"
+            # flip any existing strict_mode=True/:True -> False (kwarg AND dict form)
+            sed -i -E 's/kmi_symbol_list_strict_mode([[:space:]]*[=:][[:space:]]*)True/kmi_symbol_list_strict_mode\1False/g' "$bz"
             sed -i -E 's/("kmi_symbol_list_add_only"[[:space:]]*:[[:space:]]*)True/\1False/g' "$bz"
-            sed -i -E '/^[[:space:]]*"kmi_symbol_list"[[:space:]]*:/a\        "kmi_symbol_list_strict_mode": False,' "$bz"
+            # inject the dict key ONLY if the stanza doesn't already declare it
+            # (android15-6.6's BUILD.bazel already has it -> injecting dup'd the key
+            # and bazel errored "dictionary expression has duplicate key").
+            if ! grep -qE 'kmi_symbol_list_strict_mode' "$bz"; then
+              sed -i -E '/^[[:space:]]*"kmi_symbol_list"[[:space:]]*:/a\        "kmi_symbol_list_strict_mode": False,' "$bz"
+            fi
           done
 
       - name: Build //common:kernel_aarch64 (or build.sh)
