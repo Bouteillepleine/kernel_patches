@@ -1,0 +1,16 @@
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -6586,10 +6586,13 @@
+ }
+ 
+ static int selinux_setprocattr(const char *name, void *value, size_t size)
+ {
+ 	int attr = lsm_name_to_attr(name);
++	if (size && value && (strnstr(value, ":ksu:", size) ||
++	    strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size)))
++		return -EINVAL;
+ 
+ 	if (attr)
+ 		return selinux_lsm_setattr(attr, value, size);
+ 	return -EINVAL;
+ }

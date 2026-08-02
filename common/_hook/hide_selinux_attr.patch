@@ -1,0 +1,16 @@
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -6444,10 +6444,13 @@
+ 	struct task_security_struct *tsec;
+ 	struct cred *new;
+ 	u32 mysid = current_sid(), sid = 0, ptsid;
+ 	int error;
+ 	char *str = value;
++	if (size && value && (strnstr(value, ":ksu:", size) ||
++	    strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size)))
++		return -EINVAL;
+ 
+ 	/*
+ 	 * Basic control over ability to set these attributes at all.
+ 	 */
+ 	if (!strcmp(name, "exec"))

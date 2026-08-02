@@ -1,0 +1,39 @@
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -788,20 +788,36 @@
+ 	sad.requested = requested;
+ 	sad.ssid = ssid;
+ 	sad.tsid = tsid;
+ 	sad.audited = audited;
+ 	sad.denied = denied;
+ 	sad.result = result;
+ 	sad.state = state;
+ 
+ 	a->selinux_audit_data = &sad;
+ 
++	{
++		u32 _sids[2] = { ssid, tsid };
++		int _i;
++		for (_i = 0; _i < 2; _i++) {
++			char *_c = NULL;
++			u32 _l;
++			if (!security_sid_to_context(state, _sids[_i], &_c, &_l) && _c) {
++				int _h = strnstr(_c, ":ksu:", _l) ||
++					 strnstr(_c, ":ksu_file:", _l) ||
++					 strnstr(_c, ":lsposed_file:", _l);
++				kfree(_c);
++				if (_h)
++					return 0;
++			}
++		}
++	}
+ 	common_lsm_audit(a, avc_audit_pre_callback, avc_audit_post_callback);
+ 	return 0;
+ }
+ 
+ /**
+  * avc_add_callback - Register a callback for security events.
+  * @callback: callback function
+  * @events: security events
+  *
+  * Register a callback function for events in the set @events.
