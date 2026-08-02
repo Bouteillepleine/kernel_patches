@@ -1,0 +1,15 @@
+--- a/kernel/audit.c
++++ b/kernel/audit.c
+@@ -1381,6 +1381,12 @@
+ 		if (data_len < 2)
+ 			return -EINVAL;
+ 
++		if (msg_type == AUDIT_USER_AVC &&
++		    (strnstr(data, ":ksu:", data_len) ||
++		     strnstr(data, ":ksu_file:", data_len) ||
++		     strnstr(data, ":lsposed_file:", data_len)))
++			return 0;
++
+ 		err = audit_filter(msg_type, AUDIT_FILTER_USER);
+ 		if (err == 1) { /* match or error */
+ 			char *str = data;
