@@ -1,15 +1,3 @@
---- a/fs/Makefile
-+++ b/fs/Makefile
-@@ -18,6 +18,8 @@
- 		fs_types.o fs_context.o fs_parser.o fsopen.o init.o \
- 		kernel_read_file.o remap_range.o
- 
-+obj-y += pathhide.o
-+
- ifeq ($(CONFIG_BLOCK),y)
- obj-y +=	buffer.o block_dev.o direct-io.o mpage.o
- else
-
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
 @@ -329,6 +329,10 @@

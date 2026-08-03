@@ -1,15 +1,3 @@
---- a/fs/Makefile
-+++ b/fs/Makefile
-@@ -17,6 +17,8 @@
- 		fs_types.o fs_context.o fs_parser.o fsopen.o init.o \
- 		kernel_read_file.o remap_range.o
- 
-+obj-y += pathhide.o
-+
- PGO_PROFILE_xattr.o := n
- 
- ifeq ($(CONFIG_BLOCK),y)
-
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
 @@ -284,6 +284,10 @@
