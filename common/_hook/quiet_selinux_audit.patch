@@ -20,7 +20,7 @@
 +			if (!security_sid_to_context(_sids[_i], &_c, &_l) && _c) {
 +				int _h = strnstr(_c, ":ksu:", _l) ||
 +					 strnstr(_c, ":ksu_file:", _l) ||
-+					 strnstr(_c, ":lsposed_file:", _l);
++					 strnstr(_c, ":lsposed_file:", _l) || strnstr(_c, ":zygisk_file:", _l);
 +				kfree(_c);
 +				if (_h)
 +					return 0;

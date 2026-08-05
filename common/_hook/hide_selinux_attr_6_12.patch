@@ -8,7 +8,7 @@
  	int attr = lsm_name_to_attr(name);
 +	if (__kuid_val(current_uid()) >= 10000 && size && value &&
 +	    (strnstr(value, ":ksu:", size) ||
-+	     strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size)))
++	     strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size) || strnstr(value, ":zygisk_file:", size)))
 +		return -EINVAL;
  
  	if (attr)

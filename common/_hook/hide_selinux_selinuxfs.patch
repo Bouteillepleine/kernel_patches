@@ -6,7 +6,7 @@
  
 +	if (__kuid_val(current_uid()) >= 10000 &&
 +	    (strnstr(data, ":ksu:", size) || strnstr(data, ":ksu_file:", size) ||
-+	     strnstr(data, ":lsposed_file:", size)))
++	     strnstr(data, ":lsposed_file:", size) || strnstr(data, ":zygisk_file:", size)))
 +		return -EINVAL;
 +
  	rv = write_op[ino](file, data, size);
