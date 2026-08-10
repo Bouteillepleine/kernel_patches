@@ -1,11 +1,10 @@
 --- a/security/selinux/selinuxfs.c
 +++ b/security/selinux/selinuxfs.c
-@@ -833,6 +833,12 @@
+@@ -833,6 +833,11 @@
  	if (IS_ERR(data))
  		return PTR_ERR(data);
  
-+	/* AID_SHELL (2000) and up: block apps and adb shell, allow system/init. */
-+	if (__kuid_val(current_uid()) >= 2000 &&
++	if (__kuid_val(current_uid()) >= 10000 &&
 +	    (strnstr(data, ":ksu:", size) || strnstr(data, ":ksu_file:", size) ||
 +	     strnstr(data, ":lsposed_file:", size) || strnstr(data, ":zygisk_file:", size)))
 +		return -EINVAL;

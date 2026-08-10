@@ -1,13 +1,12 @@
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -6586,10 +6586,15 @@
+@@ -6586,10 +6586,14 @@
  }
  
  static int selinux_setprocattr(const char *name, void *value, size_t size)
  {
  	int attr = lsm_name_to_attr(name);
-+	/* AID_SHELL (2000) and up: block apps and adb shell, allow system/init. */
-+	if (__kuid_val(current_uid()) >= 2000 && size && value &&
++	if (__kuid_val(current_uid()) >= 10000 && size && value &&
 +	    (strnstr(value, ":ksu:", size) ||
 +	     strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size) || strnstr(value, ":zygisk_file:", size)))
 +		return -EINVAL;
