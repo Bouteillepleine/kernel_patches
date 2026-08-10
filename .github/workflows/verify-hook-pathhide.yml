@@ -1,0 +1,177 @@
+name: 🕵️ verify _hook/_pathhide on GKI
+
+# Applies the updated common/_hook + common/_pathhide patches onto vanilla Google
+# GKI ACK source (5 builder versions) and compiles ONLY the affected objects with
+# a real clang (the tree's prebuilt if present, else apt clang-18, LLVM). The
+# `seqno` job additionally integrates KernelSU-Next so kernel/selinux/rules.c
+# exists, applies fix_selinux_seqno, and compiles that object.
+
+on:
+  push:
+    branches: [ci/verify-patches]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'single android<A>-<K> to run (blank = all 5)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [android12-5.10, android13-5.15, android14-6.1, android15-6.6, android16-6.12]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate
+        id: gate
+        run: |
+          SEL="${{ github.event.inputs.version }}"
+          if [ -n "$SEL" ] && [ "$SEL" != "${{ matrix.version }}" ]; then echo "run=no" >> "$GITHUB_OUTPUT"; else echo "run=yes" >> "$GITHUB_OUTPUT"; fi
+      - name: Free disk
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get -qq autoremove -y; sudo apt-get -qq clean; df -h /
+      - name: Deps
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          sudo apt-get -qq update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
+            build-essential git curl python3 flex bison libssl-dev libelf-dev bc rsync zip ccache \
+            clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu libdw-dev
+          mkdir -p ~/bin; curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo; chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.email ci@ci; git config --global user.name ci; git config --global color.ui false
+      - name: Sync GKI (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          V="${{ matrix.version }}"; mkdir gki && cd gki
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-$V" < /dev/null
+          repo sync -c -j"$(nproc)" --no-tags --optimized-fetch --prune --force-sync
+          test -d common
+      - name: Apply patches (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -e
+          V="${{ matrix.version }}"; KVER="${V#*-}"; P="$GITHUB_WORKSPACE/common"
+          cd gki/common
+          cp "$P/_pathhide/pathhide.c" fs/proc/pathhide.c
+          cp "$P/_pathhide/pathhide.h" include/linux/pathhide.h
+          patch -p1 < "$P/_pathhide/pathhide_${KVER}_integration.patch"
+          patch -p1 < "$P/_pathhide/pathhide_build_integration.patch"
+          if patch -p1 --dry-run < "$P/_pathhide/pathhide_mapfiles_integration.patch" >/dev/null 2>&1; then
+            patch -p1 < "$P/_pathhide/pathhide_mapfiles_integration.patch"; echo "mapfiles: APPLIED"
+          else echo "mapfiles: SKIPPED ($KVER context differs)"; fi
+          if patch -p1 --dry-run < "$P/_hook/hide_selinux_attr_6_12.patch" >/dev/null 2>&1; then
+            patch -p1 < "$P/_hook/hide_selinux_attr_6_12.patch"; echo "attr: 6_12"
+          else patch -p1 < "$P/_hook/hide_selinux_attr.patch"; echo "attr: legacy"; fi
+          if patch -p1 --dry-run < "$P/_hook/quiet_selinux_audit.patch" >/dev/null 2>&1; then
+            patch -p1 < "$P/_hook/quiet_selinux_audit.patch"; echo "audit: non-legacy"
+          else patch -p1 < "$P/_hook/quiet_selinux_audit_legacy.patch"; echo "audit: legacy"; fi
+          patch -p1 < "$P/_hook/hide_selinux_selinuxfs.patch"
+          patch -p1 < "$P/_hook/quiet_selinux_audit_user.patch"
+          echo "all patches applied"
+      - name: Compile affected objects (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -e
+          cd gki/common
+          sudo mkdir -p /usr/local/bin
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-as; do
+            [ -e /usr/bin/$t-18 ] && sudo ln -sf /usr/bin/$t-18 /usr/local/bin/$t; done
+          export PATH="/usr/local/bin:$PATH"
+          echo "toolchain: apt clang-18"; clang --version | head -1; ld.lld --version | head -1
+          M="make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -j$(nproc)"
+          $M gki_defconfig
+          ./scripts/config --file out/.config --enable SECURITY --enable SECURITY_NETWORK --enable SECURITY_SELINUX \
+            --enable AUDIT --enable CHECKPOINT_RESTORE --enable PROC_FS --disable LTO_CLANG_THIN --disable LTO_CLANG_FULL \
+            --disable CFI_CLANG --disable SHADOW_CALL_STACK --disable KCFI --disable DEBUG_INFO_BTF --disable DEBUG_INFO \
+            --disable WERROR --disable RUST || true
+          $M olddefconfig
+          echo "cfg: SELINUX=$(./scripts/config --file out/.config --state SECURITY_SELINUX) AUDIT=$(./scripts/config --file out/.config --state AUDIT) CR=$(./scripts/config --file out/.config --state CHECKPOINT_RESTORE)"
+          $M prepare
+          FAIL=0
+          for o in fs/proc/pathhide.o fs/proc/fd.o fs/proc/task_mmu.o fs/proc/base.o \
+                   security/selinux/hooks.o security/selinux/selinuxfs.o security/selinux/avc.o kernel/audit.o; do
+            if $M "$o" >/tmp/cc.log 2>&1; then echo "CC  $o : OK"; else echo "CC  $o : FAIL"; tail -20 /tmp/cc.log; FAIL=1; fi
+          done
+          echo "=== ${{ matrix.version }}: $([ $FAIL = 0 ] && echo ALL-OK || echo FAILURES) ==="
+          exit $FAIL
+
+  seqno:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [android12-5.10, android13-5.15, android14-6.1, android15-6.6, android16-6.12]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate
+        id: gate
+        run: |
+          SEL="${{ github.event.inputs.version }}"
+          if [ -n "$SEL" ] && [ "$SEL" != "${{ matrix.version }}" ]; then echo "run=no" >> "$GITHUB_OUTPUT"; else echo "run=yes" >> "$GITHUB_OUTPUT"; fi
+      - name: Free disk
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get -qq autoremove -y; sudo apt-get -qq clean; df -h /
+      - name: Deps
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          sudo apt-get -qq update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
+            build-essential git curl python3 flex bison libssl-dev libelf-dev bc rsync zip ccache \
+            clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu libdw-dev
+          mkdir -p ~/bin; curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo; chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.email ci@ci; git config --global user.name ci; git config --global color.ui false
+      - name: Sync GKI (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          V="${{ matrix.version }}"; mkdir gki && cd gki
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-$V" < /dev/null
+          repo sync -c -j"$(nproc)" --no-tags --optimized-fetch --prune --force-sync
+          test -d common
+      - name: KernelSU-Next + apply fix_selinux_seqno (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -e
+          P="$GITHUB_WORKSPACE/common"; cd gki/common
+          git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
+          test -f KernelSU-Next/kernel/selinux/rules.c
+          # wire like setup.sh (symlink + Makefile + Kconfig)
+          ln -sf "$(realpath KernelSU-Next/kernel)" drivers/kernelsu
+          grep -q 'kernelsu' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          ( cd KernelSU-Next && patch -p1 < "$P/_hook/fix_selinux_seqno.patch" )
+          grep -n ksu_policyload_announced KernelSU-Next/kernel/selinux/rules.c
+      - name: Compile rules.o (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -e
+          cd gki/common
+          sudo mkdir -p /usr/local/bin
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-as; do
+            [ -e /usr/bin/$t-18 ] && sudo ln -sf /usr/bin/$t-18 /usr/local/bin/$t; done
+          export PATH="/usr/local/bin:$PATH"
+          echo "toolchain: apt clang-18"; clang --version | head -1; ld.lld --version | head -1
+          M="make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -j$(nproc)"
+          $M gki_defconfig
+          ./scripts/config --file .config --enable KSU --enable SECURITY_SELINUX --enable AUDIT \
+            --disable LTO_CLANG_THIN --disable LTO_CLANG_FULL --disable CFI_CLANG --disable SHADOW_CALL_STACK \
+            --disable KCFI --disable DEBUG_INFO_BTF --disable DEBUG_INFO --disable WERROR --disable RUST || true
+          $M olddefconfig
+          echo "cfg: KSU=$(./scripts/config --file .config --state KSU)"
+          $M prepare
+          # generate SELinux headers (flask.h / av_permissions.h) that rules.c pulls in
+          $M security/selinux/avc.o
+          $M drivers/kernelsu/selinux/rules.o KCFLAGS="-I$PWD/security/selinux -I$PWD/security/selinux/include"
+          ls -l drivers/kernelsu/selinux/rules.o
+          echo "=== ${{ matrix.version }} seqno rules.o: OK ==="

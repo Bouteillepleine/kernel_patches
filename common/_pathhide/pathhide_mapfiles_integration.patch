@@ -1,0 +1,37 @@
+Extend pathhide coverage to /proc/<pid>/map_files/ (readdir listing, name
+lookup, and symlink resolution). Without this, a process can enumerate its own
+injected file-backed mappings via /proc/self/map_files/ even though they are
+hidden from /proc/self/maps. Guarded upstream by CONFIG_CHECKPOINT_RESTORE.
+
+NEEDS VALIDATION per tree: line numbers/context match v6.12; on 5.10 the
+readdir loop walks mm->mmap via vm_next instead of for_each_vma().
+
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -65,1 +65,2 @@
+ #include <linux/namei.h>
++#include <linux/pathhide.h>
+@@ -2270,5 +2271,5 @@
+	rc = -ENOENT;
+	vma = find_exact_vma(mm, vm_start, vm_end);
+-	if (vma && vma->vm_file) {
++	if (vma && vma->vm_file && !pathhide_match_file(vma->vm_file)) {
+		*path = *file_user_path(vma->vm_file);
+		path_get(path);
+@@ -2372,6 +2373,6 @@
+	if (!vma)
+		goto out_no_vma;
+
+-	if (vma->vm_file)
++	if (vma->vm_file && !pathhide_match_file(vma->vm_file))
+		result = proc_map_files_instantiate(dentry, task,
+				(void *)(unsigned long)vma->vm_file->f_mode);
+@@ -2446,5 +2447,7 @@
+	for_each_vma(vmi, vma) {
+		if (!vma->vm_file)
+			continue;
++		if (pathhide_match_file(vma->vm_file))
++			continue;
+		if (++pos <= ctx->pos)
+			continue;
+

@@ -1,0 +1,11 @@
+Wire pathhide.o into the proc filesystem build.
+Copy pathhide.c to fs/proc/pathhide.c and pathhide.h to include/linux/pathhide.h,
+then apply this hunk. Deliberately unconditional obj-y (no CONFIG_PATHHIDE), so
+nothing lands in /proc/config.gz that could out the patch.
+
+--- a/fs/proc/Makefile
++++ b/fs/proc/Makefile
+@@ -6,2 +6,3 @@
+ obj-y   += proc.o
++obj-y   += pathhide.o
+

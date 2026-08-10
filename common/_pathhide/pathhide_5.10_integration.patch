@@ -1,27 +1,23 @@
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -329,6 +329,10 @@
+@@ -1,1 +1,2 @@
+ #include <linux/seq_file.h>
++#include <linux/pathhide.h>
+@@ -329,6 +330,9 @@
  	unsigned long start, end;
  	dev_t dev = 0;
  	const char *name = NULL;
-+	extern bool pathhide_match_file(struct file *file);
 +
 +	if (file && pathhide_match_file(file))
 +		return;
- 
+
  	if (file) {
  		struct inode *inode = file_inode(vma->vm_file);
-
 --- a/fs/proc/fd.c
 +++ b/fs/proc/fd.c
-@@ -173,6 +173,7 @@
- 	struct files_struct *files = NULL;
- 	struct task_struct *task;
- 	int ret = -ENOENT;
-+	extern bool pathhide_match_file(struct file *file);
- 
- 	task = get_proc_task(d_inode(dentry));
- 	if (task) {
+@@ -1,1 +1,2 @@
+ #include <linux/fdtable.h>
++#include <linux/pathhide.h>
 @@ -187,6 +188,11 @@
  		spin_lock(&files->file_lock);
  		fd_file = fcheck_files(files, fd);
@@ -34,15 +30,7 @@
  			*path = fd_file->f_path;
  			path_get(&fd_file->f_path);
  			ret = 0;
-@@ -255,6 +261,7 @@
- 	struct task_struct *p = get_proc_task(file_inode(file));
- 	struct files_struct *files;
- 	unsigned int fd;
-+	extern bool pathhide_match_file(struct file *file);
- 
- 	if (!p)
- 		return -ENOENT;
-@@ -278,6 +285,8 @@
+@@ -278,6 +284,8 @@
  		if (!f)
  			continue;
  		data.mode = f->f_mode;
@@ -50,5 +38,3 @@
 +			continue;
  		rcu_read_unlock();
  		data.fd = fd;
- 
-

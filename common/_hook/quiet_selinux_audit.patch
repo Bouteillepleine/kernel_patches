@@ -1,6 +1,6 @@
 --- a/security/selinux/avc.c
 +++ b/security/selinux/avc.c
-@@ -771,20 +771,36 @@
+@@ -771,20 +771,38 @@
  	sad.tclass = tclass;
  	sad.requested = requested;
  	sad.ssid = ssid;
@@ -12,11 +12,13 @@
  	a->selinux_audit_data = &sad;
  
 +	{
-+		u32 _sids[2] = { ssid, tsid };
++		u32 _sids[2] = { tsid, ssid };
 +		int _i;
 +		for (_i = 0; _i < 2; _i++) {
 +			char *_c = NULL;
 +			u32 _l;
++			if (_i == 1 && ssid == tsid)
++				break;
 +			if (!security_sid_to_context(_sids[_i], &_c, &_l) && _c) {
 +				int _h = strnstr(_c, ":ksu:", _l) ||
 +					 strnstr(_c, ":ksu_file:", _l) ||
