@@ -10,7 +10,7 @@ readdir loop walks mm->mmap via vm_next instead of for_each_vma().
 +++ b/fs/proc/base.c
 @@ -65,1 +65,2 @@
  #include <linux/namei.h>
-+#include <linux/pathhide.h>
++extern bool pathhide_match_file(struct file *file);
 @@ -2270,5 +2271,5 @@
 	rc = -ENOENT;
 	vma = find_exact_vma(mm, vm_start, vm_end);

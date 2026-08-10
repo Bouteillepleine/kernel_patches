@@ -62,7 +62,7 @@ jobs:
           V="${{ matrix.version }}"; KVER="${V#*-}"; P="$GITHUB_WORKSPACE/common"
           cd gki/common
           cp "$P/_pathhide/pathhide.c" fs/proc/pathhide.c
-          cp "$P/_pathhide/pathhide.h" include/linux/pathhide.h
+          cp "$P/_pathhide/pathhide.h" fs/proc/pathhide.h
           patch -p1 < "$P/_pathhide/pathhide_${KVER}_integration.patch"
           patch -p1 < "$P/_pathhide/pathhide_build_integration.patch"
           if patch -p1 --dry-run < "$P/_pathhide/pathhide_mapfiles_integration.patch" >/dev/null 2>&1; then

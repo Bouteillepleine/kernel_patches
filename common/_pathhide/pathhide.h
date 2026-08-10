@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Install this header as include/linux/pathhide.h so both pathhide.c and the
- * fs/proc integration sites can reach it via <linux/pathhide.h>.
+ * Ships co-located with pathhide.c (both copied into fs/), so pathhide.c pulls
+ * it in via #include "pathhide.h". The fs/proc integration sites do NOT include
+ * this header — they forward-declare pathhide_match_file() with a local extern,
+ * so they need no installed header.
  */
 #ifndef _LINUX_PATHHIDE_H
 #define _LINUX_PATHHIDE_H

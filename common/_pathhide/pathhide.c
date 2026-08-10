@@ -38,7 +38,7 @@
 #include <linux/uaccess.h>
 #include <linux/capability.h>
 #include <linux/init.h>
-#include <linux/pathhide.h>
+#include "pathhide.h"
 
 #ifndef PH_PROC_NAME
 #define PH_PROC_NAME	"pathhide"
