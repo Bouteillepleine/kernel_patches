@@ -1,12 +1,13 @@
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -6444,10 +6444,14 @@
+@@ -6444,10 +6444,15 @@
  	struct task_security_struct *tsec;
  	struct cred *new;
  	u32 mysid = current_sid(), sid = 0, ptsid;
  	int error;
  	char *str = value;
-+	if (__kuid_val(current_uid()) >= 10000 && size && value &&
++	/* AID_SHELL (2000) and up: block apps and adb shell, allow system/init. */
++	if (__kuid_val(current_uid()) >= 2000 && size && value &&
 +	    (strnstr(value, ":ksu:", size) ||
 +	     strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size) || strnstr(value, ":zygisk_file:", size)))
 +		return -EINVAL;
