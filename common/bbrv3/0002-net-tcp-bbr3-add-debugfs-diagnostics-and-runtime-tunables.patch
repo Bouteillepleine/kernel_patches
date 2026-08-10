@@ -64,18 +64,10 @@ v3 (review hardening; diagnostics must not become the bug):
 - Guard the debugfs code with CONFIG_DEBUG_FS.
 - Drop the stale "registry is empty" comment in bbr3_unregister
   (there is no registry) and state the actual .owner invariant.
-- bbr3_release() frees the private ctx under the socket spinlock
-  (spin_lock_bh(&sk->sk_lock.slock)); the debugfs walk snapshots it under
-  spin_trylock_bh(). The owned-by-user skip only excludes the runtime
-  CC-change free (which runs under lock_sock); socket destruction
-  (tcp_v4_destroy_sock -> tcp_cleanup_congestion_control -> bbr3_release)
-  frees with owned==0 and no slock held, and bbr3_cache has no RCU grace
-  period, so without this an RCU reader mid-walk (TCP socks are
-  SLAB_TYPESAFE_BY_RCU) could deref a ctx being freed on the destroy path.
 ---
  net/ipv4/Makefile   |   1 +
- net/ipv4/tcp_bbr3.c | 182 ++++++++++++++++++++++++++++++++++++++++++++++++-----
- 2 files changed, 167 insertions(+), 16 deletions(-)
+ net/ipv4/tcp_bbr3.c | 169 +++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 159 insertions(+), 11 deletions(-)
 
 diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
 index 45324da..cb73741 100644
@@ -307,31 +299,7 @@ index bdb02f9..80997f3 100644
  static void bbr3_init(struct sock *sk)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
-@@ -2128,15 +2260,18 @@ static void bbr3_release(struct sock *sk)
- {
- 	struct bbr3 **bbr3_ptr = (struct bbr3 **)inet_csk_ca(sk);
- 	struct tcp_sock *tp = tcp_sk(sk);
--	struct bbr3 *bbr = *bbr3_ptr;
-+	struct bbr3 *bbr;
- 
- 	tp->ecn_flags &= ~TCP_ECN_ECT_PERMANENT;
- 
--	if (!bbr)
--		return;
--
-+	/* Serialize ctx free vs. the debugfs reader's trylock snapshot. */
-+	spin_lock_bh(&sk->sk_lock.slock);
-+	bbr = *bbr3_ptr;
- 	*bbr3_ptr = NULL;
--	kmem_cache_free(bbr3_cache, bbr);
-+	spin_unlock_bh(&sk->sk_lock.slock);
-+
-+	if (bbr)
-+		kmem_cache_free(bbr3_cache, bbr);
- }
- 
- /* BBR marks the current round trip as a loss round. */
-@@ -2348,13 +2483,28 @@ static int __init bbr3_register(void)
+@@ -2348,13 +2480,28 @@ static int __init bbr3_register(void)
  		return -ENOMEM;
  
  	ret = tcp_register_congestion_control(&tcp_bbr3_cong_ops);
