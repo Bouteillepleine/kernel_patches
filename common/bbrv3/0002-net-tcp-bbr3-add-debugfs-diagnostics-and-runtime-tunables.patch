@@ -64,10 +64,16 @@ v3 (review hardening; diagnostics must not become the bug):
 - Guard the debugfs code with CONFIG_DEBUG_FS.
 - Drop the stale "registry is empty" comment in bbr3_unregister
   (there is no registry) and state the actual .owner invariant.
+- Create bbr3_cache with SLAB_TYPESAFE_BY_RCU so the debugfs reader's
+  rcu_read_lock() ehash walk can never dereference a freed ctx: the
+  destroy-path bbr3_release() frees without the socket lock and the cache
+  has no grace period. The backing memory stays type-stable for the
+  reader's RCU section (no UAF); bbr3_release() is unchanged — no
+  init/release-path code, which is the boot-safe way to close the race.
 ---
  net/ipv4/Makefile   |   1 +
- net/ipv4/tcp_bbr3.c | 169 +++++++++++++++++++++++++++++++++++++++++---
- 2 files changed, 159 insertions(+), 11 deletions(-)
+ net/ipv4/tcp_bbr3.c | 171 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 160 insertions(+), 12 deletions(-)
 
 diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
 index 45324da..cb73741 100644
@@ -82,7 +88,7 @@ index 45324da..cb73741 100644
  obj-$(CONFIG_TCP_CONG_CDG) += tcp_cdg.o
  obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
 diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
-index bdb02f9..80997f3 100644
+index b65a91f..256e6ef 100644
 --- a/net/ipv4/tcp_bbr3.c
 +++ b/net/ipv4/tcp_bbr3.c
 @@ -64,13 +64,41 @@
@@ -216,7 +222,7 @@ index bdb02f9..80997f3 100644
  
  /* Exit STARTUP if number of round trips with ECN mark rate above ecn_thresh
   * meets this count.
-@@ -2024,6 +2080,82 @@ out:
+@@ -2035,6 +2091,82 @@ out:
  
  static struct kmem_cache *bbr3_cache __read_mostly;
  
@@ -299,7 +305,13 @@ index bdb02f9..80997f3 100644
  static void bbr3_init(struct sock *sk)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
-@@ -2348,13 +2480,28 @@ static int __init bbr3_register(void)
+@@ -2354,18 +2486,33 @@ static int __init bbr3_register(void)
+ {
+ 	int ret;
+ 
+-	bbr3_cache = KMEM_CACHE(bbr3, SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT);
++	bbr3_cache = KMEM_CACHE(bbr3, SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT | SLAB_TYPESAFE_BY_RCU);
+ 	if (!bbr3_cache)
  		return -ENOMEM;
  
  	ret = tcp_register_congestion_control(&tcp_bbr3_cong_ops);
@@ -330,6 +342,3 @@ index bdb02f9..80997f3 100644
  	tcp_unregister_congestion_control(&tcp_bbr3_cong_ops);
  	kmem_cache_destroy(bbr3_cache);
  }
--- 
-2.54.0.windows.1
-
