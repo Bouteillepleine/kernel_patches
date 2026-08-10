@@ -1,28 +1,29 @@
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
-@@ -29,15 +29,21 @@
- // reset avc cache table, otherwise the new rules will not take effect if already denied
- static void reset_avc_cache()
- {
-+    static bool ksu_policyload_announced; /* silence only the first, boot-time apply */
- #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+@@ -39,10 +39,22 @@ static void reset_avc_cache()
      avc_ss_reset(0);
 -    selnl_notify_policyload(0);
 -    selinux_status_update_policyload(0);
-+    if (ksu_policyload_announced) {
-+        selnl_notify_policyload(0);
-+        selinux_status_update_policyload(0);
++    {
++        static bool ksu_policyload_announced;
++        if (ksu_policyload_announced) {
++            selnl_notify_policyload(0);
++            selinux_status_update_policyload(0);
++        }
++        ksu_policyload_announced = true;
 +    }
  #else
      struct selinux_avc *avc = selinux_state.avc;
      avc_ss_reset(avc, 0);
 -    selnl_notify_policyload(0);
 -    selinux_status_update_policyload(&selinux_state, 0);
-+    if (ksu_policyload_announced) {
-+        selnl_notify_policyload(0);
-+        selinux_status_update_policyload(&selinux_state, 0);
++    {
++        static bool ksu_policyload_announced;
++        if (ksu_policyload_announced) {
++            selnl_notify_policyload(0);
++            selinux_status_update_policyload(&selinux_state, 0);
++        }
++        ksu_policyload_announced = true;
 +    }
  #endif
-+    ksu_policyload_announced = true;
      selinux_xfrm_notify_policyload();
- }
