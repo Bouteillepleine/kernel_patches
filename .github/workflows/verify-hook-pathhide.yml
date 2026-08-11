@@ -1,11 +1,5 @@
 name: 🕵️ verify _hook/_pathhide on GKI
 
-# Applies the updated common/_hook + common/_pathhide patches onto vanilla Google
-# GKI ACK source (5 builder versions) and compiles ONLY the affected objects with
-# a real clang (the tree's prebuilt if present, else apt clang-18, LLVM). The
-# `seqno` job additionally integrates KernelSU-Next so kernel/selinux/rules.c
-# exists, applies fix_selinux_seqno, and compiles that object.
-
 on:
   push:
     branches: [ci/verify-patches]
