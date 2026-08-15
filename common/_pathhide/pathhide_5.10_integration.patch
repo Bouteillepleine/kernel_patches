@@ -14,27 +14,7 @@
 
 --- a/fs/proc/fd.c
 +++ b/fs/proc/fd.c
-@@ -173,6 +173,7 @@
- 	struct files_struct *files = NULL;
- 	struct task_struct *task;
- 	int ret = -ENOENT;
-+	extern bool pathhide_match_file(struct file *file);
- 
- 	task = get_proc_task(d_inode(dentry));
- 	if (task) {
-@@ -187,6 +188,11 @@
- 		spin_lock(&files->file_lock);
- 		fd_file = fcheck_files(files, fd);
- 		if (fd_file) {
-+			if (pathhide_match_file(fd_file)) {
-+				spin_unlock(&files->file_lock);
-+				put_files_struct(files);
-+				return -ENOENT;
-+			}
- 			*path = fd_file->f_path;
- 			path_get(&fd_file->f_path);
- 			ret = 0;
-@@ -255,6 +261,7 @@
+@@ -255,6 +255,7 @@
  	struct task_struct *p = get_proc_task(file_inode(file));
  	struct files_struct *files;
  	unsigned int fd;
@@ -42,7 +22,7 @@
  
  	if (!p)
  		return -ENOENT;
-@@ -278,6 +285,8 @@
+@@ -278,6 +279,8 @@
  		if (!f)
  			continue;
  		data.mode = f->f_mode;
@@ -51,4 +31,3 @@
  		rcu_read_unlock();
  		data.fd = fd;
  
-
