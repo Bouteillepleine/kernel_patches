@@ -1,0 +1,45 @@
+Extend pathhide coverage to /proc/<pid>/map_files/ (readdir listing, name
+lookup, and symlink resolution). Without this, a process can enumerate its own
+injected file-backed mappings via /proc/self/map_files/ even though they are
+hidden from /proc/self/maps -- the address ranges alone prove concealment.
+Guarded upstream by CONFIG_CHECKPOINT_RESTORE.
+
+Generated and verified against android12-5.10.
+
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -63,6 +63,7 @@
+ #include <linux/string.h>
+ #include <linux/seq_file.h>
+ #include <linux/namei.h>
++extern bool pathhide_match_file(struct file *file);
+ #include <linux/mnt_namespace.h>
+ #include <linux/mm.h>
+ #include <linux/pgsize_migration.h>
+@@ -2272,7 +2273,7 @@
+ 
+ 	rc = -ENOENT;
+ 	vma = find_exact_vma(mm, vm_start, vm_end);
+-	if (vma && vma->vm_file) {
++	if (vma && vma->vm_file && !pathhide_match_file(vma->vm_file)) {
+ 		*path = vma->vm_file->f_path;
+ 		path_get(path);
+ 		rc = 0;
+@@ -2375,7 +2376,7 @@
+ 	if (!vma)
+ 		goto out_no_vma;
+ 
+-	if (vma->vm_file)
++	if (vma->vm_file && !pathhide_match_file(vma->vm_file))
+ 		result = proc_map_files_instantiate(dentry, task,
+ 				(void *)(unsigned long)vma->vm_file->f_mode);
+ 
+@@ -2445,6 +2446,8 @@
+ 
+ 	for (vma = mm->mmap, pos = 2; vma; vma = vma->vm_next) {
+ 		if (!vma->vm_file)
++			continue;
++		if (pathhide_match_file(vma->vm_file))
+ 			continue;
+ 		if (++pos <= ctx->pos)
+ 			continue;

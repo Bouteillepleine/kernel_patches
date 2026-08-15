@@ -59,9 +59,7 @@ jobs:
           cp "$P/_pathhide/pathhide.h" fs/proc/pathhide.h
           patch -p1 < "$P/_pathhide/pathhide_${KVER}_integration.patch"
           patch -p1 < "$P/_pathhide/pathhide_build_integration.patch"
-          if patch -p1 --dry-run < "$P/_pathhide/pathhide_mapfiles_integration.patch" >/dev/null 2>&1; then
-            patch -p1 < "$P/_pathhide/pathhide_mapfiles_integration.patch"; echo "mapfiles: APPLIED"
-          else echo "mapfiles: SKIPPED ($KVER context differs)"; fi
+          patch -p1 < "$P/_pathhide/pathhide_mapfiles_${KVER}_integration.patch"
           if patch -p1 --dry-run < "$P/_hook/hide_selinux_attr_6_12.patch" >/dev/null 2>&1; then
             patch -p1 < "$P/_hook/hide_selinux_attr_6_12.patch"; echo "attr: 6_12"
           else patch -p1 < "$P/_hook/hide_selinux_attr.patch"; echo "attr: legacy"; fi
