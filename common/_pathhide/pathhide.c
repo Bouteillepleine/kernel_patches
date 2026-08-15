@@ -32,6 +32,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/percpu.h>
 #include <linux/spinlock.h>
 #include <linux/dcache.h>
 #include <linux/string.h>
@@ -68,23 +69,30 @@ static bool ph_match_str(const char *path)
 	return hit;
 }
 
+/*
+ * Preallocated per-CPU path buffers. An allocation here could only fail
+ * "open" -- a NULL buffer means no match, which emits the very mapping we
+ * were asked to conceal -- so the allocation is removed rather than made
+ * more robust. Costs PATH_MAX per CPU, held for the life of the kernel.
+ */
+static DEFINE_PER_CPU(char [PATH_MAX], ph_pathbuf);
+
 bool pathhide_match_file(struct file *file)
 {
-	char *buf, *p;
+	char (*bufp)[PATH_MAX];
+	char *p;
 	bool hit = false;
 
 	if (!file || !READ_ONCE(ph_nrules))
 		return false;
 
-	buf = kmalloc(PATH_MAX, GFP_ATOMIC);
-	if (!buf)
-		return false;
-
-	p = d_path(&file->f_path, buf, PATH_MAX);
+	/* Disables preemption; d_path() and ph_match_str() never sleep. */
+	bufp = get_cpu_ptr(&ph_pathbuf);
+	p = d_path(&file->f_path, *bufp, PATH_MAX);
 	if (!IS_ERR(p))
 		hit = ph_match_str(p);
+	put_cpu_ptr(&ph_pathbuf);
 
-	kfree(buf);
 	return hit;
 }
 
