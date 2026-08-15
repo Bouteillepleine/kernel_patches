@@ -143,7 +143,13 @@ jobs:
           grep -q 'kernelsu' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           ( cd KernelSU-Next && patch -p1 < "$P/_hook/fix_selinux_seqno.patch" )
-          grep -n ksu_policyload_announced KernelSU-Next/kernel/selinux/rules.c
+          # Post-condition: the status-page bump is gone, so /sys/fs/selinux/status
+          # keeps its stock policyload seqno. avc_ss_reset/selnl_notify must remain.
+          if grep -q selinux_status_update_policyload KernelSU-Next/kernel/selinux/rules.c; then
+            echo "seqno: FAIL - selinux_status_update_policyload still present"; exit 1; fi
+          grep -q selnl_notify_policyload KernelSU-Next/kernel/selinux/rules.c || \
+            { echo "seqno: FAIL - selnl_notify_policyload was removed (bootloop risk)"; exit 1; }
+          echo "seqno: status-page bump removed, selnl_notify retained"
       - name: Compile rules.o (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
         run: |
