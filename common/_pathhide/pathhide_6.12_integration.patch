@@ -1,33 +1,22 @@
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -495,6 +495,15 @@
- static int show_map(struct seq_file *m, void *v)
- {
- 	struct vm_area_struct *vma = v;
+@@ -462,6 +462,10 @@
+ 	unsigned long long pgoff = 0;
+ 	unsigned long start, end;
+ 	dev_t dev = 0;
 +	extern bool pathhide_match_file(struct file *file);
 +
-+	/* Hide the WHOLE entry: this also covers the show_map_pad_vma() call below,
-+	 * which re-enters show_map_vma() for the padding VMA. Guarding the callers
-+	 * rather than show_map_vma() itself means exactly one match per VMA per read
-+	 * -- pathhide_match_file() costs a d_path() walk and roughly doubles a maps
-+	 * read as it is (measured 100ms vs 51ms over 10587 vmas on OP15). */
 +	if (vma->vm_file && pathhide_match_file(vma->vm_file))
-+		return 0;
++		return;
  
- 	if (vma_pages(vma))
- 		show_map_vma(m, vma);
-@@ -1303,6 +1312,16 @@
+ 	if (vma->vm_file) {
+ 		const struct inode *inode = file_user_inode(vma->vm_file);
+@@ -1303,6 +1307,10 @@
  {
  	struct vm_area_struct *vma = v;
  	struct mem_size_stats mss = {};
 +	extern bool pathhide_match_file(struct file *file);
 +
-+	/* Skip the whole smaps entry, not just its header. show_smap() emits Size:,
-+	 * KernelPageSize:, __show_smap() and the rest unconditionally, so dropping
-+	 * only show_map_vma()s header left an ORPHANED stats block -- a louder tell
-+	 * than the mapping it hides (stock always has header==stats parity), and it
-+	 * leaked the hidden mappings sizes. Measured on OP15: 4748 headers vs 4750
-+	 * Size: blocks, orphans of 3376 kB and 984 kB. */
 +	if (vma->vm_file && pathhide_match_file(vma->vm_file))
 +		return 0;
  
