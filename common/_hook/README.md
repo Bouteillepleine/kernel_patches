@@ -83,3 +83,44 @@ can hold a stale decision across a KSU policy change. Narrow in practice —
 `avc_ss_reset()` is deliberately *kept*, so the kernel's own AVC still flushes;
 only userspace-cached decisions are affected, and KSU installs its rules early in
 boot, before most userspace caching matters.
+
+## Why the gate is `uid >= 2000` and must not be widened
+
+Tested 2026-08-21 on OP15 (branch `hook/uid-gate-non-root`, kernel run
+32506537161): changing all three gates from `uid >= 2000` to `uid != 0`, so that
+system-uid callers are cloaked too. **It boots, it closes the oracle for
+uid 1000-1999 -- and it costs every app its root grant.** Do not re-attempt.
+
+`hide_selinux_selinuxfs.patch` hooks `selinux_transaction_write()`, the *generic*
+dispatcher for every selinuxfs transaction file. That includes
+`/sys/fs/selinux/access`, which is what libselinux's `selinux_check_access()`
+writes to -- and access checks are performed **by a proxy, on behalf of somebody
+else**:
+
+```
+ksud (uid 0, u:r:ksu:s0) asks servicemanager for the "package" service
+  -> servicemanager (uid 1000) calls selinux_check_access("u:r:ksu:s0", ...)
+     -> libselinux writes that string to /sys/fs/selinux/access
+        -> string contains ":ksu:", caller is uid 1000, now cloaked -> -EINVAL
+           -> libselinux reads the failure as a denial
+              -> servicemanager refuses the lookup
+```
+
+Observed: `avc: denied { find } ... name=package scontext=u:r:ksu:s0
+tcontext=u:object_r:package_service:s0 permissive=0`, from 8.17s of uptime,
+repeating once a second indefinitely. ksud never builds the package->appid map,
+so the allowlist is never applied and no app gets root. `.allowlist` on disk is
+untouched -- reflashing a `>= 2000` kernel restores everything.
+
+The tell is easy to misread: `adb` root still works, because uid-0 `su` does not
+go through servicemanager. It looks like a userspace problem, not a kernel one.
+The previous boot's `/data/adb/ksu/log/dmesg.old.log` had **0** of these denials;
+same KernelSU driver 35088 both boots.
+
+So the residual gap is real but narrow: an oracle at uid 1000-1999 needs an
+attacker who **already holds a system uid** (platform-signed, or sharedUserId
+android.uid.system). Every detector worth cloaking against runs at uid >= 10000
+and is covered. Note also that `setprocattr` alone could safely take `!= 0` --
+it can only ever set the *caller's own* label, so nothing is proxied -- except
+that a uid-1000 LSPosed daemon setting `attr/fscreate` to
+`u:object_r:lsposed_file:s0` goes through the same string match. Not worth it.
