@@ -14,7 +14,19 @@
  *
  * Rules are substrings of the *full* path, so prefer specific needles
  * (a package id or an absolute prefix) over short tokens that could match
- * unrelated paths.
+ * unrelated paths. This is a genuine footgun, not a style note -- measured
+ * against system_server's 5442 file-backed mappings on OP15:
+ *
+ *     "com.strawing.duckusb"  ->     0 hidden   (a package id: exact)
+ *     "base.apk"              ->   665 hidden   (12%)
+ *     "/system/"              ->  1638 hidden   (30%)
+ *     "lib"                   ->  2270 hidden   (42%)
+ *     "com"                   ->  2271 hidden   (42%)
+ *
+ * Nothing here rejects a rule for being too broad, and the same needle also
+ * removes entries from /proc/<pid>/fd, where a vanished fd can confuse anything
+ * that enumerates them. A sloppy rule therefore degrades the whole system in a
+ * way that is very hard to attribute back to this file. Keep needles specific.
  *
  * Inert until the first rule is added (pathhide_match_file() short-circuits on
  * an empty rule set), so it is a no-op on stock configurations.
