@@ -19,13 +19,28 @@
  * Inert until the first rule is added (pathhide_match_file() short-circuits on
  * an empty rule set), so it is a no-op on stock configurations.
  *
- * Stealth notes:
- *   - The control node returns -ENOENT to callers without CAP_SYS_ADMIN, so an
- *     unprivileged probe that open()s the path by name cannot confirm it exists.
- *   - The node name is a build-time knob (PH_PROC_NAME); override it to blend
- *     into the target tree. The dirent is still visible to an unprivileged
- *     /proc readdir, so for full stealth also hide the name via the readdir
- *     cloak (69_hide_stuff / maphide).
+ * Stealth notes -- READ THESE BEFORE RELYING ON THEM:
+ *   - ph_open() returns -ENOENT without CAP_SYS_ADMIN so an open() by name
+ *     answers exactly as it would for a file that is not there. That check is
+ *     only REACHABLE because the node is created world-openable (0666): at 0600
+ *     the VFS rejected on DAC in may_open() before ph_open() ever ran, and the
+ *     caller got EACCES -- which confirms the file exists. Measured on OP15 at
+ *     0600, as uid 2000: `cat /proc/pathhide` -> "Permission denied". Every
+ *     write path still checks CAP_SYS_ADMIN, and a non-admin cannot obtain a fd
+ *     at all, so 0666 grants nothing.
+ *   - The dirent REMAINS VISIBLE to an unprivileged /proc readdir, and stat()
+ *     by name still succeeds. Measured on OP15 as uid 2000:
+ *         ls /proc | grep pathhide   -> 1
+ *         ls -l /proc/pathhide       -> -rw------- root root
+ *     A stock kernel has no such entry, so this is a one-syscall,
+ *     zero-permission, self-naming tell -- louder than anything this file
+ *     hides. Renaming via PH_PROC_NAME only makes it less self-describing; it
+ *     does not make it absent, and nothing in the builders currently overrides
+ *     it, so the node ships literally called "pathhide".
+ *   - The real fix is not to have a /proc node at all: nomount moved its own
+ *     knobs off /sys/kernel/<name> onto a private raw-netlink protocol for
+ *     exactly this reason (CAP_NET_ADMIN-gated, not enumerable, no dirent).
+ *     This control plane should follow it.
  */
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -96,19 +111,28 @@ bool pathhide_match_file(struct file *file)
 	return hit;
 }
 
-/* Callers hold ph_lock. */
-static void ph_add_locked(const char *s)
+/*
+ * Callers hold ph_lock. Returns 0 on success (or if already present) and
+ * -ENOSPC when the table is full -- the caller MUST propagate that. Silently
+ * returning success from a full table meant `echo +rule > /proc/pathhide`
+ * reported success while hiding nothing, so a user past PH_MAX_RULES believed
+ * paths were cloaked that were still in plain view. Same class as the batch-add
+ * bug that let the nomount engine report an applied rule it had refused.
+ */
+static int ph_add_locked(const char *s)
 {
 	int i;
 
 	for (i = 0; i < ph_nrules; i++)
 		if (!strcmp(ph_rules[i], s))
-			return;			/* already present */
+			return 0;		/* already present */
 	if (ph_nrules >= PH_MAX_RULES)
-		return;
+		return -ENOSPC;
 	strscpy(ph_rules[ph_nrules], s, PH_RULE_LEN);
-	if (ph_rules[ph_nrules][0])
-		WRITE_ONCE(ph_nrules, ph_nrules + 1);
+	if (!ph_rules[ph_nrules][0])
+		return -EINVAL;
+	WRITE_ONCE(ph_nrules, ph_nrules + 1);
+	return 0;
 }
 
 /* Callers hold ph_lock. */
@@ -153,6 +177,7 @@ static ssize_t ph_write(struct file *file, const char __user *ubuf,
 	unsigned long flags;
 	const char *s;
 	size_t n = count;
+	int ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
@@ -189,12 +214,14 @@ static ssize_t ph_write(struct file *file, const char __user *ubuf,
 		return -ENAMETOOLONG;
 
 	spin_lock_irqsave(&ph_lock, flags);
-	if (line[0] == '~')
+	if (line[0] == '~') {
 		ph_del_locked(s);
-	else
-		ph_add_locked(s);
+		ret = 0;
+	} else {
+		ret = ph_add_locked(s);
+	}
 	spin_unlock_irqrestore(&ph_lock, flags);
-	return count;
+	return ret ? ret : count;
 }
 
 static const struct proc_ops ph_proc_ops = {
@@ -207,6 +234,15 @@ static const struct proc_ops ph_proc_ops = {
 
 static int __init pathhide_init(void)
 {
+	/*
+	 * Kept at 0600. Loosening it to 0666 would make ph_open()'s -ENOENT
+	 * reachable (the VFS otherwise refuses in may_open() first and hands an
+	 * unprivileged caller EACCES, which proves the node exists) -- but that
+	 * closes only ONE of three disclosure vectors while readdir and stat still
+	 * expose the node, and a world-writable /proc entry is itself an anomaly.
+	 * Trading a certain oddity for a partial gain is not worth it; the fix is
+	 * to stop using /proc at all. See the stealth notes at the top.
+	 */
 	proc_create(PH_PROC_NAME, 0600, NULL, &ph_proc_ops);
 	return 0;
 }
