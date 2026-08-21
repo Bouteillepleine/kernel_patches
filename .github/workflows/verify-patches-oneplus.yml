@@ -1,0 +1,125 @@
+name: 🎯 verify patches on the REAL OnePlus trees
+
+# verify-hook-pathhide.yml syncs AOSP common GKI. The builders build OnePlus /
+# WildKernels trees, which differ -- OnePlus 6.1 carries an OPlus-only
+# CONFIG_CONT_PTE_HUGEPAGE block inside show_smap(), for one. On 2026-08-21 a
+# patch that was clean against AOSP failed on 26 builder jobs for exactly that
+# reason. This job checks what the builders actually compile.
+#
+# No kernel is built: every patch is dry-run against the real fs/proc and
+# security/selinux sources, fetched at the revision each manifest pins. That is
+# enough to catch a context mismatch, which is the failure this exists to stop,
+# and it finishes in minutes instead of hours.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'common/_hook/**'
+      - 'common/_pathhide/**'
+      - '.github/workflows/verify-patches-oneplus.yml'
+  pull_request:
+    paths:
+      - 'common/_hook/**'
+      - 'common/_pathhide/**'
+  workflow_dispatch:
+    inputs:
+      builder:
+        description: 'builder repo whose manifests define the fleet'
+        required: false
+        default: 'Bouteillepleine/OnePlus-ReSukiSu_NMS'
+      manifest_dir:
+        description: 'manifest directory in that repo'
+        required: false
+        default: 'manifests/a16'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      BUILDER: ${{ github.event.inputs.builder || 'Bouteillepleine/OnePlus-ReSukiSu_NMS' }}
+      MANIFEST_DIR: ${{ github.event.inputs.manifest_dir || 'manifests/a16' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect every (tree, revision) the fleet pins
+        run: |
+          set -euo pipefail
+          mkdir -p .verify
+          # Manifests live in the builder repo. Two shapes appear: a project with
+          # path="kernel_platform/common" (Qualcomm), and a project carrying
+          # <linkfile dest="kernel_platform/common"> (MediaTek). Both are the
+          # common kernel; missing the second silently skips ~15 trees.
+          gh api "repos/$BUILDER/contents/$MANIFEST_DIR" --jq '.[] | select(.name|endswith(".xml")) | .download_url' > .verify/urls.txt
+          echo "manifests: $(wc -l < .verify/urls.txt)"
+          : > .verify/pairs.raw
+          while read -r u; do
+            m=$(curl -sfL "$u") || continue
+            printf '%s\n' "$m" | grep 'path="kernel_platform/common"' | head -1 \
+              | sed -nE 's/.*name="([^"]+)".*revision="([^"]+)".*/\1 \2/p' >> .verify/pairs.raw || true
+            printf '%s\n' "$m" | grep -B1 'linkfile dest="kernel_platform/common"' | grep '<project' \
+              | sed -nE 's/.*name="([^"]+)".*revision="([^"]+)".*/\1 \2/p' >> .verify/pairs.raw || true
+          done < .verify/urls.txt
+          grep -v '^$' .verify/pairs.raw | sort -u > .verify/pairs.txt
+          echo "distinct (tree, revision) pairs: $(wc -l < .verify/pairs.txt)"
+          test -s .verify/pairs.txt
+
+      - name: Dry-run every patch against every tree
+        run: |
+          set -uo pipefail
+          KP="$PWD/common"
+          fails=0; checked=0; skipped=0
+          # Mirrors the builder's own selection (build-kernel/action.yml):
+          #   selinuxfs + audit_user always; attr_6_12 on 6.12 else attr;
+          #   quiet_audit on 6.6/6.12 else quiet_audit_legacy.
+          # fix_selinux_seqno.patch targets kernel/selinux/rules.c, a KernelSU
+          # file that does not exist in the common tree -- not verifiable here.
+          while read -r name rev; do
+            [ -n "$name" ] || continue
+            d=".verify/t/$name-${rev:0:8}"; mkdir -p "$d"
+            mk=$(curl -sfL "https://raw.githubusercontent.com/OnePlusOSS/$name/$rev/Makefile" | head -5) || true
+            kv=$(printf '%s' "$mk" | awk '/^VERSION/{v=$3}/^PATCHLEVEL/{p=$3}END{if(v!="")print v"."p}')
+            if [ -z "$kv" ]; then echo "::warning::cannot read kernel version for $name@${rev:0:8} - skipped"; skipped=$((skipped+1)); continue; fi
+            case "$kv" in 6.12) attr=hide_selinux_attr_6_12.patch ;; *) attr=hide_selinux_attr.patch ;; esac
+            case "$kv" in 6.6|6.12) audit=quiet_selinux_audit.patch ;; *) audit=quiet_selinux_audit_legacy.patch ;; esac
+            set -- \
+              "_pathhide/pathhide_${kv}_integration.patch" \
+              "_pathhide/pathhide_mapfiles_${kv}_integration.patch" \
+              "_hook/$attr" "_hook/hide_selinux_selinuxfs.patch" \
+              "_hook/$audit" "_hook/quiet_selinux_audit_user.patch"
+            row=""; bad=0
+            for p in "$@"; do
+              if [ ! -f "$KP/$p" ]; then row="$row MISSING:$(basename "$p")"; bad=1; continue; fi
+              # fetch only the files this patch actually touches
+              for f in $(grep '^--- a/' "$KP/$p" | sed 's|^--- a/||' | sort -u); do
+                [ -f "$d/$f" ] && continue
+                mkdir -p "$d/$(dirname "$f")"
+                curl -sfL "https://raw.githubusercontent.com/OnePlusOSS/$name/$rev/$f" -o "$d/$f" || rm -f "$d/$f"
+              done
+              missing=0
+              for f in $(grep '^--- a/' "$KP/$p" | sed 's|^--- a/||' | sort -u); do
+                [ -s "$d/$f" ] || missing=1
+              done
+              if [ "$missing" = 1 ]; then row="$row n/a:$(basename "$p")"; continue; fi
+              if (cd "$d" && patch -p1 --forward --dry-run < "$KP/$p" >/dev/null 2>&1); then
+                row="$row ok"
+              else
+                row="$row ***$(basename "$p")***"; bad=1
+              fi
+            done
+            checked=$((checked+1))
+            if [ "$bad" = 1 ]; then
+              fails=$((fails+1))
+              echo "::error::$name @ ${rev:0:8} (k=$kv):$row"
+            else
+              printf '  %-44s k=%-5s%s\n' "$name" "$kv" "$row"
+            fi
+          done < .verify/pairs.txt
+          echo
+          echo "trees checked: $checked   failed: $fails   skipped: $skipped"
+          [ "$fails" -eq 0 ] || { echo "::error::$fails tree(s) reject at least one patch - the builders will fail on these"; exit 1; }
+          echo "every patch applies on every tree the fleet builds"
