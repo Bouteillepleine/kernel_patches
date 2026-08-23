@@ -93,20 +93,37 @@ static char ph_rules[PH_MAX_RULES][PH_RULE_LEN];
 static int  ph_nrules;
 static DEFINE_SPINLOCK(ph_lock);
 
+/*
+ * Plain spin_lock, NOT spin_lock_irqsave.
+ *
+ * Nothing takes ph_lock from interrupt or softirq context -- every caller is
+ * process context: pathhide_match_file() off a /proc read, pathhide_ctl() off a
+ * netlink command, pathhide_get_rule() off a dump, ph_seq_show() off a /proc
+ * read. Disabling interrupts bought nothing and was paid for on the hottest path
+ * this file has: one call per VMA, so system_server's ~5400 file-backed mappings
+ * mean ~5400 acquisitions to read /proc/<pid>/maps once, each holding the lock
+ * across up to PH_MAX_RULES strstr() passes over a PATH_MAX string.
+ *
+ * Not converted to RCU. It would let readers run lock-free, which is the right
+ * shape for a read-mostly set -- but it needs the rule array to become an
+ * immutable, pointer-swapped object, and getting that wrong is a use-after-free
+ * on a path every process hits. The scan is bounded (64 rules, short needles) and
+ * the realistic set is under ten, so the win did not justify the risk here. If
+ * this ever shows up in a profile, that is the change to make.
+ */
 static bool ph_match_str(const char *path)
 {
-	unsigned long flags;
 	bool hit = false;
 	int i;
 
-	spin_lock_irqsave(&ph_lock, flags);
+	spin_lock(&ph_lock);
 	for (i = 0; i < ph_nrules; i++) {
 		if (strstr(path, ph_rules[i])) {
 			hit = true;
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&ph_lock, flags);
+	spin_unlock(&ph_lock);
 	return hit;
 }
 
@@ -161,8 +178,14 @@ static int ph_add_locked(const char *s)
 	return 0;
 }
 
-/* Callers hold ph_lock. */
-static void ph_del_locked(const char *s)
+/*
+ * Callers hold ph_lock. Returns 0, or -ENOENT when there was no such rule --
+ * which the caller MUST propagate, for the same reason ph_add_locked() reports a
+ * full table: `nm k p '~needle'` returning success while the needle is still
+ * being matched tells the operator a path was UNCLOAKED when it is still hidden.
+ * That is the mirror image of the add-side bug and just as quiet.
+ */
+static int ph_del_locked(const char *s)
 {
 	int i, n = ph_nrules;
 
@@ -171,9 +194,10 @@ static void ph_del_locked(const char *s)
 			memmove(&ph_rules[i], &ph_rules[i + 1],
 				(n - i - 1) * PH_RULE_LEN);
 			WRITE_ONCE(ph_nrules, n - 1);
-			return;
+			return 0;
 		}
 	}
+	return -ENOENT;
 }
 
 /*
@@ -198,7 +222,6 @@ static void ph_del_locked(const char *s)
 int pathhide_ctl(const char *buf, size_t count)
 {
 	char line[PH_RULE_LEN + 1];
-	unsigned long flags;
 	const char *s;
 	size_t n = count;
 	int ret;
@@ -216,9 +239,9 @@ int pathhide_ctl(const char *buf, size_t count)
 
 	/* '-' on its own clears every rule. */
 	if (line[0] == '-' && line[1] == '\0') {
-		spin_lock_irqsave(&ph_lock, flags);
+		spin_lock(&ph_lock);
 		WRITE_ONCE(ph_nrules, 0);
-		spin_unlock_irqrestore(&ph_lock, flags);
+		spin_unlock(&ph_lock);
 		return 0;
 	}
 
@@ -232,14 +255,12 @@ int pathhide_ctl(const char *buf, size_t count)
 	if (strlen(s) >= PH_RULE_LEN)
 		return -ENAMETOOLONG;
 
-	spin_lock_irqsave(&ph_lock, flags);
-	if (line[0] == '~') {
-		ph_del_locked(s);
-		ret = 0;
-	} else {
+	spin_lock(&ph_lock);
+	if (line[0] == '~')
+		ret = ph_del_locked(s);
+	else
 		ret = ph_add_locked(s);
-	}
-	spin_unlock_irqrestore(&ph_lock, flags);
+	spin_unlock(&ph_lock);
 	return ret;
 }
 
@@ -253,30 +274,28 @@ int pathhide_ctl(const char *buf, size_t count)
  */
 int pathhide_get_rule(int idx, char *out, size_t outsz)
 {
-	unsigned long flags;
 	int len = 0;
 
 	if (!out || outsz < PH_RULE_LEN || idx < 0)
 		return -EINVAL;
-	spin_lock_irqsave(&ph_lock, flags);
+	spin_lock(&ph_lock);
 	if (idx < ph_nrules) {
 		strscpy(out, ph_rules[idx], outsz);
 		len = strlen(out);
 	}
-	spin_unlock_irqrestore(&ph_lock, flags);
+	spin_unlock(&ph_lock);
 	return len;
 }
 
 #ifdef PH_ENABLE_PROC
 static int ph_seq_show(struct seq_file *m, void *v)
 {
-	unsigned long flags;
 	int i;
 
-	spin_lock_irqsave(&ph_lock, flags);
+	spin_lock(&ph_lock);
 	for (i = 0; i < ph_nrules; i++)
 		seq_printf(m, "%s\n", ph_rules[i]);
-	spin_unlock_irqrestore(&ph_lock, flags);
+	spin_unlock(&ph_lock);
 	return 0;
 }
 
