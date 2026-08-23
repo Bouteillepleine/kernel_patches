@@ -4,13 +4,23 @@
  * /proc/<pid>/smaps, /proc/<pid>/map_files and /proc/<pid>/fd.
  *
  * Rules are plain substrings matched against the resolved d_path of a VMA's
- * or fd's backing file. Configure via /proc/<PH_PROC_NAME> (root, 0600):
+ * or fd's backing file. The control plane is nomount's private raw-netlink
+ * channel, driven by the bundled `nm` client:
  *
- *     echo '+io.github.chsbuffer.revancedxposed' > /proc/pathhide   # add rule
- *     echo '+/data/adb/lspd'                     > /proc/pathhide
- *     echo '~/data/adb/lspd'                     > /proc/pathhide   # remove one
- *     echo '-'                                   > /proc/pathhide   # clear all
- *     cat /proc/pathhide                                            # list rules
+ *     nm k p '+io.github.chsbuffer.revancedxposed'   # add rule
+ *     nm k p '+/data/adb/lspd'                       # add
+ *     nm k p '~/data/adb/lspd'                       # remove one
+ *     nm k p '-'                                     # clear all
+ *     nm l p                                         # list rules
+ *
+ * That channel is CAP_NET_ADMIN-gated, is not enumerable, and creates no dirent
+ * anywhere -- see the stealth notes below for why this file no longer owns a
+ * /proc node. nomount.c forwards NM_KNOB_PATHHIDE to pathhide_ctl() and
+ * NM_CMD_GET_PATHHIDE to pathhide_get_rule(), both through WEAK symbols, so the
+ * two patch sets still apply independently: a kernel with nomount but without
+ * pathhide answers -EINVAL on the knob, and a kernel with pathhide but without
+ * nomount still matches (it just has no way to be configured unless the
+ * PH_ENABLE_PROC fallback below is compiled in).
  *
  * Rules are substrings of the *full* path, so prefer specific needles
  * (a package id or an absolute prefix) over short tokens that could match
@@ -32,27 +42,31 @@
  * an empty rule set), so it is a no-op on stock configurations.
  *
  * Stealth notes -- READ THESE BEFORE RELYING ON THEM:
- *   - ph_open() returns -ENOENT without CAP_SYS_ADMIN so an open() by name
- *     answers exactly as it would for a file that is not there. That check is
- *     only REACHABLE because the node is created world-openable (0666): at 0600
- *     the VFS rejected on DAC in may_open() before ph_open() ever ran, and the
- *     caller got EACCES -- which confirms the file exists. Measured on OP15 at
- *     0600, as uid 2000: `cat /proc/pathhide` -> "Permission denied". Every
- *     write path still checks CAP_SYS_ADMIN, and a non-admin cannot obtain a fd
- *     at all, so 0666 grants nothing.
- *   - The dirent REMAINS VISIBLE to an unprivileged /proc readdir, and stat()
- *     by name still succeeds. Measured on OP15 as uid 2000:
- *         ls /proc | grep pathhide   -> 1
- *         ls -l /proc/pathhide       -> -rw------- root root
- *     A stock kernel has no such entry, so this is a one-syscall,
- *     zero-permission, self-naming tell -- louder than anything this file
- *     hides. Renaming via PH_PROC_NAME only makes it less self-describing; it
- *     does not make it absent, and nothing in the builders currently overrides
- *     it, so the node ships literally called "pathhide".
- *   - The real fix is not to have a /proc node at all: nomount moved its own
- *     knobs off /sys/kernel/<name> onto a private raw-netlink protocol for
- *     exactly this reason (CAP_NET_ADMIN-gated, not enumerable, no dirent).
- *     This control plane should follow it.
+ *   - There is NO /proc node by default. It used to be created unconditionally
+ *     and was the loudest thing this file did: a stock kernel has no such entry,
+ *     so `ls /proc` found it with no permission at all, and the module announced
+ *     "a path-hiding patch is installed" while concealing seven package names.
+ *     Measured on OP15 (2026-08-23), and measured from a REAL app domain rather
+ *     than a root shell, because `su <uid> -c` runs in the ksu domain and gives
+ *     the wrong answer:
+ *         untrusted_app / app_zygote / priv_app -> proc:dir  INCLUDES read
+ *             => readdir of /proc lists the entry. This was the tell.
+ *         untrusted_app / app_zygote / priv_app -> proc:file == 0
+ *             => stat() and open() on it are refused by SELinux, so the earlier
+ *                note here claiming "stat() by name still succeeds" was only
+ *                ever true for shell/ksu, never for an app.
+ *   - Two further claims in the previous version of this comment were simply
+ *     wrong about the code beneath it: it said the node was created 0666 and
+ *     that ph_open()'s -ENOENT was therefore reachable. pathhide_init() created
+ *     it 0600, so an unprivileged open() got EACCES from may_open() -- which
+ *     confirms the file exists -- and ph_open() never ran. Verified on-device.
+ *     Do not reintroduce a stealth claim without measuring it from an app
+ *     domain first.
+ *   - PH_ENABLE_PROC brings the node back for anyone applying this patch set
+ *     WITHOUT nomount, who would otherwise have no way to configure it. It is
+ *     opt-in precisely because it reintroduces the tell above: the builders do
+ *     not define it. Renaming via PH_PROC_NAME makes the node less
+ *     self-describing but no less present, so it is not a substitute.
  */
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -162,6 +176,98 @@ static void ph_del_locked(const char *s)
 	}
 }
 
+/*
+ * Apply one control command. This is the whole control surface; the netlink
+ * knob and the optional /proc write handler are both thin wrappers around it.
+ *
+ *     "+needle"   add a rule        "~needle"   remove one
+ *     "needle"    add (bare form)   "-"         clear every rule
+ *
+ * @buf need NOT be NUL-terminated -- it is copied and terminated here, which is
+ * what lets a netlink attribute payload be passed straight through without the
+ * caller staging its own buffer.
+ *
+ * Deliberately does NOT check capabilities: every caller is already behind one
+ * (CAP_NET_ADMIN on the netlink knob, CAP_SYS_ADMIN on the /proc write). Putting
+ * a second, different check here would make the two paths disagree about who may
+ * configure this.
+ *
+ * Returns 0, or a negative errno the caller MUST propagate -- see ph_add_locked
+ * for why a full table has to be reported rather than swallowed.
+ */
+int pathhide_ctl(const char *buf, size_t count)
+{
+	char line[PH_RULE_LEN + 1];
+	unsigned long flags;
+	const char *s;
+	size_t n = count;
+	int ret;
+
+	if (n == 0)
+		return -EINVAL;
+	if (n > PH_RULE_LEN)
+		return -ENAMETOOLONG;
+	memcpy(line, buf, n);
+	line[n] = '\0';
+	while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+		line[--n] = '\0';
+	if (n == 0)
+		return 0;
+
+	/* '-' on its own clears every rule. */
+	if (line[0] == '-' && line[1] == '\0') {
+		spin_lock_irqsave(&ph_lock, flags);
+		WRITE_ONCE(ph_nrules, 0);
+		spin_unlock_irqrestore(&ph_lock, flags);
+		return 0;
+	}
+
+	/* '~needle' removes one existing rule; '+needle'/bare needle adds one. */
+	if (line[0] == '~' || line[0] == '+')
+		s = line + 1;
+	else
+		s = line;
+	if (!*s)
+		return -EINVAL;
+	if (strlen(s) >= PH_RULE_LEN)
+		return -ENAMETOOLONG;
+
+	spin_lock_irqsave(&ph_lock, flags);
+	if (line[0] == '~') {
+		ph_del_locked(s);
+		ret = 0;
+	} else {
+		ret = ph_add_locked(s);
+	}
+	spin_unlock_irqrestore(&ph_lock, flags);
+	return ret;
+}
+
+/*
+ * Copy rule @idx into @out. Returns its length, or 0 once @idx is past the end
+ * (which is how a caller iterating from 0 knows to stop).
+ *
+ * One rule per call rather than a bulk copy so the netlink dump can allocate and
+ * emit each attribute with ph_lock DROPPED -- nlmsg_put() and friends must not
+ * run under a spinlock. The list is tiny and read only by an explicit `nm l p`.
+ */
+int pathhide_get_rule(int idx, char *out, size_t outsz)
+{
+	unsigned long flags;
+	int len = 0;
+
+	if (!out || outsz < PH_RULE_LEN || idx < 0)
+		return -EINVAL;
+	spin_lock_irqsave(&ph_lock, flags);
+	if (idx < ph_nrules) {
+		strscpy(out, ph_rules[idx], outsz);
+		len = strlen(out);
+	}
+	spin_unlock_irqrestore(&ph_lock, flags);
+	return len;
+}
+
+#ifdef PH_ENABLE_PROC
 static int ph_seq_show(struct seq_file *m, void *v)
 {
 	unsigned long flags;
@@ -186,53 +292,18 @@ static ssize_t ph_write(struct file *file, const char __user *ubuf,
 			size_t count, loff_t *ppos)
 {
 	char line[PH_RULE_LEN + 1];
-	unsigned long flags;
-	const char *s;
-	size_t n = count;
 	int ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	if (n == 0)
+	if (count == 0)
 		return -EINVAL;
-	if (n > PH_RULE_LEN)
+	if (count > PH_RULE_LEN)
 		return -ENAMETOOLONG;
-	if (copy_from_user(line, ubuf, n))
+	if (copy_from_user(line, ubuf, count))
 		return -EFAULT;
-	line[n] = '\0';
-	while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
-		line[--n] = '\0';
-	if (n == 0)
-		return count;
 
-	/* '-' on its own clears every rule. */
-	if (line[0] == '-' && line[1] == '\0') {
-		spin_lock_irqsave(&ph_lock, flags);
-		WRITE_ONCE(ph_nrules, 0);
-		spin_unlock_irqrestore(&ph_lock, flags);
-		return count;
-	}
-
-	/* '~needle' removes one existing rule; '+needle'/bare needle adds one. */
-	if (line[0] == '~')
-		s = line + 1;
-	else if (line[0] == '+')
-		s = line + 1;
-	else
-		s = line;
-	if (!*s)
-		return -EINVAL;
-	if (strlen(s) >= PH_RULE_LEN)
-		return -ENAMETOOLONG;
-
-	spin_lock_irqsave(&ph_lock, flags);
-	if (line[0] == '~') {
-		ph_del_locked(s);
-		ret = 0;
-	} else {
-		ret = ph_add_locked(s);
-	}
-	spin_unlock_irqrestore(&ph_lock, flags);
+	ret = pathhide_ctl(line, count);
 	return ret ? ret : count;
 }
 
@@ -244,18 +315,20 @@ static const struct proc_ops ph_proc_ops = {
 	.proc_write	= ph_write,
 };
 
+/*
+ * Only built when PH_ENABLE_PROC is defined. Without it this file registers
+ * nothing and owns no name anywhere in the filesystem -- configuration arrives
+ * over nomount's netlink channel instead. See the stealth notes at the top for
+ * the measurement that motivated making this opt-in.
+ *
+ * Still 0600 when it IS enabled: loosening to 0666 would make ph_open()'s
+ * -ENOENT reachable, but that closes only the open() vector while readdir still
+ * lists the entry -- and readdir is the one an app can actually reach.
+ */
 static int __init pathhide_init(void)
 {
-	/*
-	 * Kept at 0600. Loosening it to 0666 would make ph_open()'s -ENOENT
-	 * reachable (the VFS otherwise refuses in may_open() first and hands an
-	 * unprivileged caller EACCES, which proves the node exists) -- but that
-	 * closes only ONE of three disclosure vectors while readdir and stat still
-	 * expose the node, and a world-writable /proc entry is itself an anomaly.
-	 * Trading a certain oddity for a partial gain is not worth it; the fix is
-	 * to stop using /proc at all. See the stealth notes at the top.
-	 */
 	proc_create(PH_PROC_NAME, 0600, NULL, &ph_proc_ops);
 	return 0;
 }
 late_initcall(pathhide_init);
+#endif /* PH_ENABLE_PROC */
