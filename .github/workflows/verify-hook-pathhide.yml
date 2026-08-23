@@ -43,9 +43,23 @@ name: 🕵️ verify _hook/_pathhide (OnePlus trees, AOSP fallback)
 # (tree, revision) in the fleet -- broad, no compile. This one compiles, on one
 # representative tree per version. Neither replaces the other.
 
+# Wired to run on its own now. It used to fire ONLY on `ci/verify-patches` or a
+# manual dispatch, which is the other half of how the 6.1 breakage hid: the patch
+# that broke it landed on main, nothing ran, and the last green run was two days
+# stale by the time anyone dispatched it. Same trigger shape as its sibling
+# verify-patches-oneplus.yml, so a change to either patch set is checked both
+# ways -- dry-run against the whole fleet, and compiled on one tree per version.
 on:
   push:
-    branches: [ci/verify-patches]
+    branches: [main, ci/verify-patches]
+    paths:
+      - 'common/_hook/**'
+      - 'common/_pathhide/**'
+      - '.github/workflows/verify-hook-pathhide.yml'
+  pull_request:
+    paths:
+      - 'common/_hook/**'
+      - 'common/_pathhide/**'
   workflow_dispatch:
     inputs:
       version:
@@ -63,6 +77,13 @@ on:
 
 permissions:
   contents: read
+
+# Ten jobs, each cloning a multi-GB tree: superseding an in-flight run on a newer
+# push matters more here than on a cheap workflow. Never cancel a manual dispatch
+# (group is per-ref, and a dispatch is usually someone watching a specific tree).
+concurrency:
+  group: verify-hook-pathhide-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   resolve:
