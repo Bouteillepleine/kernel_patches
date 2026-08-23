@@ -9,13 +9,35 @@ name: 🕵️ verify _hook/_pathhide (OnePlus trees, AOSP fallback)
 # what the builders ship and wrong for AOSP, so an AOSP-only verifier reports a
 # failure nobody should act on -- and this job only fires on `ci/verify-patches`
 # or a manual dispatch, so the divergence sat unnoticed until it was dispatched
-# by hand. Verify what actually ships.
+# by hand.
+#
+# The divergence is not one hunk. Measured 2026-08-23, changed lines AOSP vs the
+# pinned OnePlus tree, over the files these patches touch:
+#
+#                            5.10  5.15   6.1   6.6  6.12
+#   fs/proc/task_mmu.c        145   151   122   182   118
+#   fs/proc/base.c              3     3   149    54   161
+#   security/selinux/hooks.c   11    11    10     3    46
+#   security/selinux/selinuxfs.c 0    0     0    54    89
+#   kernel/audit.c              4     4     4     4     0
+#   fs/proc/fd.c                0     0     0     0     0
+#   security/selinux/avc.c      0     0     0     0     0
+#
+# task_mmu.c -- where every pathhide maps/smaps hunk lands -- diverges on ALL
+# five. AOSP was only ever passing by coincidence.
 #
 # So: use the real OnePlus tree for every kernel version the builder fleet pins
 # one for, and fall back to AOSP common only for a version it does not cover
 # (e.g. a patch set added ahead of the tree that will carry it). The resolve job
-# below reports which of the two each version got, so the fallback is never
-# silent.
+# reports which of the two each version got, so the fallback is never silent.
+#
+# TREE LAYOUT MATTERS. The common repo alone does not configure: on 5.10/5.15/6.1
+# `kernel/oplus_cpu` is a SYMLINK to ../../../vendor/oplus/kernel/cpu, whose
+# target is supplied by the android_kernel_modules_and_devicetree_* project the
+# manifest mounts at path="./". Cloning only `common` leaves it dangling and
+# gki_defconfig dies with `can't open file "kernel/oplus_cpu/sched/Kconfig"`.
+# (6.6/6.12 have no such symlink, which is why they passed while the older three
+# failed.) Both projects are therefore laid out exactly as the manifest does.
 #
 # Sibling job: verify-patches-oneplus.yml dry-runs every patch against every
 # (tree, revision) in the fleet -- broad, no compile. This one compiles, on one
@@ -53,51 +75,71 @@ jobs:
       MANIFEST_DIR: ${{ github.event.inputs.manifest_dir || 'manifests/a16' }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Map kernel version -> OnePlus tree
+      - name: Map kernel version -> OnePlus tree pair
         id: map
         run: |
           set -euo pipefail
-          # Same discovery as verify-patches-oneplus.yml: the common kernel is the
-          # project at path="kernel_platform/common" (Qualcomm) or the one carrying
-          # <linkfile dest="kernel_platform/common"> (MediaTek).
           gh api "repos/$BUILDER/contents/$MANIFEST_DIR" \
             --jq '.[] | select(.name|endswith(".xml")) | .download_url' > urls.txt
           echo "manifests: $(wc -l < urls.txt)"
+
+          # One line per manifest: <base>|<common_name>|<common_rev>|<mod_name>|<mod_rev>
+          # The common kernel is the project at path="kernel_platform/common"
+          # (Qualcomm) or the one carrying <linkfile dest="kernel_platform/common">
+          # (MediaTek). The modules/devicetree project is the one at path="./" --
+          # it provides vendor/, which the common tree symlinks into.
           : > pairs.raw
           while read -r u; do
             m=$(curl -sfL "$u") || continue
-            # fetch base of the remote the common project uses (never hardcoded)
             base=$(printf '%s\n' "$m" | sed -nE 's@.*<remote fetch="([^"]+)" name="origin".*@\1@p' | head -1)
             [ -n "$base" ] || base="https://github.com/OnePlusOSS"
-            printf '%s\n' "$m" | grep 'path="kernel_platform/common"' | head -1 \
-              | sed -nE "s@.*name=\"([^\"]+)\".*revision=\"([^\"]+)\".*@$base/\1 \2@p" >> pairs.raw || true
-            printf '%s\n' "$m" | grep -B1 'linkfile dest="kernel_platform/common"' | grep '<project' \
-              | sed -nE "s@.*name=\"([^\"]+)\".*revision=\"([^\"]+)\".*@$base/\1 \2@p" >> pairs.raw || true
+            c=$(printf '%s\n' "$m" | grep 'path="kernel_platform/common"' | head -1 \
+                | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p')
+            [ -n "$c" ] || c=$(printf '%s\n' "$m" | grep -B1 'linkfile dest="kernel_platform/common"' \
+                | grep '<project' | head -1 | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p')
+            [ -n "$c" ] || continue
+            d=$(printf '%s\n' "$m" | grep 'path="\./"' | head -1 \
+                | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p')
+            echo "$base|$c|${d:-|}" >> pairs.raw
           done < urls.txt
-          grep -v '^$' pairs.raw | sort -u > pairs.txt
-          echo "distinct (tree, revision) pairs: $(wc -l < pairs.txt)"
+          sort -u pairs.raw > pairs.txt
+          echo "distinct manifests resolved: $(wc -l < pairs.txt)"
 
-          # Read each tree's own Makefile for its kernel version. Prefer a
-          # BRANCH-shaped revision over a raw SHA so the clone below is a plain
-          # `git clone --depth=1 -b <rev>`; a bare SHA needs a fetch-by-object,
-          # which not every host allows.
+          # Read each common tree's own Makefile for its kernel version, and rank
+          # the candidates so the pick is DETERMINISTIC. Left to chance it lands on
+          # whatever sorts first, which on the first run meant a MediaTek 5.10 tree
+          # and three mid-range SoCs -- a different tree every time the fleet gains
+          # a manifest, so a green run would stop meaning anything specific.
+          #
+          #   digit 1  branch-shaped revision (0) over a raw SHA (1): the clone is a
+          #            plain `git clone --depth=1 -b <rev>`, and fetch-by-object is
+          #            not allowed everywhere.
+          #   digit 2  Qualcomm `_common_oneplus_sm*` (0) over anything else (1):
+          #            these hunks were fitted against the Qualcomm trees, and the
+          #            MediaTek ones are named `android_kernel_<ver>_oneplus_mt*`.
+          # Tie-break: SoC name DESCENDING, i.e. the newest flagship for that kernel
+          # version, which is the tree most devices in the fleet actually ship.
           : > map.txt
-          while read -r url rev; do
-            raw=$(printf '%s' "$url" | sed 's@^https://github.com/@https://raw.githubusercontent.com/@')
-            kv=$(curl -sfL "$raw/$rev/Makefile" 2>/dev/null \
+          while IFS='|' read -r base cname crev dname drev; do
+            [ -n "$cname" ] || continue
+            raw=$(printf '%s' "$base" | sed 's@^https://github.com/@https://raw.githubusercontent.com/@')
+            kv=$(curl -sfL "$raw/$cname/$crev/Makefile" 2>/dev/null \
                  | awk '/^VERSION/{a=$3} /^PATCHLEVEL/{b=$3} END{if(a!="")print a"."b}')
             [ -n "$kv" ] || continue
-            case "$rev" in */*) pref=0 ;; *) pref=1 ;; esac
-            echo "$kv $pref $url $rev" >> map.txt
+            case "$crev"  in */*) p1=0 ;; *) p1=1 ;; esac
+            case "$cname" in *_common_oneplus_sm*) p2=0 ;; *) p2=1 ;; esac
+            echo "$kv $p1$p2 $cname $base/$cname@$crev|${dname:+$base/$dname@$drev}" >> map.txt
           done < pairs.txt
 
           out=""
           for kv in 5.10 5.15 6.1 6.6 6.12; do
-            pick=$(awk -v k="$kv" '$1==k' map.txt | sort -k2,2n | head -1)
+            row=$(awk -v k="$kv" '$1==k' map.txt | sort -k2,2n -k3,3r | head -1)
+            pick=$(printf '%s' "$row" | cut -d' ' -f4-)
             if [ -n "$pick" ]; then
-              u=$(echo "$pick" | awk '{print $3}'); r=$(echo "$pick" | awk '{print $4}')
-              out="${out}${kv}=${u}@${r};"
-              echo "  $kv -> OnePlus  $u @ $r"
+              out="${out}${kv}=${pick};"
+              echo "  $kv -> OnePlus  $(printf '%s' "$row" | cut -d' ' -f3)"
+              echo "            common =${pick%%|*}"
+              echo "            modules=${pick#*|}"
             else
               echo "  $kv -> AOSP     (no OnePlus tree pinned by the fleet)"
             fi
@@ -107,6 +149,15 @@ jobs:
   verify:
     needs: resolve
     runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: '2G'
+      # `make prepare` regenerates headers whose mtime changes every run, and the
+      # default sloppiness makes ccache treat that as a miss on files it has
+      # already compiled byte-identically. include_file_mtime/ctime is the usual
+      # kernel-CI relaxation; time_macros only matters for __DATE__/__TIME__,
+      # which nothing here uses.
+      CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
     strategy:
       fail-fast: false
       matrix:
@@ -128,12 +179,20 @@ jobs:
           V="${{ matrix.version }}"; KV="${V#*-}"
           entry=$(printf '%s' "$MAP" | tr ';' '\n' | grep "^${KV}=" | head -1 | cut -d= -f2- || true)
           if [ -n "$entry" ]; then
+            c="${entry%%|*}"; d="${entry#*|}"
+            rev="${c##*@}"
             echo "kind=oneplus" >> "$GITHUB_OUTPUT"
-            echo "url=${entry%@*}" >> "$GITHUB_OUTPUT"
-            echo "rev=${entry##*@}" >> "$GITHUB_OUTPUT"
-            echo "SOURCE: OnePlus ${entry%@*} @ ${entry##*@}"
+            echo "curl_=${c%@*}" >> "$GITHUB_OUTPUT"
+            echo "crev=$rev" >> "$GITHUB_OUTPUT"
+            echo "durl=${d%@*}" >> "$GITHUB_OUTPUT"
+            echo "drev=${d##*@}" >> "$GITHUB_OUTPUT"
+            # Cache key component: the sources a tree compiles are what the ccache
+            # entries are keyed on, so the cache must not be shared across trees.
+            echo "revkey=$(printf '%s' "$rev" | tr -c 'A-Za-z0-9._-' '_')" >> "$GITHUB_OUTPUT"
+            echo "SOURCE: OnePlus common=${c} modules=${d:-<none>}"
           else
             echo "kind=aosp" >> "$GITHUB_OUTPUT"
+            echo "revkey=aosp-$V" >> "$GITHUB_OUTPUT"
             echo "SOURCE: AOSP common $V (no OnePlus tree for $KV)"
           fi
       - name: Free disk
@@ -151,26 +210,70 @@ jobs:
           mkdir -p ~/bin; curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo; chmod a+x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.email ci@ci; git config --global user.name ci; git config --global color.ui false
-      - name: Sync OnePlus tree (${{ matrix.version }})
+          # ccache masquerade, same shape as the hookless matrix in kbuild: make
+          # every compiler name we invoke resolve to ccache, which then finds the
+          # real one further down PATH. No CC=/HOSTCC= override, so kbuild's own
+          # LLVM=1 handling is untouched. HOSTCC (gcc/cc) is included because
+          # `make prepare` builds the script host tools, which is a real slice of
+          # the wall clock here.
+          sudo mkdir -p /usr/lib/ccache
+          for n in clang clang++ gcc g++ cc c++ aarch64-linux-gnu-gcc aarch64-linux-gnu-g++; do
+            sudo ln -sf /usr/bin/ccache "/usr/lib/ccache/$n"
+          done
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache --version | head -1
+      - name: Restore ccache
+        if: steps.gate.outputs.run == 'yes'
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.ccache
+          # run_id in the key means every run writes a fresh entry (cache entries
+          # are immutable, so a fixed key would never be updated once created);
+          # restore-keys then picks up the most recent prefix match.
+          key: ccache-verify-${{ matrix.version }}-${{ steps.src.outputs.revkey }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-verify-${{ matrix.version }}-${{ steps.src.outputs.revkey }}-
+            ccache-verify-${{ matrix.version }}-
+      - name: Sync OnePlus trees (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'oneplus'
         run: |
           set -e
-          mkdir gki
-          git clone --depth=1 -b "${{ steps.src.outputs.rev }}" "${{ steps.src.outputs.url }}" gki/common
-          awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' gki/common/Makefile
+          mkdir -p tree
+          # Manifest layout: modules/devicetree at "./", common at
+          # "kernel_platform/common". The common tree's kernel/oplus_cpu symlink
+          # (../../../vendor/oplus/kernel/cpu) only resolves with both in place.
+          if [ -n "${{ steps.src.outputs.durl }}" ]; then
+            git clone --depth=1 -b "${{ steps.src.outputs.drev }}" "${{ steps.src.outputs.durl }}" tree
+          fi
+          mkdir -p tree/kernel_platform
+          git clone --depth=1 -b "${{ steps.src.outputs.crev }}" "${{ steps.src.outputs.curl_ }}" tree/kernel_platform/common
+          K="$PWD/tree/kernel_platform/common"
+          echo "KDIR=$K" >> "$GITHUB_ENV"
+          awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' "$K/Makefile"
+          # Prove the OPlus symlink resolves before we spend ten minutes finding out
+          # it does not. Absent on 6.6/6.12, which is fine -- only a DANGLING one is
+          # a problem.
+          if [ -L "$K/kernel/oplus_cpu" ]; then
+            if [ -d "$K/kernel/oplus_cpu" ]; then echo "oplus_cpu symlink: resolves OK"
+            else echo "::error::kernel/oplus_cpu symlink is dangling - modules project missing or wrong revision"; exit 1; fi
+          else
+            echo "oplus_cpu symlink: not present in this tree"
+          fi
       - name: Sync AOSP common (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'aosp'
         run: |
+          set -e
           V="${{ matrix.version }}"; mkdir gki && cd gki
           repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-$V" < /dev/null
           repo sync -c -j"$(nproc)" --no-tags --optimized-fetch --prune --force-sync
           test -d common
+          echo "KDIR=$PWD/common" >> "$GITHUB_ENV"
       - name: Apply patches (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
         run: |
           set -e
           V="${{ matrix.version }}"; KVER="${V#*-}"; P="$GITHUB_WORKSPACE/common"
-          cd gki/common
+          cd "$KDIR"
           cp "$P/_pathhide/pathhide.c" fs/proc/pathhide.c
           cp "$P/_pathhide/pathhide.h" fs/proc/pathhide.h
           patch -p1 < "$P/_pathhide/pathhide_${KVER}_integration.patch"
@@ -189,13 +292,18 @@ jobs:
         if: steps.gate.outputs.run == 'yes'
         run: |
           set -e
-          cd gki/common
+          cd "$KDIR"
           sudo mkdir -p /usr/local/bin
           for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-as; do
             [ -e /usr/bin/$t-18 ] && sudo ln -sf /usr/bin/$t-18 /usr/local/bin/$t; done
-          export PATH="/usr/local/bin:$PATH"
+          # ccache FIRST: /usr/local/bin holds the clang-18 symlinks, so leaving it
+          # ahead would resolve `clang` straight to the real compiler and silently
+          # bypass the cache entirely (a green run with a 0% hit rate).
+          export PATH="/usr/lib/ccache:/usr/local/bin:$PATH"
           echo "toolchain: apt clang-18"; clang --version | head -1; ld.lld --version | head -1
+          echo "cc resolves to: $(command -v clang)"
           echo "source: ${{ steps.src.outputs.kind }}"
+          ccache --zero-stats >/dev/null 2>&1 || true
           M="make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -j$(nproc)"
           $M gki_defconfig
           ./scripts/config --file out/.config --enable SECURITY --enable SECURITY_NETWORK --enable SECURITY_SELINUX \
@@ -210,12 +318,27 @@ jobs:
                    security/selinux/hooks.o security/selinux/selinuxfs.o security/selinux/avc.o kernel/audit.o; do
             if $M "$o" >/tmp/cc.log 2>&1; then echo "CC  $o : OK"; else echo "CC  $o : FAIL"; tail -20 /tmp/cc.log; FAIL=1; fi
           done
+          echo "--- ccache ---"; ccache --show-stats 2>/dev/null | head -12 || true
           echo "=== ${{ matrix.version }} (${{ steps.src.outputs.kind }}): $([ $FAIL = 0 ] && echo ALL-OK || echo FAILURES) ==="
           exit $FAIL
+
+      - name: Save ccache
+        # always(), so a run that FAILS still publishes what it managed to compile.
+        # Otherwise a broken tree keeps paying full price on every retry, which is
+        # exactly when the cache is worth most.
+        if: always() && steps.gate.outputs.run == 'yes'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-verify-${{ matrix.version }}-${{ steps.src.outputs.revkey }}-${{ github.run_id }}
 
   seqno:
     needs: resolve
     runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: '2G'
+      CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
     strategy:
       fail-fast: false
       matrix:
@@ -237,12 +360,18 @@ jobs:
           V="${{ matrix.version }}"; KV="${V#*-}"
           entry=$(printf '%s' "$MAP" | tr ';' '\n' | grep "^${KV}=" | head -1 | cut -d= -f2- || true)
           if [ -n "$entry" ]; then
+            c="${entry%%|*}"; d="${entry#*|}"
+            rev="${c##*@}"
             echo "kind=oneplus" >> "$GITHUB_OUTPUT"
-            echo "url=${entry%@*}" >> "$GITHUB_OUTPUT"
-            echo "rev=${entry##*@}" >> "$GITHUB_OUTPUT"
-            echo "SOURCE: OnePlus ${entry%@*} @ ${entry##*@}"
+            echo "curl_=${c%@*}" >> "$GITHUB_OUTPUT"
+            echo "crev=$rev" >> "$GITHUB_OUTPUT"
+            echo "durl=${d%@*}" >> "$GITHUB_OUTPUT"
+            echo "drev=${d##*@}" >> "$GITHUB_OUTPUT"
+            echo "revkey=$(printf '%s' "$rev" | tr -c 'A-Za-z0-9._-' '_')" >> "$GITHUB_OUTPUT"
+            echo "SOURCE: OnePlus common=${c} modules=${d:-<none>}"
           else
             echo "kind=aosp" >> "$GITHUB_OUTPUT"
+            echo "revkey=aosp-$V" >> "$GITHUB_OUTPUT"
             echo "SOURCE: AOSP common $V (no OnePlus tree for $KV)"
           fi
       - name: Free disk
@@ -260,25 +389,57 @@ jobs:
           mkdir -p ~/bin; curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo; chmod a+x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.email ci@ci; git config --global user.name ci; git config --global color.ui false
-      - name: Sync OnePlus tree (${{ matrix.version }})
+          sudo mkdir -p /usr/lib/ccache
+          for n in clang clang++ gcc g++ cc c++ aarch64-linux-gnu-gcc aarch64-linux-gnu-g++; do
+            sudo ln -sf /usr/bin/ccache "/usr/lib/ccache/$n"
+          done
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache --version | head -1
+      - name: Restore ccache
+        if: steps.gate.outputs.run == 'yes'
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.ccache
+          # Separate namespace from `verify`: this job compiles a different object
+          # set (KernelSU rules.o plus its own prepare), so sharing one cache would
+          # just evict each other's entries inside the 2G cap.
+          key: ccache-seqno-${{ matrix.version }}-${{ steps.src.outputs.revkey }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-seqno-${{ matrix.version }}-${{ steps.src.outputs.revkey }}-
+            ccache-seqno-${{ matrix.version }}-
+      - name: Sync OnePlus trees (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'oneplus'
         run: |
           set -e
-          mkdir gki
-          git clone --depth=1 -b "${{ steps.src.outputs.rev }}" "${{ steps.src.outputs.url }}" gki/common
-          awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' gki/common/Makefile
+          mkdir -p tree
+          if [ -n "${{ steps.src.outputs.durl }}" ]; then
+            git clone --depth=1 -b "${{ steps.src.outputs.drev }}" "${{ steps.src.outputs.durl }}" tree
+          fi
+          mkdir -p tree/kernel_platform
+          git clone --depth=1 -b "${{ steps.src.outputs.crev }}" "${{ steps.src.outputs.curl_ }}" tree/kernel_platform/common
+          K="$PWD/tree/kernel_platform/common"
+          echo "KDIR=$K" >> "$GITHUB_ENV"
+          awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' "$K/Makefile"
+          if [ -L "$K/kernel/oplus_cpu" ]; then
+            if [ -d "$K/kernel/oplus_cpu" ]; then echo "oplus_cpu symlink: resolves OK"
+            else echo "::error::kernel/oplus_cpu symlink is dangling - modules project missing or wrong revision"; exit 1; fi
+          else
+            echo "oplus_cpu symlink: not present in this tree"
+          fi
       - name: Sync AOSP common (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'aosp'
         run: |
+          set -e
           V="${{ matrix.version }}"; mkdir gki && cd gki
           repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-$V" < /dev/null
           repo sync -c -j"$(nproc)" --no-tags --optimized-fetch --prune --force-sync
           test -d common
+          echo "KDIR=$PWD/common" >> "$GITHUB_ENV"
       - name: KernelSU-Next + apply fix_selinux_seqno (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
         run: |
           set -e
-          P="$GITHUB_WORKSPACE/common"; cd gki/common
+          P="$GITHUB_WORKSPACE/common"; cd "$KDIR"
           git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
           test -f KernelSU-Next/kernel/selinux/rules.c
           # wire like setup.sh (symlink + Makefile + Kconfig)
@@ -297,13 +458,15 @@ jobs:
         if: steps.gate.outputs.run == 'yes'
         run: |
           set -e
-          cd gki/common
+          cd "$KDIR"
           sudo mkdir -p /usr/local/bin
           for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-as; do
             [ -e /usr/bin/$t-18 ] && sudo ln -sf /usr/bin/$t-18 /usr/local/bin/$t; done
-          export PATH="/usr/local/bin:$PATH"
+          export PATH="/usr/lib/ccache:/usr/local/bin:$PATH"
           echo "toolchain: apt clang-18"; clang --version | head -1; ld.lld --version | head -1
+          echo "cc resolves to: $(command -v clang)"
           echo "source: ${{ steps.src.outputs.kind }}"
+          ccache --zero-stats >/dev/null 2>&1 || true
           M="make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -j$(nproc)"
           $M gki_defconfig
           ./scripts/config --file .config --enable KSU --enable SECURITY_SELINUX --enable AUDIT \
@@ -316,4 +479,12 @@ jobs:
           $M security/selinux/avc.o
           $M drivers/kernelsu/selinux/rules.o KCFLAGS="-I$PWD/security/selinux -I$PWD/security/selinux/include"
           ls -l drivers/kernelsu/selinux/rules.o
+          echo "--- ccache ---"; ccache --show-stats 2>/dev/null | head -12 || true
           echo "=== ${{ matrix.version }} (${{ steps.src.outputs.kind }}) seqno rules.o: OK ==="
+
+      - name: Save ccache
+        if: always() && steps.gate.outputs.run == 'yes'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-seqno-${{ matrix.version }}-${{ steps.src.outputs.revkey }}-${{ github.run_id }}
