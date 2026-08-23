@@ -109,18 +109,24 @@ jobs:
           # (Qualcomm) or the one carrying <linkfile dest="kernel_platform/common">
           # (MediaTek). The modules/devicetree project is the one at path="./" --
           # it provides vendor/, which the common tree symlinks into.
+          # NB: every extraction below ends in `|| true`. A manifest legitimately
+          # NOT matching a pattern is normal -- the MediaTek ones carry the common
+          # kernel as a <linkfile> rather than path="kernel_platform/common" -- but
+          # under `set -e` with pipefail a grep that finds nothing kills the whole
+          # step. That is exactly how the first wired run died at "manifests: 69".
+          # Absence is handled by the explicit [ -n ] tests, not by the exit status.
           : > pairs.raw
           while read -r u; do
             m=$(curl -sfL "$u") || continue
-            base=$(printf '%s\n' "$m" | sed -nE 's@.*<remote fetch="([^"]+)" name="origin".*@\1@p' | head -1)
+            base=$(printf '%s\n' "$m" | sed -nE 's@.*<remote fetch="([^"]+)" name="origin".*@\1@p' | head -1 || true)
             [ -n "$base" ] || base="https://github.com/OnePlusOSS"
             c=$(printf '%s\n' "$m" | grep 'path="kernel_platform/common"' | head -1 \
-                | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p')
+                | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p' || true)
             [ -n "$c" ] || c=$(printf '%s\n' "$m" | grep -B1 'linkfile dest="kernel_platform/common"' \
-                | grep '<project' | head -1 | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p')
+                | grep '<project' | head -1 | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p' || true)
             [ -n "$c" ] || continue
             d=$(printf '%s\n' "$m" | grep 'path="\./"' | head -1 \
-                | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p')
+                | sed -nE 's@.*name="([^"]+)".*revision="([^"]+)".*@\1|\2@p' || true)
             echo "$base|$c|${d:-|}" >> pairs.raw
           done < urls.txt
           sort -u pairs.raw > pairs.txt
@@ -144,8 +150,10 @@ jobs:
           while IFS='|' read -r base cname crev dname drev; do
             [ -n "$cname" ] || continue
             raw=$(printf '%s' "$base" | sed 's@^https://github.com/@https://raw.githubusercontent.com/@')
+            # `|| true` for the same reason as above: a tree whose Makefile cannot
+            # be fetched is skipped by the [ -n ] test below, not by killing the run.
             kv=$(curl -sfL "$raw/$cname/$crev/Makefile" 2>/dev/null \
-                 | awk '/^VERSION/{a=$3} /^PATCHLEVEL/{b=$3} END{if(a!="")print a"."b}')
+                 | awk '/^VERSION/{a=$3} /^PATCHLEVEL/{b=$3} END{if(a!="")print a"."b}' || true)
             [ -n "$kv" ] || continue
             case "$crev"  in */*) p1=0 ;; *) p1=1 ;; esac
             case "$cname" in *_common_oneplus_sm*) p2=0 ;; *) p2=1 ;; esac
