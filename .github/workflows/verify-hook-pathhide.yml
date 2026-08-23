@@ -1,4 +1,25 @@
-name: 🕵️ verify _hook/_pathhide on GKI
+name: 🕵️ verify _hook/_pathhide (OnePlus trees, AOSP fallback)
+
+# Compiles the objects the _hook/_pathhide patches touch.
+#
+# It used to sync AOSP common GKI for every version, which was wrong in a way
+# that stayed invisible for two days: on 2026-08-21 commit 3b78a31 deliberately
+# refitted the 6.1 smaps hunk to OnePlus's OPlus-only CONFIG_CONT_PTE_HUGEPAGE
+# block inside show_smap(), and AOSP has no such block. The patch is CORRECT for
+# what the builders ship and wrong for AOSP, so an AOSP-only verifier reports a
+# failure nobody should act on -- and this job only fires on `ci/verify-patches`
+# or a manual dispatch, so the divergence sat unnoticed until it was dispatched
+# by hand. Verify what actually ships.
+#
+# So: use the real OnePlus tree for every kernel version the builder fleet pins
+# one for, and fall back to AOSP common only for a version it does not cover
+# (e.g. a patch set added ahead of the tree that will carry it). The resolve job
+# below reports which of the two each version got, so the fallback is never
+# silent.
+#
+# Sibling job: verify-patches-oneplus.yml dry-runs every patch against every
+# (tree, revision) in the fleet -- broad, no compile. This one compiles, on one
+# representative tree per version. Neither replaces the other.
 
 on:
   push:
@@ -9,12 +30,82 @@ on:
         description: 'single android<A>-<K> to run (blank = all 5)'
         required: false
         default: ''
+      builder:
+        description: 'builder repo holding the manifests'
+        required: false
+        default: 'Bouteillepleine/OnePlus-ReSukiSu_NMS'
+      manifest_dir:
+        description: 'manifest directory in that repo'
+        required: false
+        default: 'manifests/a16'
 
 permissions:
   contents: read
 
 jobs:
+  resolve:
+    name: resolve source trees
+    runs-on: ubuntu-latest
+    outputs:
+      map: ${{ steps.map.outputs.map }}
+    env:
+      BUILDER: ${{ github.event.inputs.builder || 'Bouteillepleine/OnePlus-ReSukiSu_NMS' }}
+      MANIFEST_DIR: ${{ github.event.inputs.manifest_dir || 'manifests/a16' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Map kernel version -> OnePlus tree
+        id: map
+        run: |
+          set -euo pipefail
+          # Same discovery as verify-patches-oneplus.yml: the common kernel is the
+          # project at path="kernel_platform/common" (Qualcomm) or the one carrying
+          # <linkfile dest="kernel_platform/common"> (MediaTek).
+          gh api "repos/$BUILDER/contents/$MANIFEST_DIR" \
+            --jq '.[] | select(.name|endswith(".xml")) | .download_url' > urls.txt
+          echo "manifests: $(wc -l < urls.txt)"
+          : > pairs.raw
+          while read -r u; do
+            m=$(curl -sfL "$u") || continue
+            # fetch base of the remote the common project uses (never hardcoded)
+            base=$(printf '%s\n' "$m" | sed -nE 's@.*<remote fetch="([^"]+)" name="origin".*@\1@p' | head -1)
+            [ -n "$base" ] || base="https://github.com/OnePlusOSS"
+            printf '%s\n' "$m" | grep 'path="kernel_platform/common"' | head -1 \
+              | sed -nE "s@.*name=\"([^\"]+)\".*revision=\"([^\"]+)\".*@$base/\1 \2@p" >> pairs.raw || true
+            printf '%s\n' "$m" | grep -B1 'linkfile dest="kernel_platform/common"' | grep '<project' \
+              | sed -nE "s@.*name=\"([^\"]+)\".*revision=\"([^\"]+)\".*@$base/\1 \2@p" >> pairs.raw || true
+          done < urls.txt
+          grep -v '^$' pairs.raw | sort -u > pairs.txt
+          echo "distinct (tree, revision) pairs: $(wc -l < pairs.txt)"
+
+          # Read each tree's own Makefile for its kernel version. Prefer a
+          # BRANCH-shaped revision over a raw SHA so the clone below is a plain
+          # `git clone --depth=1 -b <rev>`; a bare SHA needs a fetch-by-object,
+          # which not every host allows.
+          : > map.txt
+          while read -r url rev; do
+            raw=$(printf '%s' "$url" | sed 's@^https://github.com/@https://raw.githubusercontent.com/@')
+            kv=$(curl -sfL "$raw/$rev/Makefile" 2>/dev/null \
+                 | awk '/^VERSION/{a=$3} /^PATCHLEVEL/{b=$3} END{if(a!="")print a"."b}')
+            [ -n "$kv" ] || continue
+            case "$rev" in */*) pref=0 ;; *) pref=1 ;; esac
+            echo "$kv $pref $url $rev" >> map.txt
+          done < pairs.txt
+
+          out=""
+          for kv in 5.10 5.15 6.1 6.6 6.12; do
+            pick=$(awk -v k="$kv" '$1==k' map.txt | sort -k2,2n | head -1)
+            if [ -n "$pick" ]; then
+              u=$(echo "$pick" | awk '{print $3}'); r=$(echo "$pick" | awk '{print $4}')
+              out="${out}${kv}=${u}@${r};"
+              echo "  $kv -> OnePlus  $u @ $r"
+            else
+              echo "  $kv -> AOSP     (no OnePlus tree pinned by the fleet)"
+            fi
+          done
+          echo "map=$out" >> "$GITHUB_OUTPUT"
+
   verify:
+    needs: resolve
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,6 +118,24 @@ jobs:
         run: |
           SEL="${{ github.event.inputs.version }}"
           if [ -n "$SEL" ] && [ "$SEL" != "${{ matrix.version }}" ]; then echo "run=no" >> "$GITHUB_OUTPUT"; else echo "run=yes" >> "$GITHUB_OUTPUT"; fi
+      - name: Pick source tree
+        id: src
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          MAP: ${{ needs.resolve.outputs.map }}
+        run: |
+          set -eu
+          V="${{ matrix.version }}"; KV="${V#*-}"
+          entry=$(printf '%s' "$MAP" | tr ';' '\n' | grep "^${KV}=" | head -1 | cut -d= -f2- || true)
+          if [ -n "$entry" ]; then
+            echo "kind=oneplus" >> "$GITHUB_OUTPUT"
+            echo "url=${entry%@*}" >> "$GITHUB_OUTPUT"
+            echo "rev=${entry##*@}" >> "$GITHUB_OUTPUT"
+            echo "SOURCE: OnePlus ${entry%@*} @ ${entry##*@}"
+          else
+            echo "kind=aosp" >> "$GITHUB_OUTPUT"
+            echo "SOURCE: AOSP common $V (no OnePlus tree for $KV)"
+          fi
       - name: Free disk
         if: steps.gate.outputs.run == 'yes'
         run: |
@@ -42,8 +151,15 @@ jobs:
           mkdir -p ~/bin; curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo; chmod a+x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.email ci@ci; git config --global user.name ci; git config --global color.ui false
-      - name: Sync GKI (${{ matrix.version }})
-        if: steps.gate.outputs.run == 'yes'
+      - name: Sync OnePlus tree (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'oneplus'
+        run: |
+          set -e
+          mkdir gki
+          git clone --depth=1 -b "${{ steps.src.outputs.rev }}" "${{ steps.src.outputs.url }}" gki/common
+          awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' gki/common/Makefile
+      - name: Sync AOSP common (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'aosp'
         run: |
           V="${{ matrix.version }}"; mkdir gki && cd gki
           repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-$V" < /dev/null
@@ -79,6 +195,7 @@ jobs:
             [ -e /usr/bin/$t-18 ] && sudo ln -sf /usr/bin/$t-18 /usr/local/bin/$t; done
           export PATH="/usr/local/bin:$PATH"
           echo "toolchain: apt clang-18"; clang --version | head -1; ld.lld --version | head -1
+          echo "source: ${{ steps.src.outputs.kind }}"
           M="make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -j$(nproc)"
           $M gki_defconfig
           ./scripts/config --file out/.config --enable SECURITY --enable SECURITY_NETWORK --enable SECURITY_SELINUX \
@@ -93,10 +210,11 @@ jobs:
                    security/selinux/hooks.o security/selinux/selinuxfs.o security/selinux/avc.o kernel/audit.o; do
             if $M "$o" >/tmp/cc.log 2>&1; then echo "CC  $o : OK"; else echo "CC  $o : FAIL"; tail -20 /tmp/cc.log; FAIL=1; fi
           done
-          echo "=== ${{ matrix.version }}: $([ $FAIL = 0 ] && echo ALL-OK || echo FAILURES) ==="
+          echo "=== ${{ matrix.version }} (${{ steps.src.outputs.kind }}): $([ $FAIL = 0 ] && echo ALL-OK || echo FAILURES) ==="
           exit $FAIL
 
   seqno:
+    needs: resolve
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -109,6 +227,24 @@ jobs:
         run: |
           SEL="${{ github.event.inputs.version }}"
           if [ -n "$SEL" ] && [ "$SEL" != "${{ matrix.version }}" ]; then echo "run=no" >> "$GITHUB_OUTPUT"; else echo "run=yes" >> "$GITHUB_OUTPUT"; fi
+      - name: Pick source tree
+        id: src
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          MAP: ${{ needs.resolve.outputs.map }}
+        run: |
+          set -eu
+          V="${{ matrix.version }}"; KV="${V#*-}"
+          entry=$(printf '%s' "$MAP" | tr ';' '\n' | grep "^${KV}=" | head -1 | cut -d= -f2- || true)
+          if [ -n "$entry" ]; then
+            echo "kind=oneplus" >> "$GITHUB_OUTPUT"
+            echo "url=${entry%@*}" >> "$GITHUB_OUTPUT"
+            echo "rev=${entry##*@}" >> "$GITHUB_OUTPUT"
+            echo "SOURCE: OnePlus ${entry%@*} @ ${entry##*@}"
+          else
+            echo "kind=aosp" >> "$GITHUB_OUTPUT"
+            echo "SOURCE: AOSP common $V (no OnePlus tree for $KV)"
+          fi
       - name: Free disk
         if: steps.gate.outputs.run == 'yes'
         run: |
@@ -124,8 +260,15 @@ jobs:
           mkdir -p ~/bin; curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo; chmod a+x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.email ci@ci; git config --global user.name ci; git config --global color.ui false
-      - name: Sync GKI (${{ matrix.version }})
-        if: steps.gate.outputs.run == 'yes'
+      - name: Sync OnePlus tree (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'oneplus'
+        run: |
+          set -e
+          mkdir gki
+          git clone --depth=1 -b "${{ steps.src.outputs.rev }}" "${{ steps.src.outputs.url }}" gki/common
+          awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' gki/common/Makefile
+      - name: Sync AOSP common (${{ matrix.version }})
+        if: steps.gate.outputs.run == 'yes' && steps.src.outputs.kind == 'aosp'
         run: |
           V="${{ matrix.version }}"; mkdir gki && cd gki
           repo init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-$V" < /dev/null
@@ -160,6 +303,7 @@ jobs:
             [ -e /usr/bin/$t-18 ] && sudo ln -sf /usr/bin/$t-18 /usr/local/bin/$t; done
           export PATH="/usr/local/bin:$PATH"
           echo "toolchain: apt clang-18"; clang --version | head -1; ld.lld --version | head -1
+          echo "source: ${{ steps.src.outputs.kind }}"
           M="make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -j$(nproc)"
           $M gki_defconfig
           ./scripts/config --file .config --enable KSU --enable SECURITY_SELINUX --enable AUDIT \
@@ -172,4 +316,4 @@ jobs:
           $M security/selinux/avc.o
           $M drivers/kernelsu/selinux/rules.o KCFLAGS="-I$PWD/security/selinux -I$PWD/security/selinux/include"
           ls -l drivers/kernelsu/selinux/rules.o
-          echo "=== ${{ matrix.version }} seqno rules.o: OK ==="
+          echo "=== ${{ matrix.version }} (${{ steps.src.outputs.kind }}) seqno rules.o: OK ==="
