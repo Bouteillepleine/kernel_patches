@@ -6,8 +6,8 @@ patches; each is fail-closed (`apply_or_die`).
 
 | patch | closes |
 |---|---|
-| `hide_selinux_attr.patch` / `hide_selinux_attr_6_12.patch` | `write(/proc/self/attr/*)` returning EACCES (type exists) instead of EINVAL (type absent) |
-| `hide_selinux_selinuxfs.patch` | the same probe through `selinuxfs` transaction writes |
+| `hide_selinux_attr.patch` / `hide_selinux_attr_6_12.patch` | `write(/proc/self/attr/*)`, `lsm_set_self_attr(2)` and `setxattr(security.selinux)` returning EACCES (type exists) instead of EINVAL (type absent) |
+| `hide_selinux_selinuxfs.patch` | the same probe through every `selinuxfs` write node (`access`/`create`/`relabel`/`user`/`member`/`context`/`validatetrans`), plus results that would echo a hidden type back |
 | `quiet_selinux_audit.patch` / `_legacy.patch` | AVC denial records naming a root type |
 | `quiet_selinux_audit_user.patch` | userspace-generated `AUDIT_USER_AVC` records naming one |
 | `fix_selinux_seqno.patch` | `/sys/fs/selinux/status` policyload count bumped by KSU's runtime rules |
@@ -27,10 +27,35 @@ indistinguishable from types that were never in the policy.
 
 ## Checking coverage on a device
 
-**The covered type list is hardcoded, in four separate patches.** It currently
-reads `:ksu:`, `:ksu_file:`, `:lsposed_file:`, `:zygisk_file:`. A setup that adds
-types those four strings do not name (Magisk, APatch, a differently-named hook
-framework) leaves the oracle open for them, and nothing fails a build to say so.
+**The covered type list is hardcoded and still lives in more than one place.**
+It reads `:ksu:`, `:ksu_file:`, `:lsposed_file:`, `:zygisk_file:`. Within
+`selinuxfs.c` it is now centralized in a single `sel_ctx_hidden()` helper that
+every write node calls, so the six selinuxfs sites share one list. But three
+copies remain — `security/selinux/hooks.c` (`selinux_lsm_setattr` and
+`selinux_inode_setxattr`), `security/selinux/avc.c` (`slow_avc_audit`) and
+`kernel/audit.c` (`audit_receive_msg`) — because they patch different source
+files, at different kernel versions, and a shared header would have to be
+installed and included by all of them (too invasive for the patch form). Each of
+those sites carries a comment pointing at the others; adding a type means editing
+all four call sites. A setup that adds a type those strings do not name (Magisk,
+APatch, a differently-named hook framework) leaves the oracle open for it, and
+nothing fails a build to say so.
+
+Two placement rules the guards now follow, and any new site must too:
+
+* **After the stock `avc_has_perm`, never before it.** The guard returns
+  `-EINVAL`, but a domain that lacks the permission (isolated_app, sdk_sandbox)
+  gets `-EACCES` from stock for *any* string. A guard placed at function or
+  dispatch entry would answer EINVAL-for-hidden but EACCES-for-garbage from those
+  domains — making the cloak itself the detector. Placed after the perm check and
+  immediately before `security_context_to_sid()`, a hidden type is
+  indistinguishable from an absent one for every caller.
+* **`hide_selinux_attr.patch` and `hide_selinux_attr_6_12.patch` are now
+  identical**, both guarding `selinux_lsm_setattr` (which `lsm_set_self_attr(2)`
+  reaches directly, bypassing the old `selinux_setprocattr`-only guard). The
+  builder's `apply_first_of` picks one; whichever it picks lands the guard in the
+  right place. They can be de-duplicated to a single patch once the builder's
+  variant list is updated to match.
 
 Verify on the target rather than assume. Run as a **non-root uid** (the gate is
 `uid >= 2000`), and use `dd` rather than `echo` — toybox `echo` does not check
@@ -73,16 +98,42 @@ Measured on OP15 / ReSukiSU (2026-08-21): the policy carries exactly `ksu`,
 ## `fix_selinux_seqno` — the trade it makes
 
 It drops `selinux_status_update_policyload()` from KSU's runtime rule path, so
-`/sys/fs/selinux/status` keeps the policyload count a stock boot produces.
-Verified on OP15: `policyload = 1`, which is what one boot-time policy load looks
-like. Without it, every KSU rule batch bumps the counter and any process that
-mmaps the status page sees more policy loads than a stock device ever performs.
+the `/sys/fs/selinux/status` mmap page keeps the values a stock boot produces.
+
+Get the mechanism right, because the earlier description here had it backwards.
+`selinux_status_update_policyload(seqno)` does **not** *bump* a policyload
+counter — it **assigns** `status->policyload = seqno` (and bumps
+`status->sequence` twice, once before and once after, so a concurrent reader can
+detect the update). KSU calls it from its rule path with **`seqno == 0`**. So
+the observable on an *unpatched* kernel is not "a higher load count" — it is
+`policyload == 0`, a value the kernel only ever writes before the first policy
+has loaded and which is therefore impossible on a running device, sitting next to
+a `sequence` that has advanced past a stock boot's. Either half is a tell; the
+pair together is unambiguous. Dropping the call leaves both stock.
+
+Verified on OP15: `policyload = 1`, `sequence` matching one boot-time load, which
+is what a single boot-time policy load looks like.
+
+**Post-condition to assert** (in a device probe, not the build): read the status
+page and require `policyload != 0 && policyload == avd.seqno`, where `avd.seqno`
+is the sequence returned by a `/sys/fs/selinux/access` compute — i.e. the
+policyload field must equal the *real* current policy sequence, never 0.
 
 The cost: userspace AVC caches (libselinux) flush on that notification, so they
 can hold a stale decision across a KSU policy change. Narrow in practice —
 `avc_ss_reset()` is deliberately *kept*, so the kernel's own AVC still flushes;
 only userspace-cached decisions are affected, and KSU installs its rules early in
 boot, before most userspace caching matters.
+
+**Left for review (boot-risk, M-C2):** the patch still lets
+`selnl_notify_policyload(0)` broadcast a policy-load event on `NETLINK_SELINUX`
+that no stock device emits after boot — a second, netlink-side tell that mirrors
+the status-page one this patch closes. Gating it out is *not* done here on
+purpose: the CI verifier asserts `selnl_notify_policyload` survives (removing it
+has a documented bootloop risk), and nothing here has proven the removal
+boot-safe. If it is ever gated out, the CI assertion in
+`verify-hook-pathhide.yml` must be updated in the same change. Treat as an open
+decision, not a shipped fix.
 
 ## Why the gate is `uid >= 2000` and must not be widened
 

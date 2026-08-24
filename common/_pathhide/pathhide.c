@@ -80,10 +80,25 @@
 #include <linux/uaccess.h>
 #include <linux/capability.h>
 #include <linux/init.h>
+#include <linux/version.h>
 #include "pathhide.h"
 
 #ifndef PH_PROC_NAME
 #define PH_PROC_NAME	"pathhide"
+#endif
+
+/*
+ * Match on the path the kernel actually DISPLAYS. On 6.6+ that is
+ * file_user_path(), which diverges from f_path for FMODE_BACKING files (an
+ * overlayfs upper backed by a lower) -- /proc/<pid>/maps, map_files and the fd
+ * symlinks all render file_user_path(), so matching f_path there would let an
+ * overlay-backed hook file slip past the very listing it is displayed in. Older
+ * kernels have no user-path split, so f_path is the displayed path.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define PH_FILE_PATH(f)		file_user_path(f)
+#else
+#define PH_FILE_PATH(f)		(&(f)->f_path)
 #endif
 
 #define PH_MAX_RULES	64
@@ -146,7 +161,7 @@ bool pathhide_match_file(struct file *file)
 
 	/* Disables preemption; d_path() and ph_match_str() never sleep. */
 	bufp = get_cpu_ptr(&ph_pathbuf);
-	p = d_path(&file->f_path, *bufp, PATH_MAX);
+	p = d_path(PH_FILE_PATH(file), *bufp, PATH_MAX);
 	if (!IS_ERR(p))
 		hit = ph_match_str(p);
 	put_cpu_ptr(&ph_pathbuf);

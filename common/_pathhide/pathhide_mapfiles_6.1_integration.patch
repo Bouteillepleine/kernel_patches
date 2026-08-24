@@ -2,7 +2,11 @@ Extend pathhide coverage to /proc/<pid>/map_files/ (readdir listing, name
 lookup, and symlink resolution). Without this, a process can enumerate its own
 injected file-backed mappings via /proc/self/map_files/ even though they are
 hidden from /proc/self/maps -- the address ranges alone prove concealment.
-Guarded upstream by CONFIG_CHECKPOINT_RESTORE.
+MANDATORY, not optional: on 6.x /proc/<pid>/map_files is compiled
+unconditionally -- there is NO CONFIG_CHECKPOINT_RESTORE guard around it (an
+earlier note here was wrong). Confirmed on the 6.12 sibling with
+CONFIG_CHECKPOINT_RESTORE=n; the same holds on 6.1. Skipping this patch leaves
+the map_files enumeration oracle open even though maps/smaps are cloaked.
 
 Generated and verified against android14-6.1.
 

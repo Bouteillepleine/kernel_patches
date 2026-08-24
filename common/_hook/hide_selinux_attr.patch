@@ -1,18 +1,31 @@
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -6444,10 +6444,15 @@
- 	struct task_security_struct *tsec;
- 	struct cred *new;
- 	u32 mysid = current_sid(), sid = 0, ptsid;
- 	int error;
- 	char *str = value;
-+	/* AID_SHELL (2000) and up: block apps and adb shell, allow system/init. */
-+	if (__kuid_val(current_uid()) >= 2000 && size && value &&
-+	    (strnstr(value, ":ksu:", size) ||
-+	     strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size) || strnstr(value, ":zygisk_file:", size)))
+@@ -3225,6 +3225,13 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
+ 			  FILE__RELABELFROM, &ad);
+ 	if (rc)
+ 		return rc;
++	/* AID_SHELL (2000)+ : after the RELABELFROM avc check, before
++	 * security_context_to_sid(), so a hidden type answers EINVAL exactly like
++	 * an absent one. List mirrored in selinuxfs.c/avc.c/kernel-audit.c. */
++	if (__kuid_val(current_uid()) >= 2000 && value &&
++	    (strnstr(value, ":ksu:", size) || strnstr(value, ":ksu_file:", size) ||
++	     strnstr(value, ":lsposed_file:", size) || strnstr(value, ":zygisk_file:", size)))
 +		return -EINVAL;
  
- 	/*
- 	 * Basic control over ability to set these attributes at all.
- 	 */
- 	if (!strcmp(name, "exec"))
+ 	rc = security_context_to_sid(value, size, &newsid,
+ 				     GFP_KERNEL);
+@@ -6432,6 +6439,14 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
+ 			str[size-1] = 0;
+ 			size--;
+ 		}
++		/* AID_SHELL (2000)+ : after the per-attr avc_has_perm above and
++		 * immediately before security_context_to_sid(), so a domain lacking
++		 * the perm still gets the stock EACCES, never EINVAL. Reached by
++		 * lsm_set_self_attr(2) too. List mirrored in selinuxfs.c/avc.c. */
++		if (__kuid_val(current_uid()) >= 2000 &&
++		    (strnstr(value, ":ksu:", size) || strnstr(value, ":ksu_file:", size) ||
++		     strnstr(value, ":lsposed_file:", size) || strnstr(value, ":zygisk_file:", size)))
++			return -EINVAL;
+ 		error = security_context_to_sid(value, size,
+ 						&sid, GFP_KERNEL);
+ 		if (error == -EINVAL && attr == LSM_ATTR_FSCREATE) {
