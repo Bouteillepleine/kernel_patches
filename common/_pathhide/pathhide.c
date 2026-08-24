@@ -88,14 +88,19 @@
 #endif
 
 /*
- * Match on the path the kernel actually DISPLAYS. On 6.6+ that is
+ * Match on the path the kernel actually DISPLAYS. From 6.7 that is
  * file_user_path(), which diverges from f_path for FMODE_BACKING files (an
  * overlayfs upper backed by a lower) -- /proc/<pid>/maps, map_files and the fd
  * symlinks all render file_user_path(), so matching f_path there would let an
  * overlay-backed hook file slip past the very listing it is displayed in. Older
  * kernels have no user-path split, so f_path is the displayed path.
+ *
+ * 6.7, not 6.6: file_user_path() arrived with the backing-file series in 6.7.
+ * Guarding at 6.6 made the 6.6 build treat it as an implicit int-returning
+ * function and fail with "incompatible integer to pointer conversion" at the
+ * d_path() call below (measured on the OnePlus android15-6.6 tree).
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 #define PH_FILE_PATH(f)		file_user_path(f)
 #else
 #define PH_FILE_PATH(f)		(&(f)->f_path)
