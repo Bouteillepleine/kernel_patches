@@ -125,15 +125,30 @@ can hold a stale decision across a KSU policy change. Narrow in practice —
 only userspace-cached decisions are affected, and KSU installs its rules early in
 boot, before most userspace caching matters.
 
-**Left for review (boot-risk, M-C2):** the patch still lets
+**Closed, will not fix (was M-C2).** The patch still lets
 `selnl_notify_policyload(0)` broadcast a policy-load event on `NETLINK_SELINUX`
 that no stock device emits after boot — a second, netlink-side tell that mirrors
-the status-page one this patch closes. Gating it out is *not* done here on
-purpose: the CI verifier asserts `selnl_notify_policyload` survives (removing it
-has a documented bootloop risk), and nothing here has proven the removal
-boot-safe. If it is ever gated out, the CI assertion in
-`verify-hook-pathhide.yml` must be updated in the same change. Treat as an open
-decision, not a shipped fix.
+the status-page one this patch closes. It stays.
+
+Receiving that broadcast requires a `netlink_selinux_socket`, and **no app domain
+is allowed to create one.** Measured 2026-08-25 against the live OP15 policy, via
+the `/sys/fs/selinux/access` compute_av node (class index 35, requested
+`0xffffffff`):
+
+| source domain | allowed |
+| --- | --- |
+| `untrusted_app` | `0` |
+| `priv_app` | `0` |
+| `isolated_app` | `0` |
+| `platform_app` | `0` |
+| `system_app` | `0` |
+
+Zero for every one, platform- and system-signed included — so the only readers
+are domains that have already won. Gating the call would trade a tell that no
+app can observe for a documented bootloop risk, and the CI verifier in
+`verify-hook-pathhide.yml` asserts `selnl_notify_policyload` survives precisely
+to stop that being done casually. Re-open only with evidence of a reachable
+listener, and update that CI assertion in the same change.
 
 ## Why the gate is `uid >= 2000` and must not be widened
 
