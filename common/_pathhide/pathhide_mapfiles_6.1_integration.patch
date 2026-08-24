@@ -12,14 +12,12 @@ Generated and verified against android14-6.1.
 
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
-@@ -63,6 +63,7 @@
- #include <linux/string.h>
+@@ -64,4 +64,5 @@
  #include <linux/seq_file.h>
  #include <linux/namei.h>
 +extern bool pathhide_match_file(struct file *file);
  #include <linux/mnt_namespace.h>
  #include <linux/mm.h>
- #include <linux/pgsize_migration.h>
 @@ -2289,7 +2290,7 @@
  
  	rc = -ENOENT;

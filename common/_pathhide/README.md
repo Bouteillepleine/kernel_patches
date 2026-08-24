@@ -10,44 +10,59 @@ the first rule is written, so a no-op on stock configurations.
 
 | patch | sites |
 |---|---|
-| `pathhide_<ver>_integration.patch` | `maps`, `smaps`, `smaps_rollup`, the `fd` readdir, and (6.12) `numa_maps` + the `PROCMAP_QUERY` ioctl + `fd` lookup/readlink/count |
+| `pathhide_<ver>_integration.patch` | `maps`, `smaps`, `smaps_rollup`, `numa_maps`, the `fd` readdir *and* `fd` lookup/readlink/fdinfo — plus `stat(fd).st_size` on 6.6/6.12 and the `PROCMAP_QUERY` ioctl on 6.12 |
 | `pathhide_mapfiles_<ver>_integration.patch` | `/proc/<pid>/map_files/` readdir, name lookup, symlink resolve — **mandatory**, see that file's header |
 | `pathhide_build_integration.patch` | optional `obj-y += pathhide.o` for the `fs/proc/` drop-in layout |
 
-## Coverage is complete only on 6.12 right now
+## Coverage per kernel version
 
-The audit fixes (fd readlink/lookup/count via `tid_fd_mode`, the `PROCMAP_QUERY`
-ioctl, `smaps_rollup`, and the maps-vs-pad decision point) were implemented and
-**compile-verified against 6.12.23** (`fs/proc/fd.o` and `fs/proc/task_mmu.o`
-build clean with the patch applied).
+The audit fixes now exist on every version the fleet builds. Each older-kernel
+patch was regenerated hunk by hunk against the real OnePlus tree its manifests
+pin, then dry-run at **fuzz 0** against every distinct `fs/proc` variant those
+manifests resolve to (13 distinct `fd.c`/`task_mmu.c`/`base.c` combinations
+across 69 `(tree, revision)` pairs).
 
-**The 5.10 / 5.15 / 6.1 / 6.6 integration patches still carry only the original
-`maps` + `smaps` + `fd`-readdir filters.** They were NOT extended, because their
-`fs/proc/fd.c` and `fs/proc/task_mmu.c` differ from 6.12 (e.g. 5.10 has no
-`tid_fd_mode()`; `fd` lookup runs through `fcheck_files`/`tid_fd_revalidate`
-instead) and no source for those versions was available here to verify the hunks
-apply. The builders are fail-closed (`apply_or_die`), so shipping unverified
-context would break those builds rather than silently under-cover.
+| fix | 5.10 | 5.15 | 6.1 | 6.6 | 6.12 |
+|---|---|---|---|---|---|
+| `maps` / `smaps` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `fd` readdir | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **H6** `fd` lookup / readlink / fdinfo (`tid_fd_mode` + `proc_fd_link`) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **M-C7** `stat(/proc/<pid>/fd).st_size` | n/a | n/a | n/a | ✓ | ✓ |
+| **M-C5** orphan `[page size compat]` pad VMA | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `numa_maps` (under `CONFIG_NUMA`) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `smaps_rollup` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROCMAP_QUERY` ioctl | n/a | n/a | n/a | n/a | ✓ |
 
-To close the same gap on an older kernel, regenerate against *that* version's
-source, mirroring the 6.12 changes:
+`n/a` means the kernel has no such code, not that the fix was skipped:
+`proc_readfd_count()`/`proc_fd_getattr()` first appear in 6.6, and the
+`PROCMAP_QUERY` ioctl (`query_matching_vma()`) first appears in 6.12 — neither
+exists in the older trees, so there is nothing to leak through.
 
-* **`fs/proc/fd.c`**
-  * make the fd lookup helper (`tid_fd_mode()` on 6.x, else the body of
-    `proc_lookupfd_common()` / `tid_fd_revalidate()`) report "not present" when
-    `pathhide_match_file()` matches — this covers `readlink`, `fdinfo`, and
-    dentry revalidation in one place;
-  * guard `proc_fd_link()` for a cached dentry read through `proc_get_link`;
-  * rewrite `proc_readfd_count()` to iterate fds and *deduct* matched ones
-    instead of `bitmap_weight(open_fds)`, so `stat(/proc/<pid>/fd).st_size`
-    equals what readdir emits (**H6 / M-C7**).
-* **`fs/proc/task_mmu.c`**
-  * move the `maps` guard out of `show_map_vma()` into `show_map()`, before both
-    the `show_map_vma()` and `show_map_pad_vma()` calls, so a hidden padded `.so`
-    does not leave an orphan `[page size compat]` line that `smaps` drops
-    (**M-C5**, only where `show_map_pad_vma`/`pgsize_migration` exists — 6.1/6.6);
-  * add `if (vma->vm_file && pathhide_match_file(vma->vm_file)) continue;` to the
-    `show_smaps_rollup()` accumulation loop (**H8 contained part**).
+### Version-specific shapes worth knowing before editing these
+
+* `tid_fd_mode()` **does** exist on 5.10 (it takes a `files_struct` reference and
+  uses `fcheck_files()`), so H6 has one decision point on every version. An
+  earlier note here claiming otherwise was wrong.
+* On 5.10, 5.15 and *some* 6.1 trees, `show_map()`/`show_smap()` open with
+  `get_pad_vma()` / `get_data_vma()`, which return **kzalloc'd copies that only
+  `show_map_pad_vma()` frees**. A guard placed after those declarations would
+  leak two `struct vm_area_struct` per hidden padded mapping on every read of
+  `maps`. Those versions therefore wrap the function — `show_map()` becomes a
+  thin guard that tail-calls `ph_show_map()` — so the decision happens before
+  anything is allocated. 6.1 needs the wrapper for a second reason: its trees
+  carry **both** shapes (`vma = v` and the pad-copy form), and the wrapper is the
+  only form that compiles against both.
+* 6.6 and 6.12 take `@v` as the VMA directly, so their guard sits inline.
+* `smaps_rollup` is a `for (vma = priv->mm->mmap; vma;)` loop on 5.10/5.15 with
+  the advance at the *bottom* of the body — `continue` there would hang. Those
+  versions suppress the accumulation instead; 6.1/6.6/6.12 are `do`/`while` and
+  use `continue`.
+* GNU `patch` reports fuzz when a hunk's trailing context is shorter than its
+  leading context, even when every line matches. The wrapper hunks therefore
+  carry 1 line of context on each side (the declarations below the opening brace
+  are the part that differs between trees). If you regenerate, re-check at
+  `-F0`: a hunk that only applies "with fuzz" can land a guard in the wrong
+  function silently.
 
 ## H8 — the accounting leak is only partly closed (STAGED, needs a decision)
 
@@ -62,7 +77,14 @@ inconsistent, and each inconsistency is a zero-privilege existence tell:
 
 `smaps_rollup`'s contended-lock slow path (`mmap_lock_is_contended`) re-gathers a
 re-fetched VMA without re-checking `pathhide_match_file()`; the contained fix only
-covers the common path. Left as-is deliberately.
+covers the common path. Left as-is deliberately, and identically on every version
+so the five patches stay comparable.
+
+One further per-version nuance: on 6.1/6.6/6.12 the `continue` also skips
+`last_vma_end = vma->vm_end`, so a hidden *trailing* VMA shortens the `[rollup]`
+header range; on 5.10/5.15 the range is left intact and only the accounting is
+suppressed. Both close the smaps-vs-rollup mismatch, which is the oracle that
+mattered.
 
 Closing this properly is a design change, not a patch tweak, and must not ship
 half-done (a half version makes the tells *worse*). Two candidate approaches:
@@ -98,10 +120,9 @@ Ship both together, or enable `PH_ENABLE_PROC` for a standalone build.
 * **`/proc/<pid>/numa_maps`** — `show_numa_map()` prints the backing file path
   (`file_user_path`), unfiltered. This was assumed inert (`CONFIG_NUMA=n`) but the
   6.12 tree config actually has **`CONFIG_NUMA=y`**, so the node is live and was a
-  real open oracle. The 6.12 integration patch now guards `show_numa_map()` the
-  same way as `show_map()`; the guard is compiled only under `CONFIG_NUMA`, so it
-  is a strict no-op where NUMA is off. The older-kernel patches still need the
-  same guard added (see the coverage-gap section).
+  real open oracle. **Every** integration patch now guards `show_numa_map()` the
+  same way as `show_map()`; `show_numa_map()` lives inside `#ifdef CONFIG_NUMA`
+  on all five versions, so the guard is a strict no-op where NUMA is off.
 * **`dl_iterate_phdr()` / the dynamic linker's `link_map`** — userspace bookkeeping
   in the process's own address space, populated by the loader, not by the kernel.
   The kernel cannot filter it; a file-backed mapping hidden from `maps` is still
