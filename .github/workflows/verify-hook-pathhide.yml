@@ -314,7 +314,9 @@ jobs:
           if patch -p1 --dry-run < "$P/_hook/quiet_selinux_audit.patch" >/dev/null 2>&1; then
             patch -p1 < "$P/_hook/quiet_selinux_audit.patch"; echo "audit: non-legacy"
           else patch -p1 < "$P/_hook/quiet_selinux_audit_legacy.patch"; echo "audit: legacy"; fi
-          patch -p1 < "$P/_hook/hide_selinux_selinuxfs.patch"
+          if patch -p1 --dry-run < "$P/_hook/hide_selinux_selinuxfs_6_12.patch" >/dev/null 2>&1; then
+            patch -p1 < "$P/_hook/hide_selinux_selinuxfs_6_12.patch"; echo "selinuxfs: 6_12"
+          else patch -p1 < "$P/_hook/hide_selinux_selinuxfs.patch"; echo "selinuxfs: base"; fi
           patch -p1 < "$P/_hook/quiet_selinux_audit_user.patch"
           echo "all patches applied"
       - name: Compile affected objects (${{ matrix.version }})

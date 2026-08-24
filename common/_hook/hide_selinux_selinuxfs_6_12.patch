@@ -1,0 +1,120 @@
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -632,6 +632,24 @@ static const struct file_operations sel_load_ops = {
+ 	.llseek		= generic_file_llseek,
+ };
+ 
++/*
++ * Shared hidden-type gate for the selinuxfs write handlers below. The type
++ * list lives here and is mirrored in security/selinux/hooks.c
++ * (selinux_lsm_setattr / selinux_inode_setxattr), security/selinux/avc.c
++ * (slow_avc_audit) and kernel/audit.c (audit_receive_msg) -- adding a type
++ * means editing all of them. Length-bounded strnstr, never strstr. Call it
++ * only AFTER the handler's own avc_has_perm has passed, so a domain lacking
++ * the perm still gets the stock EACCES and the cloak never becomes the tell.
++ */
++static bool sel_ctx_hidden(const char *buf, size_t size)
++{
++	if (__kuid_val(current_uid()) < 2000)
++		return false;
++	return strnstr(buf, ":ksu:", size) || strnstr(buf, ":ksu_file:", size) ||
++	       strnstr(buf, ":lsposed_file:", size) ||
++	       strnstr(buf, ":zygisk_file:", size);
++}
++
+ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
+ {
+ 	char *canon = NULL;
+@@ -643,6 +661,11 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
+ 	if (length)
+ 		goto out;
+ 
++	if (sel_ctx_hidden(buf, size)) {
++		length = -EINVAL;
++		goto out;
++	}
++
+ 	length = security_context_to_sid(buf, size, &sid, GFP_KERNEL);
+ 	if (length)
+ 		goto out;
+@@ -757,6 +780,11 @@ static ssize_t sel_write_validatetrans(struct file *file,
+ 		goto out;
+ 	}
+ 
++	if (sel_ctx_hidden(req, count)) {
++		rc = -EINVAL;
++		goto out;
++	}
++
+ 	rc = -ENOMEM;
+ 	oldcon = kzalloc(count + 1, GFP_KERNEL);
+ 	if (!oldcon)
+@@ -834,6 +862,8 @@ static ssize_t selinux_transaction_write(struct file *file, const char __user *b
+ 		return PTR_ERR(data);
+ 
+ 	rv = write_op[ino](file, data, size);
++	if (rv > 0 && sel_ctx_hidden(data, rv))
++		return -EINVAL;
+ 	if (rv > 0) {
+ 		simple_transaction_set(file, rv);
+ 		rv = size;
+@@ -867,6 +897,11 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
+ 	if (length)
+ 		goto out;
+ 
++	if (sel_ctx_hidden(buf, size)) {
++		length = -EINVAL;
++		goto out;
++	}
++
+ 	length = -ENOMEM;
+ 	scon = kzalloc(size + 1, GFP_KERNEL);
+ 	if (!scon)
+@@ -919,6 +954,11 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
+ 	if (length)
+ 		goto out;
+ 
++	if (sel_ctx_hidden(buf, size)) {
++		length = -EINVAL;
++		goto out;
++	}
++
+ 	length = -ENOMEM;
+ 	scon = kzalloc(size + 1, GFP_KERNEL);
+ 	if (!scon)
+@@ -1018,6 +1058,11 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
+ 	if (length)
+ 		goto out;
+ 
++	if (sel_ctx_hidden(buf, size)) {
++		length = -EINVAL;
++		goto out;
++	}
++
+ 	length = -ENOMEM;
+ 	scon = kzalloc(size + 1, GFP_KERNEL);
+ 	if (!scon)
+@@ -1076,6 +1121,11 @@ static ssize_t sel_write_user(struct file *file, char *buf, size_t size)
+ 	if (length)
+ 		goto out;
+ 
++	if (sel_ctx_hidden(buf, size)) {
++		length = -EINVAL;
++		goto out;
++	}
++
+ 	length = -ENOMEM;
+ 	con = kzalloc(size + 1, GFP_KERNEL);
+ 	if (!con)
+@@ -1138,6 +1188,11 @@ static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
+ 	if (length)
+ 		goto out;
+ 
++	if (sel_ctx_hidden(buf, size)) {
++		length = -EINVAL;
++		goto out;
++	}
++
+ 	length = -ENOMEM;
+ 	scon = kzalloc(size + 1, GFP_KERNEL);
+ 	if (!scon)
