@@ -17,7 +17,31 @@ false positives:
 | `stat(p "/zzz")` | `ENOTDIR` | `ENOENT` |
 | `link(p, "/data/local/tmp/x")` | `EXDEV` | `ENOENT` |
 
-This directory closes all four. `ghost.c` supplies one predicate,
+A **second mechanism** was found later, by probing the wider class rather than
+reasoning about it. `mnt_want_write()` answers before existence is re-validated,
+so on a read-only ROM mount these three report `EROFS` — the same answer a stock
+*visible* file gives — where an absent path gives `ENOENT`:
+
+| probe | hidden | absent | stock visible |
+|---|---|---|---|
+| `truncate(p, 0)` | `EROFS` | `ENOENT` | `EROFS` |
+| `utimensat(AT_FDCWD, p, …, 0)` | `EROFS` | `ENOENT` | `EROFS` |
+| `chmod(p, 0644)` | `EROFS` | `ENOENT` | `EROFS` |
+
+Measured the same way (OP15, blocked uid 10438, engine v25), with both an absent
+and a stock-visible control.
+
+Cleared by the same measurement, and deliberately NOT patched: `inotify_add_watch`
+and `name_to_handle_at` answer identically for hidden and absent (`n2h` is
+`ENOSYS` — the fs exports no `->fh_to_dentry`). `readlink` and `statfs` were leaks
+until engine v21/v25 added `.readlink` to both iops and a `->statfs` on the
+hijacked `s_op`; they are closed in the engine, not here.
+
+⚠️ The class is **not proven exhaustive**. Anything that resolves a path and then
+acts without consulting a hijacked op is a candidate. `classprobe.c` is the
+harness — extend it rather than reasoning.
+
+This directory closes all seven. `ghost.c` supplies one predicate,
 `ghost_hidden_path()`; the per-version `ghost_*.patch` files place one guard per
 oracle, each of which answers `-ENOENT`.
 
@@ -31,6 +55,9 @@ oracle, each of which answers `-ENOENT`.
 | `ghost_xattr*.patch` | guards in all four `path_*xattr()` wrappers, `fs/xattr.c` |
 | `ghost_linkat*.patch` | guard in `do_linkat()`, `fs/namei.c` |
 | `ghost_notdir*.patch` | guard in `link_path_walk()`, `fs/namei.c` |
+| `ghost_truncate.patch` | guard in `do_sys_truncate()`, `fs/open.c` |
+| `ghost_utimes.patch` | guard in `do_utimes_path()`, `fs/utimes.c` |
+| `ghost_chmod*.patch` | guard in `do_fchmodat()`, `fs/open.c` |
 
 Each family has variants; a builder applies the **first that dry-runs clean**,
 newest-shape first, and fails the build if none does. See the coverage table.

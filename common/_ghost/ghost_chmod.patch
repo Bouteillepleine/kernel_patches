@@ -1,0 +1,70 @@
+Close the chmod(2) existence oracle.
+
+  chmod(p, 0644)
+
+MEASURED on OP15 (Android 16, 6.12.23, engine v25) as blocked uid 10438 against
+/product/etc/permissions, with TWO controls -- an absent sibling and a
+stock-VISIBLE sibling:
+
+  hidden injected path   -> EROFS
+  genuinely absent path  -> ENOENT
+  stock visible file     -> EROFS
+
+So a hidden path answers exactly like an ordinary existing file, which is the
+one bit the hiding exists to withhold.
+
+WHY THE ENGINE CANNOT ANSWER IT
+
+This is a SECOND mechanism, distinct from the four guards this directory shipped
+first. Those escape because the syscall never reaches a file-level op at all.
+This one escapes because mnt_want_write() answers first: chmod_common() takes a write
+reference on the read-only ROM mount and returns -EROFS before anything
+re-validates that the path exists, so the hijacked ->setattr and ->permission
+are never consulted. Verified against v6.12 fs/open.c.
+
+WHERE THE GUARD GOES, AND WHY THERE
+
+Immediately after user_path_at() returns success, before chmod_common(). That is AFTER
+the lookup -- so the parent directory's search permission has already been
+enforced, and a caller who cannot search it still gets -EACCES exactly as it
+would for an absent name -- and BEFORE the write reference that produces the
+EROFS.
+
+Read the note in ghost_o_path.patch on why this is the opposite placement rule
+from common/_hook/ before moving it.
+
+ghost_hidden_path() is false unless the caller's real uid is in the configured
+hidden set AND the rendered path matches a configured rule, so a caller that is
+not being hidden from is unaffected, and a kernel whose tables are empty never
+changes behaviour at all.
+
+APPLIES TO
+
+do_fchmodat() as shaped on v6.6 and v6.12 (identical bodies).
+v5.10/v5.15/v6.1 carry an earlier shape -- ghost_chmod_5_10.patch covers
+those, and the two are complementary: each FAILS where the other applies,
+so apply_first_of cannot pick wrong.
+
+Dry-run at -F0 against v5.10, v5.15, v6.1, v6.6 and v6.12: applies on v6.6 and v6.12, fails on v5.10/v5.15/v6.1 (by design).
+
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -695,12 +695,18 @@
+ 	if (flags & AT_EMPTY_PATH)
+ 		lookup_flags |= LOOKUP_EMPTY;
+ 
+ retry:
+ 	error = user_path_at(dfd, filename, lookup_flags, &path);
+ 	if (!error) {
++		extern bool ghost_hidden_path(const struct path *gp);
++
++		if (ghost_hidden_path(&path)) {
++			path_put(&path);
++			return -ENOENT;
++		}
+ 		error = chmod_common(&path, mode);
+ 		path_put(&path);
+ 		if (retry_estale(error, lookup_flags)) {
+ 			lookup_flags |= LOOKUP_REVAL;
+ 			goto retry;
+ 		}
