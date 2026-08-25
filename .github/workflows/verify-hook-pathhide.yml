@@ -593,6 +593,16 @@ jobs:
           echo "source: ${{ steps.src.outputs.kind }}"
           ccache --zero-stats >/dev/null 2>&1 || true
           M="make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -j$(nproc)"
+          # drivers/Kconfig now sources drivers/kernelsu/Kconfig, so that symlink
+          # must exist BEFORE the shared gki_defconfig -- not only inside the
+          # per-fork loop below. When the symlink was created once by the
+          # single-fork apply step this was implicit; moving it into the loop left
+          # defconfig reading a dangling source and dying with
+          #   drivers/Kconfig:248: can't open file "drivers/kernelsu/Kconfig"
+          # on every matrix leg. Point it at the first fork just to satisfy
+          # Kconfig; the loop repoints it per fork before each build.
+          _first="$(head -1 "$GITHUB_WORKSPACE/ksu-forks.txt" | cut -d"|" -f1)"
+          ln -sfn "$(realpath "$_first/kernel")" drivers/kernelsu
           $M gki_defconfig
           ./scripts/config --file .config --enable KSU --enable SECURITY_SELINUX --enable AUDIT \
             --disable LTO_CLANG_THIN --disable LTO_CLANG_FULL --disable CFI_CLANG --disable SHADOW_CALL_STACK \
