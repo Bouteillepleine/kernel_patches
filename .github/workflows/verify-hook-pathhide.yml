@@ -387,7 +387,7 @@ jobs:
       # dir|owner/repo|ref  -- dir is where it is cloned inside $KDIR.
       KSU_FORKS: |
         ReSukiSU|ReSukiSU/ReSukiSU|main
-        KernelSU-Next|KernelSU-Next/KernelSU-Next|next
+        KernelSU-Next|KernelSU-Next/KernelSU-Next|dev
         SukiSU-Ultra|SukiSU-Ultra/SukiSU-Ultra|main
     strategy:
       fail-fast: false
@@ -501,7 +501,16 @@ jobs:
             [ -z "$dir" ] && continue
             echo "::group::$dir ($repo@$ref)"
             # < /dev/null: git must not eat the fork list this loop is reading.
-            git clone --depth=1 -b "$ref" "https://github.com/$repo" "$dir" < /dev/null
+            # And the clone must NOT be allowed to abort the step: `set -e` on a
+            # bad ref exits 128 here, so the FIRST unreachable fork masked every
+            # fork after it -- which is exactly how a wrong ref (`next` for a repo
+            # whose branch is `dev`) hid the other two entirely instead of
+            # reporting one line. Record it and keep going.
+            if ! git clone --depth=1 -b "$ref" "https://github.com/$repo" "$dir" < /dev/null; then
+              echo "::error::$repo@$ref: clone failed - branch or repo does not exist"
+              printf '%s|%s@%s|NOREF|clone failed (branch/repo missing)\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+              BAD=1; echo "::endgroup::"; continue
+            fi
             if [ ! -f "$dir/kernel/selinux/rules.c" ]; then
               echo "::error::$repo@$ref: kernel/selinux/rules.c is missing - the patch target moved"
               printf '%s|%s@%s|MISSING|rules.c not at kernel/selinux/rules.c\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
