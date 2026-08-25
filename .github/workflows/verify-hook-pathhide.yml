@@ -440,7 +440,13 @@ jobs:
           # ghost_build_integration.patch wiring actually took.
           if $M fs/ >/tmp/cc-fs.log 2>&1; then
             echo "CC  fs/ (full) : OK"
-            if llvm-ar t out/fs/proc/built-in.a 2>/dev/null | grep -qx 'ghost.o'; then
+            # Match the BASENAME. built-in.a is a THIN archive and llvm-ar lists
+            # its members by path -- "out/fs/proc/ghost.o", never bare "ghost.o"
+            # -- so `grep -qx ghost.o` could not match on any tree, whether or
+            # not the wiring took. It failed all five legs while the very next
+            # assertion (the symbol is exported) passed, and the error's own
+            # diagnostic dump printed out/fs/proc/ghost.o directly underneath it.
+            if llvm-ar t out/fs/proc/built-in.a 2>/dev/null | grep -qE '(^|/)ghost\.o$'; then
               echo "wiring: ghost.o is in fs/proc/built-in.a : OK"
             else
               echo "::error::ghost.o is NOT in fs/proc/built-in.a - the obj-y wiring did not take"
