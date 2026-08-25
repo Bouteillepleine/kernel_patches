@@ -1,18 +1,27 @@
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -6444,10 +6444,15 @@
- 	struct task_security_struct *tsec;
- 	struct cred *new;
- 	u32 mysid = current_sid(), sid = 0, ptsid;
- 	int error;
- 	char *str = value;
-+	/* AID_SHELL (2000) and up: block apps and adb shell, allow system/init. */
+@@ -6415,4 +6415,24 @@
+ 	if (error)
+ 		return error;
+ 
++	/* AID_SHELL (2000) and up: block apps and adb shell, allow system/init.
++	 *
++	 * Placement is the whole point. This MUST sit after the PROCESS__SET*
++	 * avc_has_perm above and before security_context_to_sid() below, so a
++	 * domain that lacks the permission still gets the stock EACCES and never
++	 * EINVAL. An earlier revision put it at the top of the function, ahead of
++	 * the permission check, which inverted the cloak into a one-syscall root
++	 * oracle: every app domain is denied PROCESS__SETCURRENT, so writing a
++	 * hidden type to /proc/self/attr/current returned EINVAL while any other
++	 * string returned EACCES -- a discrimination no stock kernel offers, and
++	 * reachable by an unprivileged app with no selinuxfs access at all.
++	 * List mirrored in selinuxfs.c / avc.c / kernel-audit.c and in the _6_12
++	 * variant, which has always had the correct placement. */
 +	if (__kuid_val(current_uid()) >= 2000 && size && value &&
 +	    (strnstr(value, ":ksu:", size) ||
-+	     strnstr(value, ":ksu_file:", size) || strnstr(value, ":lsposed_file:", size) || strnstr(value, ":zygisk_file:", size)))
++	     strnstr(value, ":ksu_file:", size) ||
++	     strnstr(value, ":lsposed_file:", size) ||
++	     strnstr(value, ":zygisk_file:", size)))
 +		return -EINVAL;
- 
- 	/*
- 	 * Basic control over ability to set these attributes at all.
- 	 */
- 	if (!strcmp(name, "exec"))
++
+ 	/* Obtain a SID for the context, if one was specified. */

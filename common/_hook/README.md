@@ -50,12 +50,26 @@ Two placement rules the guards now follow, and any new site must too:
   domains — making the cloak itself the detector. Placed after the perm check and
   immediately before `security_context_to_sid()`, a hidden type is
   indistinguishable from an absent one for every caller.
-* **`hide_selinux_attr.patch` and `hide_selinux_attr_6_12.patch` are now
-  identical**, both guarding `selinux_lsm_setattr` (which `lsm_set_self_attr(2)`
-  reaches directly, bypassing the old `selinux_setprocattr`-only guard). The
-  builder's `apply_first_of` picks one; whichever it picks lands the guard in the
-  right place. They can be de-duplicated to a single patch once the builder's
-  variant list is updated to match.
+* **The two attr patches are NOT identical, and must not be assumed so.**
+  `hide_selinux_attr_6_12.patch` guards `selinux_lsm_setattr` (which
+  `lsm_set_self_attr(2)` reaches directly) *and* `selinux_inode_setxattr`; its
+  hunks are fitted to the 6.6+ signatures (`struct mnt_idmap *`), so it fails
+  dry-run on 5.10/5.15/6.1. `hide_selinux_attr.patch` is the fallback for those
+  and guards `selinux_setprocattr` only — **`setxattr(security.selinux)` is
+  therefore uncovered on 5.10/5.15/6.1.** Do not read the coverage table above as
+  applying to the fallback.
+
+  History worth keeping: the fallback shipped for a while with its guard at
+  *function entry*, ahead of the `PROCESS__SETCURRENT` check — breaking the first
+  rule above and inverting the cloak into a one-syscall root oracle on those three
+  kernel versions (EINVAL for a hidden type, EACCES for anything else, from an
+  unprivileged app, via its own `/proc/self/attr/current`). It now lands after the
+  perm check and immediately before `security_context_to_sid()`, verified by
+  `git apply` at zero fuzz against v5.10, v5.15, v6.1 **and** v6.12 — so a
+  fallback on 6.12 is also correctly placed, not silently regressed.
+
+  The builder's `apply_first_of` lists `_6_12` FIRST, so 6.6/6.12 keep the richer
+  variant; the fallback only wins where `_6_12` cannot apply.
 
 Verify on the target rather than assume. Run as a **non-root uid** (the gate is
 `uid >= 2000`), and use `dd` rather than `echo` — toybox `echo` does not check
