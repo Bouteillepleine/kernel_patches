@@ -370,6 +370,25 @@ jobs:
       CCACHE_DIR: /home/runner/.ccache
       CCACHE_MAXSIZE: '2G'
       CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
+      # Every KSU fork the builder fleet ships, not just one.
+      #
+      # This used to hardcode KernelSU-Next, which meant the fork that
+      # OnePlus-ReSukiSu_NMS actually builds (ReSukiSU) was never verified and
+      # SukiSU-Ultra never was either. Measured 2026-08-25, fix_selinux_seqno.patch
+      # against each fork's rules.c:
+      #     ReSukiSU/ReSukiSU@main            -F0 clean
+      #     KernelSU-Next/KernelSU-Next@next  -F0 FAILS, applies at fuzz 1
+      #     SukiSU-Ultra/SukiSU-Ultra@main    -F0 FAILS, applies at fuzz 1
+      # Two thirds of the coverage was therefore surviving on fuzz alone: one
+      # whitespace change upstream and the builders fail closed, with nothing here
+      # to have warned first. The apply step below records the fit per fork and
+      # says "fuzz" out loud instead of letting it pass as clean.
+      #
+      # dir|owner/repo|ref  -- dir is where it is cloned inside $KDIR.
+      KSU_FORKS: |
+        ReSukiSU|ReSukiSU/ReSukiSU|main
+        KernelSU-Next|KernelSU-Next/KernelSU-Next|next
+        SukiSU-Ultra|SukiSU-Ultra/SukiSU-Ultra|main
     strategy:
       fail-fast: false
       matrix:
@@ -466,25 +485,91 @@ jobs:
           repo sync -c -j"$(nproc)" --no-tags --optimized-fetch --prune --force-sync
           test -d common
           echo "KDIR=$PWD/common" >> "$GITHUB_ENV"
-      - name: KernelSU-Next + apply fix_selinux_seqno (${{ matrix.version }})
+      - name: KSU forks + apply fix_selinux_seqno (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
         run: |
           set -e
           P="$GITHUB_WORKSPACE/common"; cd "$KDIR"
-          git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
-          test -f KernelSU-Next/kernel/selinux/rules.c
-          # wire like setup.sh (symlink + Makefile + Kconfig)
-          ln -sf "$(realpath KernelSU-Next/kernel)" drivers/kernelsu
+          printf '%s\n' "$KSU_FORKS" | sed '/^[[:space:]]*$/d' > "$GITHUB_WORKSPACE/ksu-forks.txt"
+          # wire like setup.sh (Makefile + Kconfig). The drivers/kernelsu symlink is
+          # repointed per fork in the compile step, so it is not created here.
           grep -q 'kernelsu' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          ( cd KernelSU-Next && patch -p1 < "$P/_hook/fix_selinux_seqno.patch" )
-          # Post-condition: the status-page bump is gone, so /sys/fs/selinux/status
-          # keeps its stock policyload seqno. avc_ss_reset/selnl_notify must remain.
-          if grep -q selinux_status_update_policyload KernelSU-Next/kernel/selinux/rules.c; then
-            echo "seqno: FAIL - selinux_status_update_policyload still present"; exit 1; fi
-          grep -q selnl_notify_policyload KernelSU-Next/kernel/selinux/rules.c || \
-            { echo "seqno: FAIL - selnl_notify_policyload was removed (bootloop risk)"; exit 1; }
-          echo "seqno: status-page bump removed, selnl_notify retained"
+          : > "$GITHUB_WORKSPACE/seqno-fit.txt"
+          BAD=0; FUZZY=0
+          while IFS='|' read -r dir repo ref; do
+            [ -z "$dir" ] && continue
+            echo "::group::$dir ($repo@$ref)"
+            # < /dev/null: git must not eat the fork list this loop is reading.
+            git clone --depth=1 -b "$ref" "https://github.com/$repo" "$dir" < /dev/null
+            if [ ! -f "$dir/kernel/selinux/rules.c" ]; then
+              echo "::error::$repo@$ref: kernel/selinux/rules.c is missing - the patch target moved"
+              printf '%s|%s@%s|MISSING|rules.c not at kernel/selinux/rules.c\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+              BAD=1; echo "::endgroup::"; continue
+            fi
+            # Fit, measured honestly. -F0 is what "clean" means: every context line
+            # matched. Anything that needs the default fuzz has had context ignored
+            # to place the hunk, and _pathhide/README.md already records that a
+            # fuzz-only hunk can land in the wrong function -- so it is reported as
+            # fuzz rather than passing as if it were clean.
+            if ( cd "$dir" && patch -p1 -F0 --dry-run < "$P/_hook/fix_selinux_seqno.patch" >/dev/null 2>&1 ); then
+              fit=clean; note='-F0, every context line matched'
+            elif ( cd "$dir" && patch -p1 --dry-run < "$P/_hook/fix_selinux_seqno.patch" >/dev/null 2>&1 ); then
+              fit=fuzz; note='applies only with fuzz - context has drifted'
+              FUZZY=1
+              echo "::warning::$repo@$ref: fix_selinux_seqno.patch does NOT apply at -F0, only with fuzz. Refit its context before an upstream whitespace change makes this a fail-closed dead build."
+            else
+              fit=FAIL; note='does not apply at any fuzz level'
+              echo "::error::$repo@$ref: fix_selinux_seqno.patch does not apply at all"
+              printf '%s|%s@%s|%s|%s\n' "$dir" "$repo" "$ref" "$fit" "$note" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+              BAD=1; echo "::endgroup::"; continue
+            fi
+            ( cd "$dir" && patch -p1 < "$P/_hook/fix_selinux_seqno.patch" )
+            # Landed where it was meant to: the patch is two pure deletions in
+            # rules.c and nothing else. A fuzz-placed hunk that hit some other
+            # function would still show 0/2 here, so the greps below stay as the
+            # semantic check -- this one catches collateral edits.
+            add=$( cd "$dir" && git diff --numstat -- kernel/selinux/rules.c | awk '{print $1}' )
+            del=$( cd "$dir" && git diff --numstat -- kernel/selinux/rules.c | awk '{print $2}' )
+            files=$( cd "$dir" && git diff --name-only | wc -l | tr -d ' ' )
+            echo "diff: +${add:-0}/-${del:-0} over ${files} file(s)"
+            if [ "${add:-0}" != 0 ] || [ "${del:-0}" != 2 ] || [ "$files" != 1 ]; then
+              echo "::error::$repo@$ref: expected exactly 2 deletions in kernel/selinux/rules.c, got +${add:-0}/-${del:-0} over ${files} file(s)"
+              printf '%s|%s@%s|BADDIFF|+%s/-%s over %s file(s)\n' "$dir" "$repo" "$ref" "${add:-0}" "${del:-0}" "$files" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+              BAD=1; echo "::endgroup::"; continue
+            fi
+            # Post-condition: the status-page bump is gone, so /sys/fs/selinux/status
+            # keeps its stock policyload seqno. avc_ss_reset/selnl_notify must remain.
+            if grep -q selinux_status_update_policyload "$dir/kernel/selinux/rules.c"; then
+              echo "::error::$repo@$ref: selinux_status_update_policyload still present"
+              printf '%s|%s@%s|POSTCOND|status_update_policyload still present\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+              BAD=1; echo "::endgroup::"; continue
+            fi
+            if ! grep -q selnl_notify_policyload "$dir/kernel/selinux/rules.c"; then
+              echo "::error::$repo@$ref: selnl_notify_policyload was removed (bootloop risk)"
+              printf '%s|%s@%s|POSTCOND|selnl_notify_policyload removed\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+              BAD=1; echo "::endgroup::"; continue
+            fi
+            echo "seqno: status-page bump removed, selnl_notify retained ($fit)"
+            printf '%s|%s@%s|%s|%s\n' "$dir" "$repo" "$ref" "$fit" "$note" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+            echo "::endgroup::"
+          done < "$GITHUB_WORKSPACE/ksu-forks.txt"
+          {
+            echo "### seqno patch fit — ${{ matrix.version }} (${{ steps.src.outputs.kind }})"
+            echo
+            echo "| fork | fit | note |"
+            echo "|---|---|---|"
+            while IFS='|' read -r dir src fit note; do
+              echo "| \`$src\` | **$fit** | $note |"
+            done < "$GITHUB_WORKSPACE/seqno-fit.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "--- fit summary ---"; cat "$GITHUB_WORKSPACE/seqno-fit.txt"
+          if [ "$BAD" != 0 ]; then
+            echo "::error::fix_selinux_seqno verification failed on at least one KSU fork (see table)"; exit 1
+          fi
+          if [ "$FUZZY" != 0 ]; then
+            echo "NOTE: at least one fork needs fuzz. Not failing the build for it, but it is not clean either."
+          fi
       - name: Compile rules.o (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
         run: |
@@ -508,10 +593,29 @@ jobs:
           $M prepare
           # generate SELinux headers (flask.h / av_permissions.h) that rules.c pulls in
           $M security/selinux/avc.o
-          $M drivers/kernelsu/selinux/rules.o KCFLAGS="-I$PWD/security/selinux -I$PWD/security/selinux/include"
-          ls -l drivers/kernelsu/selinux/rules.o
+          # One prepared tree, three forks: the expensive half (sync + defconfig +
+          # prepare) is shared, and only rules.o is rebuilt per fork by repointing
+          # the drivers/kernelsu symlink. Objects land next to their own sources
+          # inside each fork dir, so there is nothing stale to collide.
+          FAIL=0
+          while IFS='|' read -r dir repo ref; do
+            [ -z "$dir" ] && continue
+            echo "::group::CC $dir ($repo@$ref)"
+            ln -sfn "$(realpath "$dir/kernel")" drivers/kernelsu
+            # Kconfig differs per fork, so re-resolve the config against this one.
+            ./scripts/config --file .config --enable KSU || true
+            $M olddefconfig >/dev/null
+            if $M drivers/kernelsu/selinux/rules.o KCFLAGS="-I$PWD/security/selinux -I$PWD/security/selinux/include" >/tmp/cc-$dir.log 2>&1; then
+              ls -l "$dir/kernel/selinux/rules.o"
+              echo "CC  $repo@$ref rules.o : OK"
+            else
+              echo "CC  $repo@$ref rules.o : FAIL"; tail -40 /tmp/cc-$dir.log; FAIL=1
+            fi
+            echo "::endgroup::"
+          done < "$GITHUB_WORKSPACE/ksu-forks.txt"
           echo "--- ccache ---"; ccache --show-stats 2>/dev/null | head -12 || true
-          echo "=== ${{ matrix.version }} (${{ steps.src.outputs.kind }}) seqno rules.o: OK ==="
+          echo "=== ${{ matrix.version }} (${{ steps.src.outputs.kind }}) seqno rules.o: $([ $FAIL = 0 ] && echo ALL-OK || echo FAILURES) ==="
+          exit $FAIL
 
       - name: Save ccache
         if: always() && steps.gate.outputs.run == 'yes'
