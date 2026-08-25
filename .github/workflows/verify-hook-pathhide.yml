@@ -1,6 +1,6 @@
-name: 🕵️ verify _hook/_pathhide (OnePlus trees, AOSP fallback)
+name: 🕵️ verify _hook/_pathhide/_ghost (OnePlus trees, AOSP fallback)
 
-# Compiles the objects the _hook/_pathhide patches touch.
+# Compiles the objects the _hook/_pathhide/_ghost patches touch.
 #
 # It used to sync AOSP common GKI for every version, which was wrong in a way
 # that stayed invisible for two days: on 2026-08-21 commit 3b78a31 deliberately
@@ -55,11 +55,13 @@ on:
     paths:
       - 'common/_hook/**'
       - 'common/_pathhide/**'
+      - 'common/_ghost/**'
       - '.github/workflows/verify-hook-pathhide.yml'
   pull_request:
     paths:
       - 'common/_hook/**'
       - 'common/_pathhide/**'
+      - 'common/_ghost/**'
   workflow_dispatch:
     inputs:
       version:
@@ -318,6 +320,87 @@ jobs:
             patch -p1 < "$P/_hook/hide_selinux_selinuxfs_6_12.patch"; echo "selinuxfs: 6_12"
           else patch -p1 < "$P/_hook/hide_selinux_selinuxfs.patch"; echo "selinuxfs: base"; fi
           patch -p1 < "$P/_hook/quiet_selinux_audit_user.patch"
+
+          # ---- _ghost -------------------------------------------------------
+          # Applied AFTER _pathhide on purpose: that is the order the builders
+          # use, and both add a line to fs/proc/Makefile. The two hunks are
+          # anchored apart (pathhide at `obj-y += proc.o`, ghost after
+          # `proc-$(CONFIG_MMU) := task_mmu.o`), so the second one lands with an
+          # offset of 1 and NO fuzz. If that ever stops being true, -F0 below
+          # turns it into a failure here rather than a silent misplacement.
+          #
+          # ghost.c does #include "ghost.h", so both files must be co-located,
+          # and ghost_build_integration.patch wires fs/proc/Makefile.
+          cp "$P/_ghost/ghost.c" fs/proc/ghost.c
+          cp "$P/_ghost/ghost.h" fs/proc/ghost.h
+          # The absence of a /proc node is a MEASURED stealth property of this
+          # patch set (untrusted_app/app_zygote/priv_app all hold `proc:dir
+          # read`, so a plain readdir would list the entry and announce the
+          # patch). Same spirit as the selnl_notify_policyload post-condition in
+          # the seqno job: assert it so it cannot be reintroduced casually.
+          if grep -q 'proc_create' "$P/_ghost/ghost.c"; then
+            echo "::error::_ghost/ghost.c contains proc_create - a self-named /proc entry is a detection surface in its own right"; exit 1
+          fi
+          echo "ghost.c: no proc_create (OK)"
+          # apply_first_of semantics: newest shape first, and the variant that
+          # lands MUST be the one this kernel version claims. A wrong pick is not
+          # a cosmetic downgrade -- three of the four path_*xattr() bodies are
+          # character-identical below `retry:`, so a fallback can place a
+          # -ENOENT guard in the wrong wrapper.
+          GN=ghost_notdir.patch
+          case "$KVER" in
+            6.12|6.6) GX=ghost_xattr_6_12.patch;  GL=ghost_linkat_5_15.patch ;;
+            6.1|5.15) GX=ghost_xattr_5_15.patch;  GL=ghost_linkat_5_15.patch ;;
+            5.10)     GX=ghost_xattr.patch;       GL=ghost_linkat.patch ;;
+            *) echo "::error::no _ghost variant map for KVER=$KVER"; exit 1 ;;
+          esac
+          # The map above is for the OnePlus trees. The two places AOSP common
+          # diverges from them, and only these two:
+          #   6.6  -- OnePlus's android15-6.6 carries the 6.12-era fs/xattr.c
+          #           restructure (setxattr_copy()/xattr_ctx, do_setxattr(), the
+          #           kname buffer in path_removexattr()), so it groups with
+          #           6.12; vanilla v6.6 is its own shape.
+          #   5.10 -- OnePlus's android12-5.10 carries try_to_unlazy() in
+          #           link_path_walk() where vanilla v5.10 still has
+          #           unlazy_walk().
+          if [ "${{ steps.src.outputs.kind }}" = aosp ]; then
+            case "$KVER" in
+              6.6)  GX=ghost_xattr_6_6.patch
+                    echo "_ghost: AOSP 6.6 fallback -> expecting $GX (OnePlus 6.6 wants ghost_xattr_6_12.patch)" ;;
+              5.10) GN=ghost_notdir_5_10.patch
+                    echo "_ghost: AOSP 5.10 fallback -> expecting $GN (OnePlus 5.10 wants ghost_notdir.patch)" ;;
+            esac
+          fi
+          ghost_first_of() {
+            local want="$1"; shift
+            local sel="" hits=0 gp
+            for gp in "$@"; do
+              if patch -p1 -F0 --forward --dry-run < "$P/_ghost/$gp" >/dev/null 2>&1; then
+                hits=$((hits+1))
+                if [ -z "$sel" ]; then sel="$gp"; fi
+              fi
+            done
+            if [ "$hits" -eq 0 ]; then
+              echo "::error::_ghost: no variant applies on $KVER for: $*"; return 1
+            fi
+            if [ "$hits" -ne 1 ]; then
+              echo "::error::_ghost: $hits variants apply on $KVER ($*) - apply_first_of cannot be trusted to pick, refit them so exactly one claims this tree"; return 1
+            fi
+            if [ "$sel" != "$want" ]; then
+              echo "::error::_ghost variant mismatch on $KVER: expected '$want', but '$sel' is the one that applies"; return 1
+            fi
+            patch -p1 -F0 --forward < "$P/_ghost/$sel"
+            echo "_ghost selected ($KVER): $sel"
+          }
+          ghost_first_of ghost_o_path.patch ghost_o_path.patch ghost_o_path_legacy.patch
+          ghost_first_of "$GX" ghost_xattr_6_12.patch ghost_xattr_6_6.patch ghost_xattr_5_15.patch ghost_xattr.patch
+          ghost_first_of "$GL" ghost_linkat_5_15.patch ghost_linkat.patch
+          ghost_first_of "$GN" ghost_notdir.patch ghost_notdir_5_10.patch
+          patch -p1 -F0 --forward < "$P/_ghost/ghost_build_integration.patch"
+          grep -q 'ghost.o' fs/proc/Makefile || { echo "::error::_ghost: ghost.o not wired into fs/proc/Makefile"; exit 1; }
+          grep -q 'pathhide.o' fs/proc/Makefile || { echo "::error::_ghost build hunk displaced _pathhide's in fs/proc/Makefile"; exit 1; }
+          grep -q 'ghost_hidden_path' fs/namei.c || { echo "::error::_ghost: fs/namei.c guards missing"; exit 1; }
+          grep -q 'ghost_hidden_path' fs/xattr.c || { echo "::error::_ghost: fs/xattr.c guards missing"; exit 1; }
           echo "all patches applied"
       - name: Compile affected objects (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
@@ -346,9 +429,32 @@ jobs:
           $M prepare
           FAIL=0
           for o in fs/proc/pathhide.o fs/proc/fd.o fs/proc/task_mmu.o fs/proc/base.o \
+                   fs/proc/ghost.o fs/namei.o fs/xattr.o \
                    security/selinux/hooks.o security/selinux/selinuxfs.o security/selinux/avc.o kernel/audit.o; do
             if $M "$o" >/tmp/cc.log 2>&1; then echo "CC  $o : OK"; else echo "CC  $o : FAIL"; tail -20 /tmp/cc.log; FAIL=1; fi
           done
+          # `make fs/proc/ghost.o` above proves ghost.c COMPILES and nothing
+          # else: kbuild will happily build a single object that is not in
+          # obj-y at all. Only a directory build reads fs/proc/Makefile's obj-y
+          # and rolls the result into built-in.a, so that is what proves the
+          # ghost_build_integration.patch wiring actually took.
+          if $M fs/ >/tmp/cc-fs.log 2>&1; then
+            echo "CC  fs/ (full) : OK"
+            if llvm-ar t out/fs/proc/built-in.a 2>/dev/null | grep -qx 'ghost.o'; then
+              echo "wiring: ghost.o is in fs/proc/built-in.a : OK"
+            else
+              echo "::error::ghost.o is NOT in fs/proc/built-in.a - the obj-y wiring did not take"
+              llvm-ar t out/fs/proc/built-in.a 2>/dev/null | head -30 || true
+              FAIL=1
+            fi
+            if llvm-nm out/fs/proc/built-in.a 2>/dev/null | grep -q 'T ghost_hidden_path'; then
+              echo "wiring: ghost_hidden_path exported from fs/proc/built-in.a : OK"
+            else
+              echo "::error::ghost_hidden_path is not defined in fs/proc/built-in.a"; FAIL=1
+            fi
+          else
+            echo "CC  fs/ (full) : FAIL"; tail -40 /tmp/cc-fs.log; FAIL=1
+          fi
           echo "--- ccache ---"; ccache --show-stats 2>/dev/null | head -12 || true
           echo "=== ${{ matrix.version }} (${{ steps.src.outputs.kind }}): $([ $FAIL = 0 ] && echo ALL-OK || echo FAILURES) ==="
           exit $FAIL

@@ -17,11 +17,13 @@ on:
     paths:
       - 'common/_hook/**'
       - 'common/_pathhide/**'
+      - 'common/_ghost/**'
       - '.github/workflows/verify-patches-oneplus.yml'
   pull_request:
     paths:
       - 'common/_hook/**'
       - 'common/_pathhide/**'
+      - 'common/_ghost/**'
   workflow_dispatch:
     inputs:
       builder:
@@ -78,6 +80,53 @@ jobs:
           #   quiet_audit on 6.6/6.12 else quiet_audit_legacy.
           # fix_selinux_seqno.patch targets kernel/selinux/rules.c, a KernelSU
           # file that does not exist in the common tree -- not verifiable here.
+          #
+          # _ghost is checked SEPARATELY below, because "every patch applies to
+          # every tree" is the wrong assertion for it and would fail that
+          # directory by design: its families are per-version variants selected
+          # by apply_first_of, so a family is green when EXACTLY ONE variant
+          # applies and it is the one this kernel version claims -- not when all
+          # of them do.
+          gfetch() {  # $1 = patch basename under common/_ghost; uses $d/$name/$rev
+            local f
+            for f in $(grep '^--- a/' "$KP/_ghost/$1" | sed 's|^--- a/||' | sort -u); do
+              [ -s "$d/$f" ] && continue
+              mkdir -p "$d/$(dirname "$f")"
+              curl -sfL "https://raw.githubusercontent.com/OnePlusOSS/$name/$rev/$f" -o "$d/$f" || rm -f "$d/$f"
+            done
+          }
+          ghave() {   # $1 = patch basename; every file it touches present?
+            local f
+            for f in $(grep '^--- a/' "$KP/_ghost/$1" | sed 's|^--- a/||' | sort -u); do
+              [ -s "$d/$f" ] || return 1
+            done
+            return 0
+          }
+          # $1 = the variant this kernel version REQUIRES, $2.. = candidates in
+          # the builder's newest-first order. -F0 because a fuzz-placed hunk can
+          # land a -ENOENT guard in the wrong function: three of the four
+          # path_*xattr() bodies are character-identical below `retry:`.
+          gfam() {
+            local want="$1"; shift
+            local sel="" hits=0 gp any=0
+            for gp in "$@"; do
+              gfetch "$gp"
+              ghave "$gp" || continue
+              any=1
+              if (cd "$d" && patch -p1 -F0 --forward --dry-run < "$KP/_ghost/$gp" >/dev/null 2>&1); then
+                hits=$((hits+1))
+                if [ -z "$sel" ]; then sel="$gp"; fi
+              fi
+            done
+            if [ "$any" = 0 ]; then row="$row n/a:g-${want%.patch}"; return 0; fi
+            if [ "$hits" -ne 1 ]; then
+              row="$row ***g-${want%.patch}:${hits}-variants-apply***"; bad=1; return 0
+            fi
+            if [ "$sel" != "$want" ]; then
+              row="$row ***g-${want%.patch}:got-${sel%.patch}***"; bad=1; return 0
+            fi
+            row="$row ok"
+          }
           while read -r name rev; do
             [ -n "$name" ] || continue
             d=".verify/t/$name-${rev:0:8}"; mkdir -p "$d"
@@ -112,6 +161,28 @@ jobs:
                 row="$row ***$(basename "$p")***"; bad=1
               fi
             done
+            # NB 6.6: the OnePlus android15-6.6 trees carry the 6.12-era
+            # fs/xattr.c restructure (setxattr_copy()/xattr_ctx, do_setxattr(),
+            # the kname buffer in path_removexattr()), so they group with 6.12
+            # and NOT with vanilla v6.6. ghost_xattr_6_6.patch covers a shape no
+            # tree in this fleet has -- if it ever starts winning here, the tree
+            # changed, not the patch.
+            case "$kv" in
+              6.12|6.6) GX=ghost_xattr_6_12.patch ; GL=ghost_linkat_5_15.patch ;;
+              6.1|5.15) GX=ghost_xattr_5_15.patch ; GL=ghost_linkat_5_15.patch ;;
+              5.10)     GX=ghost_xattr.patch      ; GL=ghost_linkat.patch ;;
+              *)        GX=                       ; GL= ;;
+            esac
+            if [ -n "$GX" ]; then
+              gfam ghost_o_path.patch ghost_o_path.patch ghost_o_path_legacy.patch
+              gfam "$GX" ghost_xattr_6_12.patch ghost_xattr_6_6.patch ghost_xattr_5_15.patch ghost_xattr.patch
+              gfam "$GL" ghost_linkat_5_15.patch ghost_linkat.patch
+              gfam ghost_notdir.patch ghost_notdir.patch ghost_notdir_5_10.patch
+              gfam ghost_build_integration.patch ghost_build_integration.patch
+            else
+              echo "::warning::$name @ ${rev:0:8}: no _ghost variant map for k=$kv - _ghost not checked on this tree"
+              row="$row skip:ghost"
+            fi
             checked=$((checked+1))
             if [ "$bad" = 1 ]; then
               fails=$((fails+1))
@@ -123,4 +194,5 @@ jobs:
           echo
           echo "trees checked: $checked   failed: $fails   skipped: $skipped"
           [ "$fails" -eq 0 ] || { echo "::error::$fails tree(s) reject at least one patch - the builders will fail on these"; exit 1; }
-          echo "every patch applies on every tree the fleet builds"
+          echo "every _hook/_pathhide patch applies on every tree the fleet builds,"
+          echo "and every _ghost family resolves to exactly one variant - the one its kernel version claims"
