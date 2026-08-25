@@ -1,0 +1,77 @@
+Close the link(2) -EXDEV existence oracle.
+
+  link(p, "/data/local/tmp/x")
+
+returns -EXDEV for a hidden path (the source is on a different mount from the
+target, always true for /system vs /data on Android) where an absent name gives
+-ENOENT. The weakest of the four oracles by information content -- it yields one
+bit and no path or label -- but it is a complete substitute for the other three,
+so leaving it open would undo them. Measured on OP15 (Android 16, 6.12.23)
+against all 24 blocked uids with a 7020-path genuinely-absent control and zero
+false positives.
+
+WHY THE ENGINE CANNOT ANSWER IT
+
+do_linkat() resolves the source with filename_lookup() (older trees:
+user_path_at()) and performs NO permission check on the final component, then
+tests old_path.mnt != new_path.mnt and returns -EXDEV -- all before may_linkat()
+and security_path_link() run. Nothing the engine hijacks is consulted. Verified
+against v6.12 fs/namei.c.
+
+WHERE THE GUARD GOES, AND WHY THERE
+
+Immediately after the source lookup succeeds, before filename_create() builds
+the target dentry -- so the guard also runs before the target directory is
+touched at all, which is what an absent source would have done. Failing later,
+at the -EXDEV test, would already have created and held the new dentry.
+
+The error path is the function's own: on 5.15+ `goto out_putpath`, which
+path_put()s old_path exactly once; on older trees a direct path_put() + return,
+matching the shape those trees use. For the placement argument -- why an
+EXISTENCE cloak belongs ahead of the file-level permission check, the opposite
+of common/_hook/'s rule -- see the header of ghost_o_path.patch.
+
+RISK NOTE
+
+This is fs/namei.c, but it is not the lookup path: do_linkat() is reached only
+by link(2)/linkat(2), which no Android hot path uses. The guard adds nothing to
+any other syscall.
+
+NOT applicable to 6.13+: do_linkat() no longer exists on torvalds/master (the
+linkat path was reworked alongside filename_unlinkat()/filename_symlinkat()).
+No patch is written for it because the builder fleet pins nothing above 6.12.
+
+APPLIES TO
+
+Verified at fuzz 0 against vanilla v5.15, v6.1, v6.6 and v6.12, and against
+the pinned OnePlus android13-5.15, android14-6.1, android15-6.6 and
+android16-6.12 trees -- one hunk shape for all eight. This is the
+`filename_lookup()` / `goto out_putnames` era; try this file first and fall
+back to ghost_linkat.patch.
+
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -4769,6 +4769,7 @@
+ 	struct inode *delegated_inode = NULL;
+ 	int how = 0;
+ 	int error;
++	extern bool ghost_hidden_path(const struct path *gp);
+ 
+ 	if ((flags & ~(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH)) != 0) {
+ 		error = -EINVAL;
+@@ -4789,6 +4790,15 @@
+ 	error = filename_lookup(olddfd, old, how, &old_path, NULL);
+ 	if (error)
+ 		goto out_putnames;
++	/*
++	 * do_linkat() returns -EXDEV on the mount mismatch before
++	 * may_linkat() runs, so the engine never sees this path. -EXDEV
++	 * proves the name exists; an absent name gives -ENOENT here.
++	 */
++	if (ghost_hidden_path(&old_path)) {
++		error = -ENOENT;
++		goto out_putpath;
++	}
+ 
+ 	new_dentry = filename_create(newdfd, new, &new_path,
+ 					(how & LOOKUP_REVAL));

@@ -1,0 +1,35 @@
+Optional helper -- most builders wire ghost.o themselves (append
+`obj-y += ghost.o` to the Makefile of whichever directory they drop ghost.c in).
+This hunk is the fs/proc variant: copy ghost.c AND ghost.h into fs/proc/
+(co-located, so ghost.c's #include "ghost.h" resolves), then apply.
+
+fs/proc/ rather than fs/ for two reasons: it is where _pathhide already puts
+pathhide.c, so a builder that ships both copies four files into one directory;
+and fs/Makefile is edited by the nomount engine patches, while fs/proc/Makefile
+is not.
+
+Deliberately unconditional obj-y (no CONFIG_GHOST), for the same reason
+_pathhide's build hunk is: a new symbol in /proc/config.gz would out the patch
+to anything that reads it, which is precisely what this patch set exists to
+prevent. ghost.c is inert until configured, so an unconditional build costs a
+few hundred bytes of text and PATH_MAX per CPU, and changes no behaviour.
+
+ANCHORED AWAY FROM _pathhide'S HUNK ON PURPOSE. pathhide_build_integration.patch
+inserts at `obj-y += proc.o` (lines 6-7); this one inserts after
+`proc-$(CONFIG_MMU) := task_mmu.o` (lines 9-10). The two never overlap, so they
+apply in either order -- the second one applied just picks up an offset of 1,
+which `patch -F0` accepts (offset is not fuzz). Verified both orders.
+
+The anchor lines are byte-identical in fs/proc/Makefile on v4.9 through
+torvalds/master and on all five pinned OnePlus trees.
+--- a/fs/proc/Makefile
++++ b/fs/proc/Makefile
+@@ -9,6 +9,8 @@
+ proc-y			:= nommu.o task_nommu.o
+ proc-$(CONFIG_MMU)	:= task_mmu.o
+ 
++obj-y			+= ghost.o
++
+ proc-y       += inode.o root.o base.o generic.o array.o \
+ 		fd.o
+ proc-$(CONFIG_TTY)      += proc_tty.o

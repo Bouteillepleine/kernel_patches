@@ -1,0 +1,78 @@
+Close the -ENOTDIR trailing-component existence oracle.
+
+  stat(p "/zzz")
+
+returns -ENOTDIR when p is a hidden regular file, where an absent p gives
+-ENOENT. Measured on OP15 (Android 16, 6.12.23) against all 24 blocked uids with
+a 7020-path genuinely-absent control and zero false positives.
+
+WHY THE ENGINE CANNOT ANSWER IT
+
+link_path_walk() tests d_can_lookup(nd->path.dentry) -- a pure dentry-type test
+-- on the component it has just stepped into, and bails before the next
+may_lookup(). The engine's hijacked ops for that inode are never reached, so it
+cannot turn the answer into -ENOENT. Verified against v6.12 fs/namei.c.
+
+WHERE THE GUARD GOES, AND WHY THERE
+
+Inside the existing `if (unlikely(!d_can_lookup(nd->path.dentry)))` block,
+after the LOOKUP_RCU unlazy step and immediately before `return -ENOTDIR;`.
+
+Two properties make this the only acceptable spot in this function:
+
+ 1. It is COLD despite living in the hottest function in the VFS. The enclosing
+    branch is already marked unlikely() and is only entered on a walk that is
+    about to fail; the common case never evaluates the guard. Nothing is added
+    to the per-component fast path.
+
+ 2. The path is STABLE there. ghost_hidden_path() renders d_path(), which is not
+    safe during an RCU walk. The stock code immediately above already calls
+    try_to_unlazy()/unlazy_walk() and returns -ECHILD if it fails, so by the
+    time the guard runs the walk is guaranteed to be in ref-walk mode with a
+    reference-counted nd->path. Placing the guard ABOVE that unlazy step would
+    read an unstable path under RCU. Do not move it up.
+
+Returning -ENOENT from here is the same kind of return the stock -ENOTDIR is:
+link_path_walk() returns the error to path_lookupat(), which calls
+terminate_walk() on the way out. No extra cleanup is needed, and none is added.
+
+RISK NOTE, AND WHY THIS ONE RANKS LAST
+
+Of the four guards this is the one in genuinely dangerous code. The hunk is
+tiny and its context is unambiguous, but a misapplied hunk in link_path_walk()
+is a bootloop, not a failed boot animation. It is also the second-weakest of the
+four by information content (one bit, no path, no label). If only some of the
+_ghost patches are to be shipped, this is the one to drop -- see README.md.
+
+APPLIES TO
+
+Verified at fuzz 0 against vanilla v5.15, v6.1, v6.6, v6.12 and
+torvalds/master, and against ALL FIVE pinned OnePlus trees -- including
+android12-5.10, whose link_path_walk() carries the try_to_unlazy() form even
+though vanilla v5.10 does not. So every tree the builder fleet actually
+resolves is covered by this one file; ghost_notdir_5_10.patch exists only for
+a build from AOSP common android12-5.10.
+
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -2426,10 +2426,20 @@
+ 			continue;
+ 		}
+ 		if (unlikely(!d_can_lookup(nd->path.dentry))) {
++			extern bool ghost_hidden_path(const struct path *gp);
++
+ 			if (nd->flags & LOOKUP_RCU) {
+ 				if (!try_to_unlazy(nd))
+ 					return -ECHILD;
+ 			}
++			/*
++			 * A non-final component that is not a
++			 * directory gives -ENOTDIR, which proves
++			 * the name exists. For a path hidden from
++			 * this uid, say what an absent name says.
++			 */
++			if (ghost_hidden_path(&nd->path))
++				return -ENOENT;
+ 			return -ENOTDIR;
+ 		}
+ 	}

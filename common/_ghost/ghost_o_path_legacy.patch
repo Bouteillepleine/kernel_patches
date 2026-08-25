@@ -1,0 +1,45 @@
+Fallback of ghost_o_path.patch for v4.9 and v4.14.
+
+Identical guard, identical placement, identical reasoning -- see the header of
+ghost_o_path.patch, which is the design record for both. The ONLY difference is
+the trailing context line: before v4.19, vfs_open() took a third argument,
+
+	error = vfs_open(&path, file, current_cred());
+
+so the v4.19+ hunk fails dry-run here and this one fails dry-run there. They are
+mutually exclusive by construction; a builder should try _ghost's primary patch
+first and fall back to this one, the same way the _hook builder lists
+hide_selinux_attr_6_12.patch ahead of its fallback.
+
+Verified at fuzz 0 against v4.9 and v4.14 fs/namei.c
+(https://raw.githubusercontent.com/torvalds/linux/v4.9/fs/namei.c and .../v4.14/...).
+It is NOT verified against a real 4.9/4.14 OEM tree: the builder fleet pins no
+OnePlus tree older than 5.10, so there was nothing device-accurate to test it
+on. Treat 4.9/4.14 coverage as vanilla-only.
+
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3416,11 +3416,23 @@ static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
+ static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
+ {
+ 	struct path path;
+ 	int error = path_lookupat(nd, flags, &path);
++	extern bool ghost_hidden_path(const struct path *gp);
++
+ 	if (!error) {
++		/*
++		 * O_PATH reaches neither ->open nor ->permission, so a path the
++		 * NoMount engine hides from this uid would otherwise be handed
++		 * straight back through /proc/self/fd/N. Fail where the lookup
++		 * would have failed had the name not existed.
++		 */
++		if (ghost_hidden_path(&path)) {
++			path_put(&path);
++			return -ENOENT;
++		}
+ 		audit_inode(nd->name, path.dentry, 0);
+ 		error = vfs_open(&path, file, current_cred());
+ 		path_put(&path);
+ 	}
+ 	return error;
+ }

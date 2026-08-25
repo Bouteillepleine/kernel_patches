@@ -1,0 +1,84 @@
+Close the O_PATH existence oracle.
+
+  open(p, O_PATH) then readlink("/proc/self/fd/N")
+
+is the loudest of the four "existence" oracles NoMount's per-inode op hijack
+cannot answer: on a hidden path it succeeds and hands the caller the full
+path back, where an absent path gives -ENOENT. Measured on OP15 (Android 16,
+6.12.23) against all 24 blocked uids, with a 7020-path genuinely-absent
+control that produced zero false positives.
+
+WHY THE ENGINE CANNOT ANSWER IT
+
+fs/open.c stamps FMODE_PATH before security_file_open() ever runs:
+
+	if (unlikely(f->f_flags & O_PATH)) {
+		f->f_mode = FMODE_PATH | FMODE_OPENED;
+		...
+
+and path_openat() diverts O_PATH into do_o_path(), which never calls
+may_open(). So neither ->open nor ->permission runs, and the hijacked inode
+and file operations are never consulted. There is nothing to hook. Verified
+against v6.12 fs/open.c and fs/namei.c.
+
+WHERE THE GUARD GOES, AND WHY THERE
+
+Immediately after path_lookupat() returns success, before audit_inode() and
+before vfs_open(). That is the earliest point at which a fully resolved,
+reference-counted struct path exists.
+
+This is the opposite placement rule from common/_hook/, and the difference is
+not an oversight -- read this before moving it. _hook cloaks a STRING (a
+SELinux type) in a syscall that reaches the same code either way, so a guard
+ahead of the stock permission check answers -EINVAL where a denied caller
+would have got -EACCES, and the cloak becomes the detector. That inversion
+shipped once and made 5.10/5.15/6.1 more detectable than unpatched.
+
+Here the thing being cloaked is the EXISTENCE OF A PATH COMPONENT, and for a
+component that genuinely does not exist the kernel never performs any
+file-level permission check at all -- the lookup fails first. So the faithful
+emulation is to fail at exactly the point the lookup would have failed, ahead
+of every file-level check. The parent directory's search permission is still
+enforced, because path_lookupat() has already enforced it: a caller who
+cannot search the parent gets -EACCES out of path_lookupat() and never
+reaches this guard, exactly as it would for an absent name.
+
+ghost_hidden_path() is false unless the caller's real uid is in the
+configured hidden set AND the rendered path matches a configured rule, so a
+caller that is not being hidden from is unaffected, and a kernel whose tables
+are empty (i.e. one built without the nomount engine's control-plane
+forwarder) never changes behaviour at all. See common/_ghost/ghost.c.
+
+APPLIES TO
+
+do_o_path() is byte-identical from v4.19 through torvalds/master, and on all
+five pinned OnePlus trees the builder fleet uses -- verified by md5 of the
+extracted function body. v4.9 and v4.14 differ only in vfs_open() taking a
+third current_cred() argument; use ghost_o_path_legacy.patch there.
+
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3901,11 +3901,23 @@ static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
+ static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
+ {
+ 	struct path path;
+ 	int error = path_lookupat(nd, flags, &path);
++	extern bool ghost_hidden_path(const struct path *gp);
++
+ 	if (!error) {
++		/*
++		 * O_PATH reaches neither ->open nor ->permission, so a path the
++		 * NoMount engine hides from this uid would otherwise be handed
++		 * straight back through /proc/self/fd/N. Fail where the lookup
++		 * would have failed had the name not existed.
++		 */
++		if (ghost_hidden_path(&path)) {
++			path_put(&path);
++			return -ENOENT;
++		}
+ 		audit_inode(nd->name, path.dentry, 0);
+ 		error = vfs_open(&path, file);
+ 		path_put(&path);
+ 	}
+ 	return error;
+ }

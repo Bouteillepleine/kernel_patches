@@ -1,0 +1,145 @@
+Close the *xattr(2) existence oracle on all four path_*xattr() wrappers.
+
+  getxattr(p, "security.selinux")   ->  hands back the SELinux label
+  listxattr(p, ...)                 ->  answers for a path stat() denies
+  setxattr(p, ...)                  ->  -EROFS on a read-only ROM partition
+  removexattr(p, ...)               ->  same
+
+where a genuinely absent name gives -ENOENT to all four. The getxattr form was
+measured on OP15 (Android 16, 6.12.23) against all 24 blocked uids with a
+7020-path genuinely-absent control and zero false positives; the listxattr form
+had already been measured leaking on this device (it answered for a uid that
+stat() and open() denied).
+
+WHY THE ENGINE CANNOT ANSWER IT
+
+vfs_getxattr() routes anything under the "security." prefix to
+xattr_getsecurity() -> security_inode_getsecurity(), answered out of the inode's
+in-memory LSM blob -- the filesystem's own xattr handler is never reached, so
+the hijacked inode_operations cannot intervene. xattr_permission() also returns
+0 for security.* and system.* without calling inode_permission(), with the
+comment "No restriction for security.* and system.* from the VFS." Verified
+against v6.12 fs/xattr.c.
+
+WHY ALL FOUR, NOT JUST getxattr
+
+They are four independent probes of one bit. Closing getxattr alone leaves
+three one-syscall replacements, so a partial cloak buys nothing while still
+carrying all the risk of a cloak. Same reasoning as _hook's rule that a type
+added to the hidden list has to be added at every call site.
+
+WHERE THE GUARD GOES, AND WHY THERE
+
+In each path_*xattr() syscall wrapper, immediately after user_path_at() returns
+success -- not in vfs_getxattr() and friends, which in-kernel consumers
+(overlayfs copy-up, nfsd, ecryptfs) reach in the calling task's context and
+would therefore pass the uid gate.
+
+For the placement argument -- why an EXISTENCE cloak belongs AHEAD of the
+file-level permission check, which is the opposite of the rule common/_hook/
+follows -- see the header of ghost_o_path.patch. Short version: for a name that
+does not exist the kernel never performs a file-level check at all, and the
+parent's search permission is still enforced because user_path_at() enforced it
+before this guard runs.
+
+f*xattr(2) (the fd forms) are deliberately NOT guarded: they need a descriptor
+for the hidden path, and every route to one is closed already -- the engine's
+hijacked ->open answers -ENOENT and ghost_o_path.patch closes the O_PATH route.
+
+NOT applicable to 6.13+, where fs/xattr.c was restructured (path_getxattr()
+became path_getxattrat() delegating to filename_getxattr(), and the wrappers
+took a kernel_xattr_ctx). The equivalent 6.13+ sites are filename_getxattr() /
+filename_listxattr() / filename_setxattr() / filename_removexattr(); no patch is
+written for them because the builder fleet pins nothing above 6.12.
+
+Hunk order follows file order: setxattr, getxattr, listxattr, removexattr.
+
+APPLIES TO
+
+Verified at fuzz 0 against vanilla v6.6 only. No tree in the builder fleet
+resolves to this shape -- OnePlus's own android15-6.6 tree has the later
+fs/xattr.c and is covered by ghost_xattr_6_12.patch. Kept so a build from
+AOSP common android15-6.6 is not left uncovered.
+
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -662,11 +662,18 @@
+ {
+ 	struct path path;
+ 	int error;
++	extern bool ghost_hidden_path(const struct path *gp);
+ 
+ retry:
+ 	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
+ 	if (error)
+ 		return error;
++	/* Same existence oracle as getxattr(2); see fs/namei.c's
++	 * do_o_path() guard for the placement argument. */
++	if (ghost_hidden_path(&path)) {
++		path_put(&path);
++		return -ENOENT;
++	}
+ 	error = mnt_want_write(path.mnt);
+ 	if (!error) {
+ 		error = setxattr(mnt_idmap(path.mnt), path.dentry, name,
+@@ -781,10 +788,22 @@
+ {
+ 	struct path path;
+ 	ssize_t error;
++	extern bool ghost_hidden_path(const struct path *gp);
++
+ retry:
+ 	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
+ 	if (error)
+ 		return error;
++	/*
++	 * security.* is answered from the inode's LSM blob, so the
++	 * filesystem never sees the request and the engine has nothing
++	 * to hook. Fail where the lookup would have failed had the name
++	 * not existed.
++	 */
++	if (ghost_hidden_path(&path)) {
++		path_put(&path);
++		return -ENOENT;
++	}
+ 	error = getxattr(mnt_idmap(path.mnt), path.dentry, name, value, size);
+ 	path_put(&path);
+ 	if (retry_estale(error, lookup_flags)) {
+@@ -858,10 +877,18 @@
+ {
+ 	struct path path;
+ 	ssize_t error;
++	extern bool ghost_hidden_path(const struct path *gp);
++
+ retry:
+ 	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
+ 	if (error)
+ 		return error;
++	/* Same existence oracle as getxattr(2); see fs/namei.c's
++	 * do_o_path() guard for the placement argument. */
++	if (ghost_hidden_path(&path)) {
++		path_put(&path);
++		return -ENOENT;
++	}
+ 	error = listxattr(path.dentry, list, size);
+ 	path_put(&path);
+ 	if (retry_estale(error, lookup_flags)) {
+@@ -923,10 +950,18 @@
+ {
+ 	struct path path;
+ 	int error;
++	extern bool ghost_hidden_path(const struct path *gp);
++
+ retry:
+ 	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
+ 	if (error)
+ 		return error;
++	/* Same existence oracle as getxattr(2); see fs/namei.c's
++	 * do_o_path() guard for the placement argument. */
++	if (ghost_hidden_path(&path)) {
++		path_put(&path);
++		return -ENOENT;
++	}
+ 	error = mnt_want_write(path.mnt);
+ 	if (!error) {
+ 		error = removexattr(mnt_idmap(path.mnt), path.dentry, name);
