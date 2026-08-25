@@ -1,0 +1,121 @@
+Close the mkdirat(2)/mknodat(2) existence oracle.
+
+  mkdirat(AT_FDCWD, p, 0700)
+  mknodat(AT_FDCWD, p, S_IFIFO|0600, 0)
+
+MEASURED on OP15 (Android 16, 6.12.23, engine v26, Suite v1.3.60) as hidden uid
+10422 against /product/etc/permissions, with TWO controls -- an absent sibling
+and a stock-VISIBLE sibling -- and repeated three times:
+
+  hidden injected path   -> EEXIST
+  genuinely absent path  -> EROFS
+  stock visible file     -> EEXIST
+
+So a hidden path answers exactly like an ordinary existing file AND differs from
+an absent one. That is the strongest shape a tell can take: a scanner needs one
+mkdirat() and no control path at all.
+
+The probed path was the single entry in the live _ghost table at the time, so
+this is a HOLE IN THE CLOAK, not merely an unenumerated neighbour.
+
+A THIRD ORDERING
+
+The two mechanisms this directory already documents do not explain it:
+
+  1. the syscall never reaches a file-level op (O_PATH, *xattr, ENOTDIR, link)
+  2. mnt_want_write() answers first (truncate, utimensat, chmod)
+
+This is neither. filename_create() calls mnt_want_write() EARLY and deliberately
+keeps going -- "don't fail immediately if it's r/o, at least try to report other
+errors" -- stashing the result in err2. It then does the exclusive lookup, and a
+POSITIVE dentry returns -EEXIST before err2 is ever consulted. A negative dentry
+falls through to `if (unlikely(err2))` and reports -EROFS. Existence wins over
+the write check, which is the opposite order from truncate.
+
+WHY THE FIX IS NOT -ENOENT
+
+Every other guard in this directory returns -ENOENT, because for those syscalls
+that is what an absent path reports. Here it is NOT: an absent name reports
+EROFS instead. Returning -ENOENT would leave the path still distinguishable
+from an absent one, merely inverted -- a new oracle in place of the old. The
+guard has to report err2, the very error the absent path would have reached.
+
+WHERE THE GUARD GOES, AND WHY THERE
+
+Inside the `d_is_positive(dentry)` arm, after the lookup and before `goto fail`.
+That is AFTER the parent's search permission has been enforced, so a caller who
+cannot search the directory still gets -EACCES exactly as it would for an absent
+name, and it is on the path that ALREADY refuses to create anything -- the arm
+ends in `goto fail` either way, so this can never turn into a create.
+
+`err2 &&` is tested first, cheapest-first like ghost_hidden_path()'s own gates:
+no path is rendered on a writable mount. On a writable mount an absent name
+would be CREATED here, and that cannot be emulated without clobbering the file
+being hidden, so -EEXIST stands -- no worse than an unpatched kernel.
+
+filename_create() is shared by mkdirat, mknodat, symlinkat and linkat's target,
+so one guard covers all four. do_renameat2() does its own lookup and is NOT
+routed through here -- measured clean (hidden EROFS, absent EROFS), because
+there mnt_want_write does win.
+
+APPLIES TO
+
+The `error = -EEXIST;` / `d_is_positive(dentry)` block in filename_create() is
+byte-identical on all five fleet kernel versions (v5.10, v5.15, v6.1, v6.6,
+v6.12) even though the lookup ABOVE it is not -- 5.10 calls __lookup_hash(),
+6.12 calls lookup_one_qstr_excl(), and 6.12 splits the call across two lines.
+That is why the context below starts at `goto unlock;` and not at the lookup:
+three lines of context is the most that is common to all five.
+
+`error = -EEXIST;` appears TWICE in every one of these files. The second is in
+do_renameat2(), where it reads `if ((flags & RENAME_NOREPLACE) &&
+d_is_positive(new_dentry))` and has NO blank line above it. The blank line in
+the context below is what pins this hunk to filename_create(); the trailing
+`Special case` comment pins it again. Do not shorten either end.
+
+DO NOT HAND-AUTHOR THE HUNK
+
+Generate it: apply the change to a real tree and `diff -u`. A hand-written hunk
+here had four leading context lines and three trailing -- self-consistent counts,
+byte-identical context, correct start line -- and `patch -F0` refused it on all
+five trees while `git apply` took it silently. Regenerating with symmetric
+context fixed it; -U3 and -U4 both apply, the asymmetric one does not.
+
+Verify with `patch -p1 -F0 --dry-run`, never with `git apply --check`: git is the
+more permissive of the two, and the builders use patch.
+
+Dry-run at -F0 against v5.10, v5.15, v6.1, v6.6 and v6.12: applies to all five,
+landing inside filename_create() on each (offsets -420, -191, -151, -144, 0).
+
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -4038,8 +4038,28 @@
+ 		goto unlock;
+ 
+ 	error = -EEXIST;
+-	if (d_is_positive(dentry))
++	if (d_is_positive(dentry)) {
++		extern bool ghost_hidden_path(const struct path *gp);
++		struct path gpath = { .mnt = path->mnt, .dentry = dentry };
++
++		/*
++		 * A hidden name must fail here the way an ABSENT one does. An
++		 * absent name gets a negative dentry, falls past this test and
++		 * lands on err2 -- -EROFS on a read-only ROM mount. -EEXIST
++		 * says the name is there, which is the one bit the hiding
++		 * exists to withhold, and it is what a stock VISIBLE file
++		 * reports too.
++		 *
++		 * Only when err2 is set. On a writable mount an absent name
++		 * would be CREATED here, and that cannot be emulated without
++		 * clobbering the file being hidden, so -EEXIST stands. Either
++		 * way this arm ends in `goto fail`, so the guard can never
++		 * turn into a create.
++		 */
++		if (err2 && ghost_hidden_path(&gpath))
++			error = err2;
+ 		goto fail;
++	}
+ 
+ 	/*
+ 	 * Special case - lookup gave negative, but... we had foo/bar/

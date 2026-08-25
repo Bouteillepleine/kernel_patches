@@ -349,9 +349,9 @@ jobs:
           # -ENOENT guard in the wrong wrapper.
           GN=ghost_notdir.patch
           case "$KVER" in
-            6.12|6.6) GX=ghost_xattr_6_12.patch;  GL=ghost_linkat_5_15.patch ;;
-            6.1|5.15) GX=ghost_xattr_5_15.patch;  GL=ghost_linkat_5_15.patch ;;
-            5.10)     GX=ghost_xattr.patch;       GL=ghost_linkat.patch ;;
+            6.12|6.6) GX=ghost_xattr_6_12.patch;  GL=ghost_linkat_5_15.patch; GC=ghost_chmod.patch ;;
+            6.1|5.15) GX=ghost_xattr_5_15.patch;  GL=ghost_linkat_5_15.patch; GC=ghost_chmod_5_10.patch ;;
+            5.10)     GX=ghost_xattr.patch;       GL=ghost_linkat.patch;      GC=ghost_chmod_5_10.patch ;;
             *) echo "::error::no _ghost variant map for KVER=$KVER"; exit 1 ;;
           esac
           # The map above is for the OnePlus trees. The two places AOSP common
@@ -396,11 +396,33 @@ jobs:
           ghost_first_of "$GX" ghost_xattr_6_12.patch ghost_xattr_6_6.patch ghost_xattr_5_15.patch ghost_xattr.patch
           ghost_first_of "$GL" ghost_linkat_5_15.patch ghost_linkat.patch
           ghost_first_of "$GN" ghost_notdir.patch ghost_notdir_5_10.patch
+          # The mnt_want_write() half of the class. These shipped with the
+          # builders and were never added here, so this job verified four of the
+          # seven guard families while reporting on all of them.
+          patch -p1 -F0 --forward < "$P/_ghost/ghost_truncate.patch"
+          patch -p1 -F0 --forward < "$P/_ghost/ghost_utimes.patch"
+          ghost_first_of "$GC" ghost_chmod.patch ghost_chmod_5_10.patch
+          # filename_create(): mkdirat/mknodat answer EEXIST on a hidden name
+          # where an absent one answers EROFS. A third ordering -- existence is
+          # decided BEFORE err2 is consulted -- so this one reports err2 rather
+          # than ENOENT. Shared by mkdirat, mknodat, symlinkat and linkat.
+          patch -p1 -F0 --forward < "$P/_ghost/ghost_create.patch"
           patch -p1 -F0 --forward < "$P/_ghost/ghost_build_integration.patch"
           grep -q 'ghost.o' fs/proc/Makefile || { echo "::error::_ghost: ghost.o not wired into fs/proc/Makefile"; exit 1; }
           grep -q 'pathhide.o' fs/proc/Makefile || { echo "::error::_ghost build hunk displaced _pathhide's in fs/proc/Makefile"; exit 1; }
           grep -q 'ghost_hidden_path' fs/namei.c || { echo "::error::_ghost: fs/namei.c guards missing"; exit 1; }
           grep -q 'ghost_hidden_path' fs/xattr.c || { echo "::error::_ghost: fs/xattr.c guards missing"; exit 1; }
+          # Per-family, because "namei.c mentions ghost_hidden_path" is satisfied
+          # by ANY one of the three guards that live there.
+          grep -q 'ghost_hidden_path' fs/open.c || { echo "::error::_ghost: fs/open.c guards missing (truncate/chmod)"; exit 1; }
+          grep -q 'ghost_hidden_path' fs/utimes.c || { echo "::error::_ghost: fs/utimes.c guard missing (utimensat)"; exit 1; }
+          grep -q 'err2 && ghost_hidden_path' fs/namei.c || { echo "::error::_ghost: filename_create guard missing (mkdirat/mknodat)"; exit 1; }
+          # It must be in filename_create, NOT do_renameat2 -- both contain an
+          # `error = -EEXIST;` and a fuzzed hunk could land in the wrong one.
+          awk '/ghost_hidden_path\(&gpath\)/{found=NR} END{exit !found}' fs/namei.c || { echo "::error::_ghost: create guard not found by name"; exit 1; }
+          if awk '/^int do_renameat2/,/^}/' fs/namei.c | grep -q 'ghost_hidden_path'; then
+            echo "::error::_ghost: the create guard landed in do_renameat2() instead of filename_create()"; exit 1
+          fi
           echo "all patches applied"
       - name: Compile affected objects (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
@@ -429,7 +451,7 @@ jobs:
           $M prepare
           FAIL=0
           for o in fs/proc/pathhide.o fs/proc/fd.o fs/proc/task_mmu.o fs/proc/base.o \
-                   fs/proc/ghost.o fs/namei.o fs/xattr.o \
+                   fs/proc/ghost.o fs/namei.o fs/xattr.o fs/open.o fs/utimes.o \
                    security/selinux/hooks.o security/selinux/selinuxfs.o security/selinux/avc.o kernel/audit.o; do
             if $M "$o" >/tmp/cc.log 2>&1; then echo "CC  $o : OK"; else echo "CC  $o : FAIL"; tail -20 /tmp/cc.log; FAIL=1; fi
           done
