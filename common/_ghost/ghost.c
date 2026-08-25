@@ -124,7 +124,17 @@
 #include <linux/types.h>
 #include "ghost.h"
 
-#define GH_MAX_RULES	256
+/* 256 was not enough for a real device. Measured on OP15 (2026-08-25): a
+ * plain four-module setup produces 260 injection targets, so the boot sync
+ * filled the table and the last 4 paths were rejected -- and a PARTIALLY
+ * populated table is worse than an empty one, because some paths are cloaked
+ * and others are not, which is itself a pattern. 512 costs 96 KiB of
+ * always-resident .bss against 48 KiB, which is the price of the guarantee
+ * that the table matches the rule set rather than a prefix of it.
+ *
+ * ghost_ctl() still returns -ENOSPC past the cap and the Suite still counts
+ * and reports rejections, so overflowing this again is loud, not silent. */
+#define GH_MAX_RULES	512
 #define GH_RULE_LEN	192
 #define GH_MAX_UIDS	128
 
