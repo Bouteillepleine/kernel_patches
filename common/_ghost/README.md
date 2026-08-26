@@ -14,7 +14,7 @@ false positives:
 |---|---|---|
 | `open(p, O_PATH)` + `readlink("/proc/self/fd/N")` | succeeds, returns the full path | `ENOENT` |
 | `getxattr(p, "security.selinux")` | succeeds, returns the label | `ENOENT` |
-| `stat(p "/zzz")` | `ENOTDIR` | `ENOENT` |
+| `stat(p "/zzz")`, and every other way of asking for a directory — `stat(p "/")`, `chdir(p)`, `open(p, O_DIRECTORY)`, `open(p, O_PATH\|O_DIRECTORY)`, `inotify_add_watch(p, IN_ONLYDIR)` | `ENOTDIR` | `ENOENT` |
 | `link(p, "/data/local/tmp/x")` | `EXDEV` | `ENOENT` |
 
 A **second mechanism** was found later, by probing the wider class rather than
@@ -31,19 +31,33 @@ so on a read-only ROM mount these three report `EROFS` — the same answer a sto
 Measured the same way (OP15, blocked uid 10438, engine v25), with both an absent
 and a stock-visible control.
 
-Cleared by the same measurement, and deliberately NOT patched: `inotify_add_watch`
-and `name_to_handle_at` answer identically for hidden and absent (`n2h` is
-`ENOSYS` — the fs exports no `->fh_to_dentry`). `readlink` and `statfs` were leaks
-until engine v21/v25 added `.readlink` to both iops and a `->statfs` on the
-hijacked `s_op`; they are closed in the engine, not here.
+A **third** was found by walking the create path rather than the read path:
+`filename_create()` decides existence before `err2` is consulted, so
+`mkdirat(AT_FDCWD, p, 0700)` and `mknodat()` answer `EEXIST` on a hidden name
+where an absent one answers `EROFS` on a read-only ROM mount. Shared by
+`mkdirat`, `mknodat`, `symlinkat` and `linkat`.
+
+| probe | hidden | absent |
+|---|---|---|
+| `mkdirat(AT_FDCWD, p, 0700)` | `EEXIST` | `EROFS` |
+| `mknodat(AT_FDCWD, p, …)` | `EEXIST` | `EROFS` |
+
+Cleared by the same measurement, and deliberately NOT patched: plain
+`inotify_add_watch` (no `IN_ONLYDIR`) and `name_to_handle_at` answer identically
+for hidden and absent (`n2h` is `ENOSYS` — the fs exports no `->fh_to_dentry`).
+`IN_ONLYDIR` is a different question and *is* a leak — it sets
+`LOOKUP_DIRECTORY`, so it lands on the `-ENOTDIR` oracle above and is closed
+with it. `readlink` and `statfs` were leaks until engine v21/v25 added
+`.readlink` to both iops and a `->statfs` on the hijacked `s_op`; they are closed
+in the engine, not here.
 
 ⚠️ The class is **not proven exhaustive**. Anything that resolves a path and then
 acts without consulting a hijacked op is a candidate. `classprobe.c` is the
 harness — extend it rather than reasoning.
 
-This directory closes all seven. `ghost.c` supplies one predicate,
-`ghost_hidden_path()`; the per-version `ghost_*.patch` files place one guard per
-oracle, each of which answers `-ENOENT`.
+This directory closes all of them — eight families of guard. `ghost.c` supplies
+one predicate, `ghost_hidden_path()`; the `ghost_*.patch` files place the guards,
+each of which answers `-ENOENT`.
 
 ## Files
 
@@ -54,10 +68,11 @@ oracle, each of which answers `-ENOENT`.
 | `ghost_o_path*.patch` | guard in `do_o_path()`, `fs/namei.c` |
 | `ghost_xattr*.patch` | guards in all four `path_*xattr()` wrappers, `fs/xattr.c` |
 | `ghost_linkat*.patch` | guard in `do_linkat()`, `fs/namei.c` |
-| `ghost_notdir*.patch` | guard in `link_path_walk()`, `fs/namei.c` |
+| `ghost_notdir.patch` | guards in `path_lookupat()` and `do_open()`, `fs/namei.c` |
 | `ghost_truncate.patch` | guard in `do_sys_truncate()`, `fs/open.c` |
 | `ghost_utimes.patch` | guard in `do_utimes_path()`, `fs/utimes.c` |
 | `ghost_chmod*.patch` | guard in `do_fchmodat()`, `fs/open.c` |
+| `ghost_create.patch` | guard in `filename_create()`, `fs/namei.c` — `mkdirat`/`mknodat`/`symlinkat`/`linkat` |
 
 Each family has variants; a builder applies the **first that dry-runs clean**,
 newest-shape first, and fails the build if none does. See the coverage table.
@@ -189,16 +204,22 @@ this list.
 | **1** | `O_PATH` | **highest** — returns the full path, one syscall pair, no privileges | **lowest** — `do_o_path()` is 10 lines, reached only by `O_PATH` opens, and is byte-identical v4.19→master | `fs/namei.c` `do_o_path()` |
 | **2** | `getxattr` / `listxattr` / `setxattr` / `removexattr` | **high** — returns the SELinux label | **low** — cold syscall wrappers in `fs/xattr.c`, no in-kernel callers | `fs/xattr.c` `path_*xattr()` |
 | **3** | `link()` `EXDEV` | low — one bit | **low** — `do_linkat()` is reached only by `link(2)`/`linkat(2)` | `fs/namei.c` `do_linkat()` |
-| **4** | `stat(p "/zzz")` `ENOTDIR` | low — one bit | **moderate** — the guard is *cold* (inside an existing `unlikely()` error branch, evaluated only on a walk already failing) but it lives in `link_path_walk()`, the hottest function in the VFS. A misapplied hunk there is a bootloop | `fs/namei.c` `link_path_walk()` |
+| **4** | `ENOTDIR` — `stat(p "/zzz")`, `stat(p "/")`, `chdir(p)`, `open(O_DIRECTORY)`, `open(O_PATH\|O_DIRECTORY)`, `inotify IN_ONLYDIR` | low per probe — one bit — but there are six of them and any one is a complete substitute for the other three guards | **low** — both guards sit on error paths that are only reached by a lookup already failing, and neither is in `link_path_walk()` any more | `fs/namei.c` `path_lookupat()` + `do_open()` |
 
 Two things about this ranking are worth spelling out, because both cut against
 the obvious guess:
 
-* **`ENOTDIR` is much cheaper than it looks.** The natural fear is "a guard in
-  the hot lookup path". It is not on the hot path: the enclosing
-  `if (unlikely(!d_can_lookup(...)))` branch is entered only when the walk is
-  already returning an error. The common case never evaluates it. It ranks last
-  on *blast radius if the hunk lands wrong*, not on cost.
+* **`ENOTDIR` is much cheaper than it looks, and it used to be much narrower
+  than it looked.** Both guards test `err` on a path the lookup is already
+  failing down, so the common case never evaluates the predicate. And the
+  earlier form — one guard inside `link_path_walk()`'s non-final-component bail
+  — closed `stat(p "/zzz")` and *nothing else*: `stat(p "/")`, `chdir(p)`,
+  `open(O_DIRECTORY)`, `open(O_PATH|O_DIRECTORY)` and `inotify IN_ONLYDIR` all
+  reach `-ENOTDIR` through the `LOOKUP_DIRECTORY` test that `link_path_walk()`
+  never sees. Each of those is a one-syscall substitute for every oracle this
+  directory closes, so the family ranked last was in fact the widest one open.
+  It also no longer touches `link_path_walk()`, which removes the only
+  documented bootloop-risk hunk in the set.
 * **The `*xattr` guard is worth doing on all four wrappers or none.** `getxattr`
   is the loud one, but `listxattr`, `setxattr` and `removexattr` are three
   independent one-syscall probes of the same bit (`setxattr` on a read-only ROM
@@ -230,22 +251,49 @@ on SoC descending):
 | 6.6 | `android_kernel_common_oneplus_sm8750@oneplus/sm8750_b_16.0.0_ace_6` |
 | 6.12 | `android_kernel_common_oneplus_sm8850@oneplus/sm8850_b_16.0.0_oneplus_15` |
 
+`aosp-N` below is AOSP common `android*-N` (5.10.264, 5.15.211, 6.1.176,
+6.6.142, 6.12.90); `op-N` is the pinned OnePlus tree from the table above. Both
+columns were re-measured at `-F0`.
+
 | family | variant | applies to |
 |---|---|---|
-| **o_path** | `ghost_o_path.patch` | v4.19 v5.4 v5.10 v5.15 v6.1 v6.6 v6.12 **master**, op-5.10 op-5.15 op-6.1 op-6.6 op-6.12 |
-| | `ghost_o_path_legacy.patch` | v4.9 v4.14 (`vfs_open()` takes `current_cred()`) |
-| **xattr** | `ghost_xattr_6_12.patch` | v6.12, **op-6.6**, op-6.12 |
-| | `ghost_xattr_6_6.patch` | v6.6 only |
-| | `ghost_xattr_5_15.patch` | v5.15 v6.1, op-5.15 op-6.1 |
-| | `ghost_xattr.patch` | v4.9 v4.14 v4.19 v5.4 v5.10, op-5.10 |
-| **linkat** | `ghost_linkat_5_15.patch` | v5.15 v6.1 v6.6 v6.12, op-5.15 op-6.1 op-6.6 op-6.12 |
-| | `ghost_linkat.patch` | v4.9 v4.14 v4.19 v5.4 v5.10, op-5.10 |
-| **notdir** | `ghost_notdir.patch` | v5.15 v6.1 v6.6 v6.12 **master**, **all five** op trees |
-| | `ghost_notdir_5_10.patch` | v5.10 only |
+| **o_path** | `ghost_o_path.patch` | v4.19 v5.4 v5.10 v5.15 v6.1 v6.6 v6.12 **master**, aosp-5.10…6.12, op-5.10…op-6.12 |
+| **xattr** | `ghost_xattr_6_12.patch` | v6.12, **aosp-6.6**, **op-6.6**, aosp-6.12 op-6.12 |
+| | `ghost_xattr_5_15.patch` | v5.15 v6.1, aosp-5.15 aosp-6.1, op-5.15 op-6.1 |
+| | `ghost_xattr.patch` | v4.9 v4.14 v4.19 v5.4 v5.10, aosp-5.10, op-5.10 |
+| **linkat** | `ghost_linkat_5_15.patch` | v5.15 v6.1 v6.6 v6.12, aosp-5.15…6.12, op-5.15…op-6.12 |
+| | `ghost_linkat.patch` | v4.9 v4.14 v4.19 v5.4 v5.10, aosp-5.10, op-5.10 |
+| **notdir** | `ghost_notdir.patch` | **one file**: aosp-5.10…6.12 and op-5.10…op-6.12 |
+| **truncate** | `ghost_truncate.patch` | one file: 5.10…6.12 (`do_sys_truncate()` is byte-identical across them), aosp and op |
+| **utimes** | `ghost_utimes.patch` | one file: 5.10…6.12 (`do_utimes_path()` is byte-identical across them), aosp and op |
+| **chmod** | `ghost_chmod.patch` | 6.6 6.12, aosp and op |
+| | `ghost_chmod_5_10.patch` | 5.10 5.15 6.1, aosp and op |
+| **create** | `ghost_create.patch` | one file: 5.10…6.12 (`filename_create()`'s `-EEXIST` block is byte-identical), aosp and op |
 | **build** | `ghost_build_integration.patch` | every tree above, v4.9 → master |
 
-Apply order for each family: **newest variant first**, fallback last — the same
-ordering `_hook`'s builder uses for `hide_selinux_attr*`.
+### Three variants were deleted
+
+* `ghost_o_path_legacy.patch` (v4.9/v4.14 `vfs_open()` signature),
+  `ghost_xattr_6_6.patch` (the vanilla-v6.6 `fs/xattr.c` shape) and
+  `ghost_notdir_5_10.patch` (vanilla v5.10's `unlazy_walk()`).
+* None of the three was reachable. `scripts/apply_nomount_stack.sh` does not
+  merely never select them: its `apply_first_of` pins the required variant per
+  kernel version, and on every version those three files could have won, the pin
+  names a different file — so the build **aborts** rather than falling back.
+  Confirmed in the script before deleting.
+* Two of them were also empty sets. AOSP common android15-6.6 carries the same
+  6.12-era `fs/xattr.c` restructure the OnePlus 6.6 tree does, so
+  `ghost_xattr_6_6.patch` matched no tree in either fleet; and the new
+  `ghost_notdir.patch` covers vanilla-shaped 5.10 as well, because its guards do
+  not sit next to the `unlazy_walk()`/`try_to_unlazy()` split that forced the
+  variant in the first place.
+
+Variant selection is by **pinned name per kernel version**, not by "first that
+dry-runs clean" — `scripts/apply_nomount_stack.sh` names the required variant for
+each of 5.10/5.15/6.1/6.6/6.12 and fails loudly if that one does not apply. Same
+arrangement as `_hook`'s builder, and for the same reason: three of the four
+`path_*xattr()` bodies are character-identical below `retry:`, so "first that
+applies" is how a `-ENOENT` guard lands in the wrong wrapper.
 
 ### Version-specific shapes worth knowing before editing these
 
@@ -253,17 +301,18 @@ ordering `_hook`'s builder uses for `hide_selinux_attr*`.
   pinned OnePlus trees (verified by md5 of the extracted function body). One
   hunk covers 13 of the 15 trees tested. Only v4.9/v4.14 differ, and only in the
   `vfs_open()` argument list.
-* **OnePlus's android15-6.6 tree carries the 6.12-era `fs/xattr.c` restructure**
-  (`setxattr_copy()`/`xattr_ctx`, `do_setxattr()`, the `kname` buffer in
-  `path_removexattr()`), so it groups with 6.12, **not** with vanilla v6.6. That
-  is the entire reason `ghost_xattr_6_6.patch` exists as a separate file — it
-  covers a shape no tree in the fleet actually has, and would be dead weight if
-  the fleet were the only consumer. Do not "simplify" by merging them.
-* **OnePlus's android12-5.10 tree carries `try_to_unlazy()`** in
-  `link_path_walk()` where vanilla v5.10 still has `unlazy_walk()`. So
-  `ghost_notdir.patch` covers all five OnePlus trees despite being labelled for
-  5.15+, and `ghost_notdir_5_10.patch` exists only for a build from AOSP common
-  android12-5.10.
+* **Every android15-6.6 tree measured carries the 6.12-era `fs/xattr.c`
+  restructure** (`setxattr_copy()`/`xattr_ctx`, `do_setxattr()`, the `kname`
+  buffer in `path_removexattr()`) — OnePlus's and AOSP common's alike — so 6.6
+  groups with 6.12, **not** with vanilla v6.6. `ghost_xattr_6_6.patch` covered
+  the vanilla shape and matched nothing either fleet resolves to; it is gone.
+* **The `unlazy_walk()` / `try_to_unlazy()` split no longer matters here.**
+  OnePlus's android12-5.10 carries `try_to_unlazy()` where vanilla v5.10 has
+  `unlazy_walk()`, and that split is why `notdir` needed two variants while its
+  guard lived in `link_path_walk()`. The guard now sits in `path_lookupat()` and
+  `do_open()`, neither of which mentions either helper, so one file covers 5.10
+  through 6.12 with hunks that are byte-identical when generated independently
+  against each of the ten trees.
 * **`path_listxattr()` is byte-identical on all 14 trees** that have it — the
   only one of the four xattr wrappers that never changed shape.
 * **Hand-writing these hunks does not work.** Every patch here was generated by
@@ -290,7 +339,15 @@ Not just dry-run. On the **real OP15 tree** (`android_kernel_common_oneplus_sm88
   nothing about wiring — kbuild will build a single object that is not in
   `obj-y` at all.
 
-The tree was restored to its prior state afterwards.
+Repeated for the whole set on **AOSP common** android12-5.10 (5.10.264),
+android13-5.15 (5.15.211), android14-6.1 (6.1.176), android15-6.6 (6.6.142) and
+android16-6.12 (6.12.90): all nine files apply at `-F0`, `fs/namei.o`,
+`fs/xattr.o`, `fs/open.o`, `fs/utimes.o` and the whole `fs/proc/` directory
+compile clean, and `nm fs/proc/built-in.a` shows `T ghost_hidden_path` on every
+one of the five. `scripts/apply_nomount_stack.sh verify ghost` asserts the same
+facts at build time.
+
+The trees were restored to their prior state afterwards.
 
 **Not boot-tested.** Nothing here has run on a device.
 
@@ -331,34 +388,46 @@ property, and it should not be possible to reintroduce one casually.
 
 ## What is deliberately NOT implemented
 
-* **A single choke-point guard in `path_lookupat()`.** This was designed and
-  costed, then rejected. The tail of `path_lookupat()` — after `complete_walk()`
-  (which guarantees ref-walk, so `d_path()` is safe) and before
-  `*path = nd->path` — is one insertion point that would close `O_PATH`, all
-  four `*xattr`, `link()`, and **every other path-resolving syscall at once**,
-  in one hunk with two version variants (5.10 orders the `LOOKUP_MOUNTPOINT` and
-  `LOOKUP_DIRECTORY` blocks differently from 6.12).
+* **A single choke-point guard on `path_lookupat()`'s SUCCESS path.** Still
+  rejected, and the distinction between that and what `ghost_notdir.patch` now
+  does is the whole of this entry — do not read one as having become the other.
 
-  It is more complete than four guards, and that is a real argument for it: the
-  four measured oracles are members of a **class** — "a syscall that resolves a
-  path and then does something no hijacked op sees" — and enumerating members
-  one at a time cannot be proven exhaustive. `readlink(2)` (`EINVAL` for a
-  non-symlink vs `ENOENT`), `inotify_add_watch(2)`, `name_to_handle_at(2)`,
-  `truncate(2)`/`utimensat(2)`/`chmod(2)` (`EROFS` vs `ENOENT`) are all
-  candidates that the four guards do not touch.
+  The rejected design puts the guard after `complete_walk()` and before
+  `*path = nd->path`, i.e. on **every successful lookup**. It would close
+  `O_PATH`, all four `*xattr`, `link()` and every other path-resolving syscall in
+  one hunk. It is more complete, and that is a real argument for it: the measured
+  oracles are members of a **class** — "a syscall that resolves a path and then
+  does something no hijacked op sees" — and enumerating members one at a time
+  cannot be proven exhaustive.
 
-  It was rejected anyway, on the instruction that a bootloop is worse than an
-  open oracle. `path_lookupat()` is on the path of `stat()`, `access()`,
-  `chdir()`, `readlink()`, `statfs()` and more — every path-based syscall that
-  is not an `open()`. That means (a) `ghost_hidden_path()` would run on a large
-  fraction of all syscalls, gated only by the uid check; (b) a wrong table entry
-  would break every syscall for that path at once rather than four cold ones;
-  and (c) it creates a second source of truth for `stat()`, which the engine
-  already answers correctly through its hijacked `->getattr`. If those trade-offs
-  are ever acceptable, that is the site — and it should replace the four guards,
-  not join them.
+  It stays rejected, on the instruction that a bootloop is worse than an open
+  oracle. `path_lookupat()` is on the path of `stat()`, `access()`, `chdir()`,
+  `readlink()`, `statfs()` and more, so (a) `ghost_hidden_path()` would run on a
+  large fraction of all syscalls, gated only by the uid check; (b) a wrong table
+  entry would break every syscall for that path at once rather than a few cold
+  ones; and (c) it creates a second source of truth for `stat()`, which the
+  engine already answers correctly through its hijacked `->getattr`.
 
-  I attempted to *measure* the wider class read-only on the OP15 and could not
+  **What `ghost_notdir.patch` does instead** is the same function and none of
+  that cost: it tests `err == -ENOTDIR` on the **error** path, so the predicate
+  is evaluated only on a lookup that is already failing, and it can only ever
+  rewrite one errno into another. Nothing on the success path changes, so a wrong
+  table entry cannot make a working `stat()` fail. That is why it is in and the
+  success-path guard is out, and why the two must not be conflated when someone
+  next reads this file.
+
+  One piece of design work it does need: `-ENOTDIR` can reach the end of
+  `path_lookupat()` from `path_init()`, which rejects a non-directory dfd or
+  preset root with `nd->flags` already carrying `LOOKUP_RCU`, before
+  `rcu_read_lock()` and before `nd->path` is assigned. `ghost_hidden_path()`
+  renders `d_path()` and needs a reference-counted path, so the guard tests
+  `!(nd->flags & LOOKUP_RCU)` **and** `nd->path.dentry` before touching the
+  predicate. Nothing is lost by that: `link_path_walk()`'s site unlazies (or
+  returns `-ECHILD`), and `complete_walk()` runs ahead of the `LOOKUP_DIRECTORY`
+  test, so every probe listed in the ranking table arrives in ref-walk mode.
+
+  The class stays open in the direction the guard does not cover. I attempted to
+  *measure* it read-only on the OP15 and could not
   settle it: `toybox stat -f` returned `ENOENT` for a hidden path
   (`/product/etc/permissions/privapp-permissions-oplus-product.xml`, confirmed
   hidden from uid 10438 and visible to root), but toybox `lstat()`s the path
@@ -381,11 +450,11 @@ property, and it should not be possible to reintroduce one casually.
   nothing above 6.12 and an unverifiable hunk is worse than none. `o_path` and
   `notdir` **do** already cover master.
 
-* **`ENOTDIR` on 4.9 / 4.14 / 4.19 / 5.4.** Three further shapes of the
-  `unlazy_walk()` call (`unlazy_walk(nd, NULL, 0)` on 4.9). Nothing in the fleet
-  is older than 5.10, there is no OEM tree to verify against, and an
-  unverifiable hunk in `link_path_walk()` is the single worst place in this
-  patch set to guess. `o_path`, `xattr` and `linkat` all cover 4.9+.
+* **`ENOTDIR` on 4.9 / 4.14 / 4.19 / 5.4.** Not covered, and no longer for the
+  old reason: the guards left `link_path_walk()` and the `unlazy_walk()` shapes
+  stopped mattering. They are simply unverified — nothing in the fleet is older
+  than 5.10 and there is no tree here to test against. `o_path`, `xattr` and
+  `linkat` all cover 4.9+.
 
 * **The accounting/consistency question `_pathhide` calls H8.** Not applicable
   here — these guards remove no entry from any listing, so nothing goes out of
@@ -414,6 +483,11 @@ su $U -c '...'
 | `listxattr(p, ...)` | `ENOENT` |
 | `setxattr(p, "user.x", ...)` | `ENOENT` |
 | `stat(p "/zzz")` | `ENOENT` |
+| `stat(p "/")` | `ENOENT` |
+| `chdir(p)` | `ENOENT` |
+| `open(p, O_DIRECTORY)` | `ENOENT` |
+| `open(p, O_PATH\|O_DIRECTORY)` | `ENOENT` |
+| `inotify_add_watch(p, IN_ONLYDIR)` | `ENOENT` |
 | `link(p, "/data/local/tmp/x")` | `ENOENT` |
 
 Use the compiled `/data/local/tmp/leakprobe`, not shell tools: `toybox stat`

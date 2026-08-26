@@ -1,18 +1,48 @@
-# `_pathhide` — hide selected file-backed entries from `/proc/<pid>/*`
+# `_pathhide` — hide selected file-backed *mappings* from `/proc/<pid>/*`
+
+> **EXPERIMENTAL, AND OFF BY DEFAULT.** The rule set starts empty, nothing in
+> this repository seeds it, and `pathhide_match_file()` short-circuits on its
+> first line while it is empty — so on every shipped build this patch set is
+> inert and every guard below is dead code. That is the intended shipping state.
+> **Loading a rule is a deliberate trade, not a free win**: read *"The trade you
+> make by loading a rule"* below before you do it.
 
 `pathhide.c` / `pathhide.h` provide `pathhide_match_file()`, a substring match
-against the *displayed* path of a VMA's or fd's backing file. The per-kernel
+against the *displayed* path of a VMA's backing file. The per-kernel
 `*_integration.patch` files call it from the `/proc` readers so matched entries
-(injected hook-framework module APKs, `/data/adb/lspd`, …) disappear. Inert until
-the first rule is written, so a no-op on stock configurations.
+(injected hook-framework module APKs, `/data/adb/lspd`, …) disappear.
 
 ## What each patch covers
 
 | patch | sites |
 |---|---|
-| `pathhide_<ver>_integration.patch` | `maps`, `smaps`, `smaps_rollup`, `numa_maps`, the `fd` readdir *and* `fd` lookup/readlink/fdinfo — plus `stat(fd).st_size` on 6.6/6.12 and the `PROCMAP_QUERY` ioctl on 6.12 |
+| `pathhide_<ver>_integration.patch` | `maps`, `smaps`, `smaps_rollup`, `numa_maps` — plus the `PROCMAP_QUERY` ioctl on 6.12 |
 | `pathhide_mapfiles_<ver>_integration.patch` | `/proc/<pid>/map_files/` readdir, name lookup, symlink resolve — **mandatory**, see that file's header |
-| `pathhide_build_integration.patch` | optional `obj-y += pathhide.o` for the `fs/proc/` drop-in layout |
+| `pathhide_build_integration.patch` | optional `obj-y += pathhide.o` for the `fs/proc/` drop-in layout. `scripts/apply_nomount_stack.sh` uses the `fs/` layout instead and appends the line itself; either way `apply_nomount_stack.sh verify pathhide` asserts the obj-y line exists |
+
+## The `/proc/<pid>/fd` half was removed
+
+`fs/proc/fd.c` used to be patched too — `tid_fd_mode()`, `proc_fd_link()`,
+`proc_readfd_common()` and, on 6.6/6.12, `proc_readfd_count()`. All of it is
+gone, and `apply_nomount_stack.sh verify pathhide` fails the build if it comes
+back. Two independent reasons:
+
+* **It was a categorical tell.** Hiding an fd from `/proc` does not close it. The
+  descriptor stays allocated, so `fcntl(N, F_GETFD)` succeeds on an `N` that
+  `/proc/self/fd/N` reports as `ENOENT`. A detector needs no rule list, no
+  knowledge of what is being hidden and no privilege to run that check, and the
+  result is **never** true on a stock kernel. The cloak replaced a heuristic
+  signal with a certain one — the same failure shape `_hook`'s README calls "the
+  cloak becomes the detector".
+* **Every device paid for it.** `proc_readfd_count()` is what
+  `stat("/proc/<pid>/fd")` answers with, and stock computes it as a single
+  `bitmap_weight()` over the open-fd bitmap. The replacement was an
+  `O(max_fds)` loop taking `task_lock` per descriptor inside one un-rescheduled
+  RCU section — on every such `stat()`, on every shipped device, including the
+  overwhelming majority that carry no rules and get nothing in return.
+
+Gating that loop on `ph_nrules` would have answered the second point alone.
+Removing the half answers both, and `fs/proc/fd.c` is now untouched.
 
 ## Coverage per kernel version
 
@@ -25,24 +55,31 @@ across 69 `(tree, revision)` pairs).
 | fix | 5.10 | 5.15 | 6.1 | 6.6 | 6.12 |
 |---|---|---|---|---|---|
 | `maps` / `smaps` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `fd` readdir | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **H6** `fd` lookup / readlink / fdinfo (`tid_fd_mode` + `proc_fd_link`) | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **M-C7** `stat(/proc/<pid>/fd).st_size` | n/a | n/a | n/a | ✓ | ✓ |
 | **M-C5** orphan `[page size compat]` pad VMA | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `numa_maps` (under `CONFIG_NUMA`) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `smaps_rollup` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `map_files` readdir / lookup / readlink | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `PROCMAP_QUERY` ioctl | n/a | n/a | n/a | n/a | ✓ |
+| ~~`fd` readdir~~ (**H6**, **M-C7**) | removed | removed | removed | removed | removed |
 
-`n/a` means the kernel has no such code, not that the fix was skipped:
-`proc_readfd_count()`/`proc_fd_getattr()` first appear in 6.6, and the
-`PROCMAP_QUERY` ioctl (`query_matching_vma()`) first appears in 6.12 — neither
-exists in the older trees, so there is nothing to leak through.
+`n/a` means the kernel has no such code, not that the fix was skipped: the
+`PROCMAP_QUERY` ioctl (`query_matching_vma()`) first appears in 6.12, so there is
+nothing to leak through on the older trees. `removed` means what the section
+above says — the fd half was deleted on purpose and its return is a build
+failure, not a regression to be re-fixed.
+
+Re-verified after the fd half was cut: all three files apply at `-F0` on the
+pinned OnePlus tree for each of the five versions, and on AOSP common 5.10 /
+5.15 / 6.1 the whole `fs/proc/` directory compiles clean with `pathhide_match_file`
+present in `fs/proc/built-in.a`. The 6.6 and 6.12 integration patches are fitted
+to the OnePlus `task_mmu.c` and do **not** apply to AOSP common — that is
+pre-existing and by design (see the header of `verify-hook-pathhide.yml`: AOSP
+diverges from the pinned trees on `task_mmu.c` for all five versions); 6.12 was
+compiled against the real `android_kernel_common_oneplus_sm8850` 6.12.23 tree
+instead.
 
 ### Version-specific shapes worth knowing before editing these
 
-* `tid_fd_mode()` **does** exist on 5.10 (it takes a `files_struct` reference and
-  uses `fcheck_files()`), so H6 has one decision point on every version. An
-  earlier note here claiming otherwise was wrong.
 * On 5.10, 5.15 and *some* 6.1 trees, `show_map()`/`show_smap()` open with
   `get_pad_vma()` / `get_data_vma()`, which return **kzalloc'd copies that only
   `show_map_pad_vma()` frees**. A guard placed after those declarations would
@@ -63,6 +100,24 @@ exists in the older trees, so there is nothing to leak through.
   are the part that differs between trees). If you regenerate, re-check at
   `-F0`: a hunk that only applies "with fuzz" can land a guard in the wrong
   function silently.
+
+## The trade you make by loading a rule
+
+Nothing here has a default rule, and that is the recommendation, not an
+oversight. The reason is the H8 accounting problem below, stated plainly:
+
+**`sum(maps ranges) != VmSize != statm[0]` remains OPEN.** Deleting a VMA's line
+from `maps` hides the *name* — a heuristic signal, one that requires the reader
+to recognise a path — but it leaves the arithmetic inconsistent, and arithmetic
+that cannot be true on a stock kernel is a *categorical* signal. A reader that
+sums the ranges in `/proc/self/maps` and compares them with `VmSize` from
+`/proc/self/status` needs to recognise nothing at all.
+
+So loading a rule does not remove a tell; it exchanges one tell for a stronger
+one. Do it only when you know the specific reader you are defeating reads names
+and not totals. This pass deliberately did **not** attempt the reconciliation —
+see the two candidate designs below, and note the warning that a half-done
+version makes the tells worse.
 
 ## H8 — the accounting leak is only partly closed (STAGED, needs a decision)
 
@@ -102,10 +157,12 @@ Pick one before extending H8; do not mix.
 
 `pathhide.c` exposes `pathhide_ctl()` (apply one `+needle` / `~needle` / `-`
 command) and `pathhide_get_rule()` (dump), but **nothing in *this* patch set
-wires them to a control channel.** Applying `_pathhide` alone yields an
+wires them to a control channel.** Applying `_pathhide` alone yields a
 `pathhide.o` that matches correctly but can never be configured (its rule set
 stays empty, so `pathhide_match_file()` short-circuits to `false` forever) unless
-you compile the opt-in `PH_ENABLE_PROC` fallback node.
+you compile the opt-in `PH_ENABLE_PROC` fallback node. Combined with the absence
+of any default rule, that is what makes the shipped state inert: the feature is
+present, off, and reachable only by a deliberate `nm k p '+needle'`.
 
 The real control plane is nomount's private raw-netlink channel: `nomount.c`
 forwards `NM_KNOB_PATHHIDE → pathhide_ctl()` and `NM_CMD_GET_PATHHIDE →
@@ -117,6 +174,8 @@ Ship both together, or enable `PH_ENABLE_PROC` for a standalone build.
 
 ## Leak paths — one closed, one out of reach
 
+* **`fcntl(N, F_GETFD)` vs `/proc/self/fd/N`** — closed by deletion, not by a
+  guard: see *"The `/proc/<pid>/fd` half was removed"* above.
 * **`/proc/<pid>/numa_maps`** — `show_numa_map()` prints the backing file path
   (`file_user_path`), unfiltered. This was assumed inert (`CONFIG_NUMA=n`) but the
   6.12 tree config actually has **`CONFIG_NUMA=y`**, so the node is live and was a

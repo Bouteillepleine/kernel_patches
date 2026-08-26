@@ -1,16 +1,62 @@
 # `_hook` — SELinux oracle cloak
 
-Six patches that close SELinux-side oracles a detector uses to tell a rooted
-kernel from a stock one. Applied by the NoMount kernel builders after the KSU
-patches; each is fail-closed (`apply_or_die`).
+Four families - seven files - that close SELinux-side oracles a detector uses to
+tell a rooted kernel from a stock one. Applied by the NoMount kernel builders
+after the KSU patches, at **fuzz 0**, each fail-closed
+(`scripts/apply_nomount_stack.sh hook`).
 
-| patch | closes |
+| family | closes |
 |---|---|
-| `hide_selinux_attr.patch` / `hide_selinux_attr_6_12.patch` | `write(/proc/self/attr/*)`, `lsm_set_self_attr(2)` and `setxattr(security.selinux)` returning EACCES (type exists) instead of EINVAL (type absent) |
-| `hide_selinux_selinuxfs.patch` | the same probe through every `selinuxfs` write node (`access`/`create`/`relabel`/`user`/`member`/`context`/`validatetrans`), plus results that would echo a hidden type back |
-| `quiet_selinux_audit.patch` / `_legacy.patch` | AVC denial records naming a root type |
-| `quiet_selinux_audit_user.patch` | userspace-generated `AUDIT_USER_AVC` records naming one |
-| `fix_selinux_seqno.patch` | `/sys/fs/selinux/status` policyload count bumped by KSU's runtime rules |
+| `hide_selinux_attr.patch` / `hide_selinux_attr_6_12.patch` | `write(/proc/self/attr/*)`, `lsm_set_self_attr(2)` and - on the `_6_12` variant only - `setxattr(security.selinux)` returning EACCES (type exists) instead of EINVAL (type absent) |
+| `hide_selinux_selinuxfs_5_10.patch` / `hide_selinux_selinuxfs_6_12.patch` | the same probe through every `selinuxfs` write node (`access`/`create`/`relabel`/`user`/`member`/`context`/`validatetrans`), plus a reply filter so a computed context never echoes a hidden type back |
+| `quiet_selinux_audit.patch` / `_legacy.patch` | AVC denial records naming a root type, **at uid >= 2000 only** |
+| `fix_selinux_seqno.patch` | `/sys/fs/selinux/status` reporting `policyload = 0` after KSU's runtime rules |
+
+### Which variant applies where
+
+Every cell was produced by `patch -p1 -F0 --dry-run` against the AOSP common
+tree for that version **and** against the OnePlus tree the builder fleet pins
+for it, and the object each one touches was compiled (`ARCH=arm64 LLVM=1`).
+
+| family | 5.10 | 5.15 | 6.1 | 6.6 | 6.12 |
+|---|---|---|---|---|---|
+| `hide_selinux_selinuxfs_6_12.patch` | - | - | - | YES | YES |
+| `hide_selinux_selinuxfs_5_10.patch` | YES | YES | YES | - | - |
+| `hide_selinux_attr_6_12.patch` | - | - | - | - | YES |
+| `hide_selinux_attr.patch` (fallback) | YES | YES | YES | YES | YES |
+| `quiet_selinux_audit.patch` | YES | YES | YES | YES | YES |
+| `quiet_selinux_audit_legacy.patch` | YES | YES | YES | YES | YES |
+
+Three rows of that table are traps, and the builder handles all of them the same
+way: it **pins the variant by kernel version and selects it by name**, rather
+than taking the first that applies.
+
+* The two `quiet_selinux_audit` files have *byte-identical* patch context on all
+  five versions - the insertion point is a blank-line-delimited spot around
+  `a->selinux_audit_data = &sad;` that never changed - and differ only in
+  whether the added code passes `state` to `security_sid_to_context()`. Both
+  dry-run clean everywhere; the wrong one fails at compile time.
+* `hide_selinux_attr.patch` also applies on 6.12, where `_6_12` must win because
+  it additionally guards `selinux_inode_setxattr()`.
+
+### Deleted, and why
+
+* **`hide_selinux_selinuxfs.patch`** (the old base variant). It hooked
+  `selinux_transaction_write()`, the *generic dispatcher*, ahead of every
+  handler's own `avc_has_perm()` - reproducing the "cloak becomes the detector"
+  inversion described below - and it matched with `strnstr()` over the whole
+  raw write buffer while the handlers parse with fixed-arity `sscanf()` and
+  ignore trailing junk. Appending `:ksu:` after the four fields returned EINVAL
+  where `:kzu:` succeeded; a stock kernel answers OK uniformly to every
+  trailing-junk variant, measured. It also had no reply filter, and it never
+  covered `validatetrans` (which has its own `file_operations` and does not go
+  through the dispatcher at all). Its replacement,
+  `hide_selinux_selinuxfs_5_10.patch`, is the `_6_12` design refitted down.
+* **`quiet_selinux_audit_user.patch`**. The same ungated raw-buffer shape in
+  `audit_receive_msg()`, on a path already behind `CAP_AUDIT_WRITE` - so it
+  cloaked a record class only a privileged caller could generate in the first
+  place - and it was the fourth place the hardcoded type list had to be kept in
+  step. Dropping it takes the list from four copies to three.
 
 ## The oracle these close
 
@@ -29,19 +75,20 @@ indistinguishable from types that were never in the policy.
 
 **The covered type list is hardcoded and still lives in more than one place.**
 It reads `:ksu:`, `:ksu_file:`, `:lsposed_file:`, `:zygisk_file:`. Within
-`selinuxfs.c` it is now centralized in a single `sel_ctx_hidden()` helper that
-every write node calls, so the six selinuxfs sites share one list. But three
-copies remain — `security/selinux/hooks.c` (`selinux_lsm_setattr` and
-`selinux_inode_setxattr`), `security/selinux/avc.c` (`slow_avc_audit`) and
-`kernel/audit.c` (`audit_receive_msg`) — because they patch different source
-files, at different kernel versions, and a shared header would have to be
+`selinuxfs.c` it is centralized in `sel_ctx_hidden()` / `sel_hidden_bytes()`,
+which every write node and the reply filter call, so all eight selinuxfs sites
+share one list. Two copies remain — `security/selinux/hooks.c`
+(`selinux_setprocattr` / `selinux_lsm_setattr` and `selinux_inode_setxattr`) and
+`security/selinux/avc.c` (`slow_avc_audit`) — because they patch different
+source files, at different kernel versions, and a shared header would have to be
 installed and included by all of them (too invasive for the patch form). Each of
 those sites carries a comment pointing at the others; adding a type means editing
-all four call sites. A setup that adds a type those strings do not name (Magisk,
-APatch, a differently-named hook framework) leaves the oracle open for it, and
-nothing fails a build to say so.
+all three. It was four until `quiet_selinux_audit_user.patch` was deleted. A
+setup that adds a type those strings do not name (Magisk, APatch, a
+differently-named hook framework) leaves the oracle open for it, and nothing
+fails a build to say so.
 
-Two placement rules the guards now follow, and any new site must too:
+Three placement rules the guards now follow, and any new site must too:
 
 * **After the stock `avc_has_perm`, never before it.** The guard returns
   `-EINVAL`, but a domain that lacks the permission (isolated_app, sdk_sandbox)
@@ -64,12 +111,38 @@ Two placement rules the guards now follow, and any new site must too:
   rule above and inverting the cloak into a one-syscall root oracle on those three
   kernel versions (EINVAL for a hidden type, EACCES for anything else, from an
   unprivileged app, via its own `/proc/self/attr/current`). It now lands after the
-  perm check and immediately before `security_context_to_sid()`, verified by
-  `git apply` at zero fuzz against v5.10, v5.15, v6.1 **and** v6.12 — so a
-  fallback on 6.12 is also correctly placed, not silently regressed.
+  perm check and immediately before `security_context_to_sid()`.
 
-  The builder's `apply_first_of` lists `_6_12` FIRST, so 6.6/6.12 keep the richer
-  variant; the fallback only wins where `_6_12` cannot apply.
+  A second, quieter version of the same problem lived in how it was *applied*.
+  The hunk carried three lines of leading context and one of trailing, so GNU
+  `patch` reported **fuzz 2** on every tree in the fleet - and fuzz 2 against one
+  trailing line means the guard was being placed by line number, in the function
+  where that matters most. The earlier note here claiming `git apply` accepted it
+  at zero fuzz was wrong; measured, it did not. The context is now balanced at
+  3/3 and the hunk header names the function, so it applies at `-F0` on 5.10,
+  5.15, 6.1, 6.6 and 6.12 - AOSP common and the pinned OnePlus trees alike - and
+  `security/selinux/hooks.o` compiles clean on all five.
+
+  The builder's `apply_first_of` selects `_6_12` **by name** on 6.12; every other
+  version takes the fallback. The fallback also applies cleanly on 6.12, which is
+  precisely why selection is by name and not by "first that applies".
+
+* **Match the PARSED field, never the raw write buffer.** Every gate now runs on
+  a NUL-terminated context the handler has already parsed, or - for the reply
+  filter, whose buffer is kernel-generated and carries embedded NULs from
+  `sel_write_user()` - on an explicitly length-bounded scan of that reply. The
+  attr guards bound their scan with `strnlen(value, size)` for the same reason.
+
+  This is not a style rule. Handlers parse with fixed-arity `sscanf()` and ignore
+  everything after the last field, and `security_context_to_sid()` stops at the
+  first NUL. A gate over the raw buffer therefore rejects
+  `"<well-formed query> :ksu:"` and `"<valid ctx>\0:ksu:"` where stock accepts
+  both, while the same junk spelled `:kzu:` is accepted on both - a
+  discrimination stock cannot make, reachable by appending seven bytes. Measured:
+  on a stock kernel every trailing-junk variant answers OK uniformly. It is the
+  same inversion as a misplaced guard, arriving through the *length argument*
+  rather than through placement, and it is what got the old base selinuxfs
+  variant deleted.
 
 Verify on the target rather than assume. Run as a **non-root uid** (the gate is
 `uid >= 2000`), and use `dd` rather than `echo` — toybox `echo` does not check
@@ -95,7 +168,7 @@ Invoke it with `su 2000 -c 'sh probe.sh'`.
 
 Every covered type must answer **exactly the same** as
 `definitely_not_a_type_xyz`. If one answers differently, that type is a live
-oracle and belongs in all four patches.
+oracle and belongs in all three copies of the list (selinuxfs.c, hooks.c, avc.c).
 
 To find what a given device actually has, list the policy's types and look for
 ones a stock build would not carry — note `strings` defaults to 4 characters and
@@ -167,15 +240,16 @@ listener, and update that CI assertion in the same change.
 ## Why the gate is `uid >= 2000` and must not be widened
 
 Tested 2026-08-21 on OP15 (branch `hook/uid-gate-non-root`, kernel run
-32506537161): changing all three gates from `uid >= 2000` to `uid != 0`, so that
+32506537161): changing all the gates from `uid >= 2000` to `uid != 0`, so that
 system-uid callers are cloaked too. **It boots, it closes the oracle for
 uid 1000-1999 -- and it costs every app its root grant.** Do not re-attempt.
 
-`hide_selinux_selinuxfs.patch` hooks `selinux_transaction_write()`, the *generic*
-dispatcher for every selinuxfs transaction file. That includes
+The mechanism survives the selinuxfs refit unchanged. The guards no longer sit in
+`selinux_transaction_write()` -- they sit in each handler, after its own
+`avc_has_perm()` -- but one of those handlers is `sel_write_access()`, i.e.
 `/sys/fs/selinux/access`, which is what libselinux's `selinux_check_access()`
-writes to -- and access checks are performed **by a proxy, on behalf of somebody
-else**:
+writes to. Access checks are performed **by a proxy, on behalf of somebody
+else**, so the outcome is identical:
 
 ```
 ksud (uid 0, u:r:ksu:s0) asks servicemanager for the "package" service
@@ -200,7 +274,33 @@ same KernelSU driver 35088 both boots.
 So the residual gap is real but narrow: an oracle at uid 1000-1999 needs an
 attacker who **already holds a system uid** (platform-signed, or sharedUserId
 android.uid.system). Every detector worth cloaking against runs at uid >= 10000
-and is covered. Note also that `setprocattr` alone could safely take `!= 0` --
+and is covered.
+
+## The AVC-audit filter is uid-gated too, and that is a deliberate trade
+
+`quiet_selinux_audit.patch` / `_legacy.patch` used to be the one pair here with
+**no** uid gate: they deleted every AVC denial record naming a covered type, at
+every uid. That is more than the job needs and it costs something specific.
+
+The record they deleted is the one that diagnosed the incident above:
+`avc: denied { find } ... name=package scontext=u:r:ksu:s0
+tcontext=u:object_r:package_service:s0`, emitted by **servicemanager at uid
+1000**, once a second from 8.17s of uptime, with the previous boot's
+`dmesg.old.log` carrying zero of them. Without that line in the log the failure
+reads as a userspace problem and the kernel change that caused it is invisible.
+
+So the filter now fires at `uid >= 2000` and nowhere below, matching every other
+site in this directory. An app-uid task's denial no longer names a root type; a
+system- or root-uid task's denial still does. State the residual plainly: a
+reader that can reach the kernel log can still see system-originated records
+naming a covered type. That is the price of keeping the incident above
+debuggable.
+
+One caveat that is not obvious from the code: `avc_audit()` can run in **softirq**
+for the network checks, where `current` is whatever task was interrupted, so the
+gate is not meaningful for those. It is safe (`current` is never NULL), and root
+frameworks do not generate network AVCs against their own types -- but do not
+read a network denial's presence or absence as a signal. Note also that `setprocattr` alone could safely take `!= 0` --
 it can only ever set the *caller's own* label, so nothing is proxied -- except
 that a uid-1000 LSPosed daemon setting `attr/fscreate` to
 `u:object_r:lsposed_file:s0` goes through the same string match. Not worth it.
