@@ -15,10 +15,12 @@ struct file;
 /*
  * Returns true if @file's backing path contains any configured needle.
  * Callers use it to omit /proc/<pid>/maps, /proc/<pid>/smaps,
- * /proc/<pid>/map_files and /proc/<pid>/fd entries whose backing file matches
- * (e.g. injected hook-framework module APKs). Inert (returns false
- * immediately) until at least one rule is written to /proc/<PH_PROC_NAME>, so
- * it is a no-op on stock configurations.
+ * /proc/<pid>/smaps_rollup, /proc/<pid>/numa_maps and /proc/<pid>/map_files
+ * entries whose backing file matches (e.g. injected hook-framework module
+ * APKs). It is NOT used for /proc/<pid>/fd any more -- see pathhide.c for why
+ * that half was removed. Inert (returns false immediately) until at least one
+ * rule is configured, and nothing configures one by default, so it is a no-op
+ * on every shipped build.
  */
 bool pathhide_match_file(struct file *file);
 

@@ -1,5 +1,35 @@
-Hide pathhide-matched files from /proc/<pid>/maps, smaps, smaps_rollup,
-numa_maps and /proc/<pid>/fd (readdir, lookup, readlink and fdinfo).
+Hide pathhide-matched file-backed mappings from /proc/<pid>/maps, smaps,
+smaps_rollup and numa_maps.
+
+OFF BY DEFAULT, AND EXPERIMENTAL. pathhide.c ships with an empty rule set and
+nothing in this patch set seeds one, so on a stock build pathhide_match_file()
+short-circuits on its first line and every guard below is dead code. Read
+common/_pathhide/README.md before loading a rule: hiding a mapping trades a
+heuristic signal (a recognisable .so named in maps) for a categorical one (the
+accounting stops balancing), and that trade is not obviously a win.
+
+THE /proc/<pid>/fd HALF IS GONE, DELIBERATELY
+
+Earlier revisions also filtered fd readdir, fd lookup/readlink, fdinfo and -- on
+6.6 and 6.12 -- the fd count behind stat(/proc/<pid>/fd).st_size. All of it has
+been removed, for two independent reasons:
+
+  * It was a CATEGORICAL tell. Hiding an fd from /proc does not close it: the
+    descriptor stays allocated, so fcntl(N, F_GETFD) succeeds on an N that
+    /proc/self/fd/N reports as ENOENT. That probe needs no knowledge of what is
+    being hidden, no rule list and no privilege, and it is never true on a stock
+    kernel. It replaced a heuristic tell with a certain one.
+
+  * The fd count rewrite made every device pay. proc_readfd_count() is what
+    stat("/proc/<pid>/fd") answers with, and stock computes it as one
+    bitmap_weight() over the open-fd bitmap. The replacement was an O(max_fds)
+    loop taking task_lock per descriptor inside a single un-rescheduled RCU
+    section -- on every such stat(), on every shipped device, including the
+    overwhelming majority that carry no rules and get nothing back for it.
+
+Gating that loop on ph_nrules would have answered the second point on its own.
+Removing the half answers both, and leaves fs/proc/fd.c untouched by this patch
+set entirely.
 
 Generated hunk by hunk against the real tree the fleet pins for this kernel
 version:
@@ -11,7 +41,6 @@ resolve to. A hunk that only lands "with fuzz" can silently guard the wrong
 function, so treat a fuzz report from `patch` as a failure and regenerate.
 
 Version notes:
-  * proc_readfd_count()/proc_fd_getattr() do not exist here -- N/A, not skipped.
   * The fleet's 6.1 trees carry TWO shapes of show_map()/show_smap(): some open
     with `struct vm_area_struct *vma = v;`, others with get_pad_vma()/
     get_data_vma(). Wrapping the function is the only form that is correct for
@@ -20,59 +49,6 @@ Version notes:
     cannot leak them. That is also why the wrapper hunk carries a single line of
     trailing context: the declarations below the brace are the part that differs.
   * smaps_rollup is a do/while here, so `continue` reaches the advance.
---- a/fs/proc/fd.c
-+++ b/fs/proc/fd.c
-@@ -109,9 +109,16 @@
- static bool tid_fd_mode(struct task_struct *task, unsigned fd, fmode_t *mode)
- {
- 	struct file *file;
-+	extern bool pathhide_match_file(struct file *f);
- 
- 	rcu_read_lock();
- 	file = task_lookup_fd_rcu(task, fd);
-+	/* Hide matched fds from lookup, readlink and fdinfo, and from
-+	 * d_revalidate so a cached dentry re-checks and vanishes too.
-+	 * Filtering proc_readfd_common() alone leaves readlink(/proc/pid/fd/N)
-+	 * returning the hidden path verbatim and fdinfo/N still openable. */
-+	if (file && pathhide_match_file(file))
-+		file = NULL;
- 	if (file)
- 		*mode = file->f_mode;
- 	rcu_read_unlock();
-@@ -176,9 +183,13 @@
- 
- 		fd_file = fget_task(task, fd);
- 		if (fd_file) {
--			*path = fd_file->f_path;
--			path_get(&fd_file->f_path);
--			ret = 0;
-+			extern bool pathhide_match_file(struct file *f);
-+
-+			if (!pathhide_match_file(fd_file)) {
-+				*path = fd_file->f_path;
-+				path_get(&fd_file->f_path);
-+				ret = 0;
-+			}
- 			fput(fd_file);
- 		}
- 		put_task_struct(task);
-@@ -243,6 +254,7 @@
- {
- 	struct task_struct *p = get_proc_task(file_inode(file));
- 	unsigned int fd;
-+	extern bool pathhide_match_file(struct file *f);
- 
- 	if (!p)
- 		return -ENOENT;
-@@ -261,6 +273,8 @@
- 		ctx->pos = fd + 2LL;
- 		if (!f)
- 			break;
-+		if (pathhide_match_file(f))
-+			continue;
- 		data.mode = f->f_mode;
- 		rcu_read_unlock();
- 		data.fd = fd;
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
 @@ -358,3 +358,26 @@

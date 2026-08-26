@@ -1,7 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * pathhide - omit selected file-backed entries from /proc/<pid>/maps,
- * /proc/<pid>/smaps, /proc/<pid>/map_files and /proc/<pid>/fd.
+ * pathhide - omit selected file-backed mappings from /proc/<pid>/maps,
+ * /proc/<pid>/smaps, /proc/<pid>/smaps_rollup, /proc/<pid>/numa_maps and
+ * /proc/<pid>/map_files.
+ *
+ * EXPERIMENTAL, AND OFF BY DEFAULT. The rule set starts empty and nothing in
+ * kernel_patches seeds it, so pathhide_match_file() short-circuits on its first
+ * line and every integration guard is dead code until somebody adds a rule.
+ * Adding one is a real trade, not a free win -- see common/_pathhide/README.md,
+ * section H8: deleting a maps line hides the NAME but leaves the accounting
+ * inconsistent, so sum(maps ranges) stops matching VmSize and statm[0]. That
+ * turns a heuristic signal (a recognisable .so path) into a categorical one
+ * (arithmetic that cannot be true on a stock kernel). Decide deliberately.
+ *
+ * It used to cover /proc/<pid>/fd as well. That half was removed: a hidden fd
+ * stays allocated, so fcntl(N, F_GETFD) succeeds on an N that /proc/self/fd/N
+ * reports as ENOENT -- unconditional, needing no rule knowledge and no
+ * privilege, and never true on a stock kernel. The fd count rewrite that went
+ * with it also replaced one bitmap_weight() with an O(max_fds) task_lock loop
+ * on every stat("/proc/<pid>/fd"), paid by every device including the ones with
+ * no rules at all.
  *
  * Rules are plain substrings matched against the resolved d_path of a VMA's
  * or fd's backing file. The control plane is nomount's private raw-netlink
@@ -33,10 +51,10 @@
  *     "lib"                   ->  2270 hidden   (42%)
  *     "com"                   ->  2271 hidden   (42%)
  *
- * Nothing here rejects a rule for being too broad, and the same needle also
- * removes entries from /proc/<pid>/fd, where a vanished fd can confuse anything
- * that enumerates them. A sloppy rule therefore degrades the whole system in a
- * way that is very hard to attribute back to this file. Keep needles specific.
+ * Nothing here rejects a rule for being too broad. A sloppy rule therefore
+ * degrades the whole system in a way that is very hard to attribute back to this
+ * file -- 30% of every process's file-backed mappings would vanish from maps for
+ * the needle "/system/". Keep needles specific.
  *
  * Inert until the first rule is added (pathhide_match_file() short-circuits on
  * an empty rule set), so it is a no-op on stock configurations.

@@ -1,5 +1,35 @@
-Hide pathhide-matched files from /proc/<pid>/maps, smaps, smaps_rollup,
-numa_maps and /proc/<pid>/fd (readdir, lookup, readlink and fdinfo).
+Hide pathhide-matched file-backed mappings from /proc/<pid>/maps, smaps,
+smaps_rollup and numa_maps.
+
+OFF BY DEFAULT, AND EXPERIMENTAL. pathhide.c ships with an empty rule set and
+nothing in this patch set seeds one, so on a stock build pathhide_match_file()
+short-circuits on its first line and every guard below is dead code. Read
+common/_pathhide/README.md before loading a rule: hiding a mapping trades a
+heuristic signal (a recognisable .so named in maps) for a categorical one (the
+accounting stops balancing), and that trade is not obviously a win.
+
+THE /proc/<pid>/fd HALF IS GONE, DELIBERATELY
+
+Earlier revisions also filtered fd readdir, fd lookup/readlink, fdinfo and -- on
+6.6 and 6.12 -- the fd count behind stat(/proc/<pid>/fd).st_size. All of it has
+been removed, for two independent reasons:
+
+  * It was a CATEGORICAL tell. Hiding an fd from /proc does not close it: the
+    descriptor stays allocated, so fcntl(N, F_GETFD) succeeds on an N that
+    /proc/self/fd/N reports as ENOENT. That probe needs no knowledge of what is
+    being hidden, no rule list and no privilege, and it is never true on a stock
+    kernel. It replaced a heuristic tell with a certain one.
+
+  * The fd count rewrite made every device pay. proc_readfd_count() is what
+    stat("/proc/<pid>/fd") answers with, and stock computes it as one
+    bitmap_weight() over the open-fd bitmap. The replacement was an O(max_fds)
+    loop taking task_lock per descriptor inside a single un-rescheduled RCU
+    section -- on every such stat(), on every shipped device, including the
+    overwhelming majority that carry no rules and get nothing back for it.
+
+Gating that loop on ph_nrules would have answered the second point on its own.
+Removing the half answers both, and leaves fs/proc/fd.c untouched by this patch
+set entirely.
 
 Generated hunk by hunk against the real tree the fleet pins for this kernel
 version:
@@ -11,107 +41,9 @@ resolve to. A hunk that only lands "with fuzz" can silently guard the wrong
 function, so treat a fuzz report from `patch` as a failure and regenerate.
 
 Version notes:
-  * proc_readfd_count() exists here and reports the TRUE fd count via
-    bitmap_weight() on the fdtable, bypassing the readdir filter exactly, so
-    stat(/proc/<pid>/fd).st_size leaks the number of hidden fds. It is rewritten
-    to count what readdir emits. 6.6 has task_lookup_next_fd_rcu() (no
-    reference taken), not 6.12's task_lookup_next_fdget_rcu().
   * show_map()/show_smap() take @v as the VMA directly on every 6.6 tree in the
-    fleet -- no pad copies to free -- so the guard sits inline exactly as it
-    does on 6.12.
+    fleet -- no pad copies to free -- so the guard sits inline.
   * smaps_rollup is a do/while here, so `continue` reaches the advance.
---- a/fs/proc/fd.c
-+++ b/fs/proc/fd.c
-@@ -117,9 +117,16 @@
- static bool tid_fd_mode(struct task_struct *task, unsigned fd, fmode_t *mode)
- {
- 	struct file *file;
-+	extern bool pathhide_match_file(struct file *f);
- 
- 	rcu_read_lock();
- 	file = task_lookup_fd_rcu(task, fd);
-+	/* Hide matched fds from lookup, readlink and fdinfo, and from
-+	 * d_revalidate so a cached dentry re-checks and vanishes too.
-+	 * Filtering proc_readfd_common() alone leaves readlink(/proc/pid/fd/N)
-+	 * returning the hidden path verbatim and fdinfo/N still openable. */
-+	if (file && pathhide_match_file(file))
-+		file = NULL;
- 	if (file)
- 		*mode = file->f_mode;
- 	rcu_read_unlock();
-@@ -184,9 +191,13 @@
- 
- 		fd_file = fget_task(task, fd);
- 		if (fd_file) {
--			*path = fd_file->f_path;
--			path_get(&fd_file->f_path);
--			ret = 0;
-+			extern bool pathhide_match_file(struct file *f);
-+
-+			if (!pathhide_match_file(fd_file)) {
-+				*path = fd_file->f_path;
-+				path_get(&fd_file->f_path);
-+				ret = 0;
-+			}
- 			fput(fd_file);
- 		}
- 		put_task_struct(task);
-@@ -251,6 +262,7 @@
- {
- 	struct task_struct *p = get_proc_task(file_inode(file));
- 	unsigned int fd;
-+	extern bool pathhide_match_file(struct file *f);
- 
- 	if (!p)
- 		return -ENOENT;
-@@ -269,6 +281,8 @@
- 		ctx->pos = fd + 2LL;
- 		if (!f)
- 			break;
-+		if (pathhide_match_file(f))
-+			continue;
- 		data.mode = f->f_mode;
- 		rcu_read_unlock();
- 		data.fd = fd;
-@@ -290,21 +304,29 @@
- static int proc_readfd_count(struct inode *inode, loff_t *count)
- {
- 	struct task_struct *p = get_proc_task(inode);
--	struct fdtable *fdt;
-+	extern bool pathhide_match_file(struct file *f);
-+	unsigned int fd = 0;
-+	loff_t n = 0;
- 
- 	if (!p)
- 		return -ENOENT;
- 
--	task_lock(p);
--	if (p->files) {
--		rcu_read_lock();
-+	/* Count fds directly, skipping matched ones, so stat(/proc/pid/fd)
-+	 * st_size equals the number of entries readdir actually emits. The
-+	 * bitmap_weight() this replaces reports the TRUE fd count and so
-+	 * bypasses the readdir filter exactly: the delta was measured on
-+	 * device to be precisely the number of hidden fds. */
-+	rcu_read_lock();
-+	for (;; fd++) {
-+		struct file *f = task_lookup_next_fd_rcu(p, &fd);
- 
--		fdt = files_fdtable(p->files);
--		*count = bitmap_weight(fdt->open_fds, fdt->max_fds);
--
--		rcu_read_unlock();
-+		if (!f)
-+			break;
-+		if (!pathhide_match_file(f))
-+			n++;
- 	}
--	task_unlock(p);
-+	rcu_read_unlock();
-+	*count = n;
- 
- 	put_task_struct(p);
- 
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
 @@ -346,6 +346,14 @@
