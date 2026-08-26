@@ -5,6 +5,11 @@ fs/proc/ (co-located, so pathhide.c's #include "pathhide.h" resolves), then appl
 Deliberately unconditional obj-y (no CONFIG_PATHHIDE), so nothing lands in
 /proc/config.gz that could out the patch.
 
+Dry-run at -F0 against all five pinned OnePlus trees and AOSP common
+android12-5.10 through android16-6.12: applies at fuzz 0 everywhere, and
+co-exists with _ghost's fs/proc/Makefile hunk in either order (they are anchored
+apart, so the second one picks up an offset of 1, which -F0 accepts).
+
 --- a/fs/proc/Makefile
 +++ b/fs/proc/Makefile
 @@ -6,2 +6,3 @@

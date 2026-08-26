@@ -10,6 +10,8 @@ the map_files enumeration oracle open even though maps/smaps are cloaked.
 
 Generated and verified against android14-6.1.
 
+Dry-run at -F0 against AOSP common android*-6.1 and the pinned OnePlus tree: applies at fuzz 0, offsets only.
+
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
 @@ -64,4 +64,5 @@

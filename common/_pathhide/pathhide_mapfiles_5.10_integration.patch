@@ -10,6 +10,8 @@ open even though maps/smaps are cloaked.
 
 Generated and verified against android12-5.10.
 
+Dry-run at -F0 against AOSP common android*-5.10 and the pinned OnePlus tree: applies at fuzz 0, offsets only.
+
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
 @@ -64,4 +64,5 @@

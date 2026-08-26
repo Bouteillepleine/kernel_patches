@@ -63,6 +63,11 @@ apply_first_of() named ghost_o_path.patch as the required variant on every
 kernel version it knows, so the fallback could only ever ABORT the build --
 never be chosen. Regenerate it against a real 4.x tree if one ever appears.
 
+Dry-run at -F0 against AOSP common android12-5.10 (5.10.264), android13-5.15
+(5.15.211), android14-6.1 (6.1.176), android15-6.6 (6.6.142) and android16-6.12
+(6.12.90), and against all five pinned OnePlus trees: applies to every one, at
+fuzz 0, offsets only.
+
 --- a/fs/namei.c
 +++ b/fs/namei.c
 @@ -3901,11 +3901,23 @@ static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)

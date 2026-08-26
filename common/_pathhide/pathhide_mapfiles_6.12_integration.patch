@@ -10,6 +10,8 @@ enumeration oracle open even though maps/smaps are cloaked.
 
 Generated and verified against android16-6.12.
 
+Dry-run at -F0 against the pinned OnePlus tree (AOSP common diverges on fs/proc here -- see the header of .github/workflows/verify-hook-pathhide.yml): applies at fuzz 0, offsets only.
+
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
 @@ -63,6 +63,7 @@
