@@ -56,12 +56,17 @@ Hunk order follows file order: setxattr, getxattr, listxattr, removexattr.
 
 APPLIES TO
 
-Verified at fuzz 0 against vanilla v6.12 and against the pinned OnePlus
-android15-6.6 and android16-6.12 trees. The OnePlus 6.6 tree carries the
-6.12-era fs/xattr.c restructure (setxattr_copy()/xattr_ctx, do_setxattr(),
-the kname buffer in path_removexattr()), so it groups HERE and not with
-vanilla v6.6 -- which is exactly why ghost_xattr_6_6.patch exists separately.
-Try this file first.
+Verified at fuzz 0 against vanilla v6.12, against the pinned OnePlus
+android15-6.6 and android16-6.12 trees, and against AOSP common android15-6.6
+(6.6.142) and android16-6.12 (6.12.90). Every one of those 6.6 trees carries
+the 6.12-era fs/xattr.c restructure (setxattr_copy()/xattr_ctx, do_setxattr(),
+the kname buffer in path_removexattr()), so 6.6 groups HERE.
+
+ghost_xattr_6_6.patch used to sit between this file and ghost_xattr_5_15.patch
+for the vanilla-v6.6 shape. It has been deleted: no tree in either fleet
+resolves to that shape, and the builder pinned ghost_xattr_6_12.patch as the
+required variant on 6.6, so if ghost_xattr_6_6.patch had ever won the race it
+would have aborted the build rather than been used. Try this file first.
 
 --- a/fs/xattr.c
 +++ b/fs/xattr.c

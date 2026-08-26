@@ -346,30 +346,24 @@ jobs:
           # a cosmetic downgrade -- three of the four path_*xattr() bodies are
           # character-identical below `retry:`, so a fallback can place a
           # -ENOENT guard in the wrong wrapper.
-          GN=ghost_notdir.patch
           case "$KVER" in
             6.12|6.6) GX=ghost_xattr_6_12.patch;  GL=ghost_linkat_5_15.patch; GC=ghost_chmod.patch ;;
             6.1|5.15) GX=ghost_xattr_5_15.patch;  GL=ghost_linkat_5_15.patch; GC=ghost_chmod_5_10.patch ;;
             5.10)     GX=ghost_xattr.patch;       GL=ghost_linkat.patch;      GC=ghost_chmod_5_10.patch ;;
             *) echo "::error::no _ghost variant map for KVER=$KVER"; exit 1 ;;
           esac
-          # The map above is for the OnePlus trees. The two places AOSP common
-          # diverges from them, and only these two:
-          #   6.6  -- OnePlus's android15-6.6 carries the 6.12-era fs/xattr.c
-          #           restructure (setxattr_copy()/xattr_ctx, do_setxattr(), the
-          #           kname buffer in path_removexattr()), so it groups with
-          #           6.12; vanilla v6.6 is its own shape.
-          #   5.10 -- OnePlus's android12-5.10 carries try_to_unlazy() in
-          #           link_path_walk() where vanilla v5.10 still has
-          #           unlazy_walk().
-          if [ "${{ steps.src.outputs.kind }}" = aosp ]; then
-            case "$KVER" in
-              6.6)  GX=ghost_xattr_6_6.patch
-                    echo "_ghost: AOSP 6.6 fallback -> expecting $GX (OnePlus 6.6 wants ghost_xattr_6_12.patch)" ;;
-              5.10) GN=ghost_notdir_5_10.patch
-                    echo "_ghost: AOSP 5.10 fallback -> expecting $GN (OnePlus 5.10 wants ghost_notdir.patch)" ;;
-            esac
-          fi
+          # The map above holds for AOSP common as well as the OnePlus trees.
+          # Both former exceptions are gone:
+          #   6.6  -- AOSP common android15-6.6 carries the same 6.12-era
+          #           fs/xattr.c restructure the OnePlus tree does
+          #           (setxattr_copy()/xattr_ctx, do_setxattr(), the kname
+          #           buffer in path_removexattr()), so ghost_xattr_6_12.patch
+          #           is the variant on both and ghost_xattr_6_6.patch -- which
+          #           matched no tree either fleet resolves -- has been deleted.
+          #   5.10 -- the ENOTDIR guard no longer lives in link_path_walk(), so
+          #           the unlazy_walk()/try_to_unlazy() split that needed
+          #           ghost_notdir_5_10.patch does not reach it. One file covers
+          #           5.10 through 6.12.
           ghost_first_of() {
             local want="$1"; shift
             local sel="" hits=0 gp
@@ -391,10 +385,10 @@ jobs:
             patch -p1 -F0 --forward < "$P/_ghost/$sel"
             echo "_ghost selected ($KVER): $sel"
           }
-          ghost_first_of ghost_o_path.patch ghost_o_path.patch ghost_o_path_legacy.patch
-          ghost_first_of "$GX" ghost_xattr_6_12.patch ghost_xattr_6_6.patch ghost_xattr_5_15.patch ghost_xattr.patch
+          ghost_first_of ghost_o_path.patch ghost_o_path.patch
+          ghost_first_of "$GX" ghost_xattr_6_12.patch ghost_xattr_5_15.patch ghost_xattr.patch
           ghost_first_of "$GL" ghost_linkat_5_15.patch ghost_linkat.patch
-          ghost_first_of "$GN" ghost_notdir.patch ghost_notdir_5_10.patch
+          ghost_first_of ghost_notdir.patch ghost_notdir.patch
           # The mnt_want_write() half of the class. These shipped with the
           # builders and were never added here, so this job verified four of the
           # seven guard families while reporting on all of them.

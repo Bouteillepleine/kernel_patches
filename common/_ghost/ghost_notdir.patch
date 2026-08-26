@@ -1,78 +1,146 @@
-Close the -ENOTDIR trailing-component existence oracle.
+Close the -ENOTDIR existence oracle at the choke point, for the whole family.
 
-  stat(p "/zzz")
+An -ENOTDIR proves a name EXISTS -- the walk stepped into something that is not
+a directory. An absent name gives -ENOENT. Every path-resolving syscall that can
+be made to want a directory is therefore a one-syscall existence probe of a
+hidden path:
 
-returns -ENOTDIR when p is a hidden regular file, where an absent p gives
--ENOENT. Measured on OP15 (Android 16, 6.12.23) against all 24 blocked uids with
-a 7020-path genuinely-absent control and zero false positives.
+  stat(p "/zzz")                    chdir(p)
+  stat(p "/")                       open(p, O_PATH|O_DIRECTORY)
+  open(p, O_DIRECTORY)              inotify_add_watch(p, IN_ONLYDIR)
 
-WHY THE ENGINE CANNOT ANSWER IT
+WHAT THIS REPLACES, AND WHY
 
-link_path_walk() tests d_can_lookup(nd->path.dentry) -- a pure dentry-type test
--- on the component it has just stepped into, and bails before the next
-may_lookup(). The engine's hijacked ops for that inode are never reached, so it
-cannot turn the answer into -ENOENT. Verified against v6.12 fs/namei.c.
+The two files this supersedes -- ghost_notdir.patch and ghost_notdir_5_10.patch
+-- guarded ONE of those sites: link_path_walk()'s non-final-component
+`d_can_lookup()` bail. That closed `stat(p "/zzz")` and nothing else. The other
+five all reach -ENOTDIR through the LOOKUP_DIRECTORY test that link_path_walk()
+never sees, so a complete one-syscall substitute for every oracle this whole
+directory closes was still sitting there, unguarded, the entire time.
 
-WHERE THE GUARD GOES, AND WHY THERE
+It also put a guard inside link_path_walk(), the hottest function in the VFS and
+the one hunk in this patch set that carried a documented bootloop risk. That risk
+is gone: link_path_walk() is no longer touched by _ghost at all.
 
-Inside the existing `if (unlikely(!d_can_lookup(nd->path.dentry)))` block,
-after the LOOKUP_RCU unlazy step and immediately before `return -ENOTDIR;`.
+And it needed two variants, because 5.10 spells the unlazy step unlazy_walk()
+where 5.15+ spells it try_to_unlazy(). The choke points below do not care which,
+so ONE file now covers 5.10 / 5.15 / 6.1 / 6.6 / 6.12 with byte-identical hunks.
 
-Two properties make this the only acceptable spot in this function:
+TWO SITES, NOT ONE
 
- 1. It is COLD despite living in the hottest function in the VFS. The enclosing
-    branch is already marked unlikely() and is only entered on a walk that is
-    about to fail; the common case never evaluates the guard. Nothing is added
-    to the per-component fast path.
+path_lookupat() is the choke point for everything that is not an open(2):
+link_path_walk()'s -ENOTDIR and the LOOKUP_DIRECTORY test both land in the same
+`err` before terminate_walk(), so one guard closes stat/chdir/inotify and
+open(O_PATH|O_DIRECTORY) together.
 
- 2. The path is STABLE there. ghost_hidden_path() renders d_path(), which is not
-    safe during an RCU walk. The stock code immediately above already calls
-    try_to_unlazy()/unlazy_walk() and returns -ECHILD if it fails, so by the
-    time the guard runs the walk is guaranteed to be in ref-walk mode with a
-    reference-counted nd->path. Placing the guard ABOVE that unlazy step would
-    read an unstable path under RCU. Do not move it up.
+do_open() is the second site and is NOT reachable from the first: path_openat()
+runs link_path_walk() and open_last_lookups() itself rather than calling
+path_lookupat(), and its LOOKUP_DIRECTORY test sits ahead of may_open(), so the
+engine's hijacked ->permission -- which is what answers -ENOENT for a plain
+open(2) -- never gets a turn. Guarding only path_lookupat() would leave
+`open(p, O_DIRECTORY)` as a complete replacement for all six probes.
 
-Returning -ENOENT from here is the same kind of return the stock -ENOTDIR is:
-link_path_walk() returns the error to path_lookupat(), which calls
-terminate_walk() on the way out. No extra cleanup is needed, and none is added.
+THE RCU TEST IS THE DESIGN WORK
 
-RISK NOTE, AND WHY THIS ONE RANKS LAST
+ghost_hidden_path() renders d_path(), which needs a reference-counted path, and
+-ENOTDIR can reach the end of path_lookupat() from sites that never unlazied:
+path_init() rejects a non-directory dfd or a non-directory preset root with
+`nd->flags` already carrying LOOKUP_RCU, before rcu_read_lock() and before
+nd->path is assigned. So the guard tests `!(nd->flags & LOOKUP_RCU)` AND
+`nd->path.dentry` before touching the predicate.
 
-Of the four guards this is the one in genuinely dangerous code. The hunk is
-tiny and its context is unambiguous, but a misapplied hunk in link_path_walk()
-is a bootloop, not a failed boot animation. It is also the second-weakest of the
-four by information content (one bit, no path, no label). If only some of the
-_ghost patches are to be shipped, this is the one to drop -- see README.md.
+Both of those sites are unreachable-by-construction for the oracles here (they
+fire before the walk starts, on the dfd, not on the name), so nothing is lost:
+link_path_walk()'s site calls try_to_unlazy()/unlazy_walk() and returns -ECHILD
+if it cannot, and complete_walk() runs ahead of the LOOKUP_DIRECTORY test. Every
+probe listed at the top reaches the predicate in ref-walk mode. do_open() needs
+no such test -- complete_walk() ran inside open_last_lookups() before it.
+
+terminate_walk() still runs in both hunks. This only rewrites the errno; it does
+not return early and it drops no reference.
 
 APPLIES TO
 
-Verified at fuzz 0 against vanilla v5.15, v6.1, v6.6, v6.12 and
-torvalds/master, and against ALL FIVE pinned OnePlus trees -- including
-android12-5.10, whose link_path_walk() carries the try_to_unlazy() form even
-though vanilla v5.10 does not. So every tree the builder fleet actually
-resolves is covered by this one file; ghost_notdir_5_10.patch exists only for
-a build from AOSP common android12-5.10.
+One file, 5.10 through 6.12. path_lookupat() is byte-identical on 5.15 / 6.1 /
+6.6 / 6.12 and differs on 5.10 only in a line six above the insertion point
+(`nd->flags &= ~LOOKUP_JUMPED` vs `nd->state &= ~ND_JUMPED`), which is outside
+the hunk's context; do_open()'s LOOKUP_DIRECTORY test and its three lines of
+context either side are identical on all five.
 
+Verified with `patch -p1 -F0 --dry-run` on android12-5.10 (5.10.264),
+android13-5.15 (5.15.211), android14-6.1 (6.1.176), android15-6.6 (6.6.142) and
+android16-6.12 (6.12.90) -- and the diff generated independently against each of
+those five trees is byte-identical apart from the @@ line numbers, which is the
+strongest evidence available that one file is enough. fs/namei.o compiles clean
+on all five (ARCH=arm64 LLVM=1). Generated by editing the real file and running
+`diff -up`, never by hand.
+
+NOT covered: 4.9 / 4.14 / 4.19 / 5.4, which are not in the builder fleet and
+have no tree here to verify against.
 --- a/fs/namei.c
 +++ b/fs/namei.c
-@@ -2426,10 +2426,20 @@
- 			continue;
- 		}
- 		if (unlikely(!d_can_lookup(nd->path.dentry))) {
-+			extern bool ghost_hidden_path(const struct path *gp);
-+
- 			if (nd->flags & LOOKUP_RCU) {
- 				if (!try_to_unlazy(nd))
- 					return -ECHILD;
- 			}
-+			/*
-+			 * A non-final component that is not a
-+			 * directory gives -ENOTDIR, which proves
-+			 * the name exists. For a path hidden from
-+			 * this uid, say what an absent name says.
-+			 */
-+			if (ghost_hidden_path(&nd->path))
-+				return -ENOENT;
- 			return -ENOTDIR;
- 		}
+@@ -2602,6 +2602,41 @@ static int path_lookupat(struct nameidat
+ 		nd->path.mnt = NULL;
+ 		nd->path.dentry = NULL;
  	}
++	if (unlikely(err == -ENOTDIR)) {
++		extern bool ghost_hidden_path(const struct path *gp);
++
++		/*
++		 * Every -ENOTDIR that reaches here proves a name exists: the
++		 * walk stepped into something that is not a directory. An
++		 * absent name would have given -ENOENT. This is the single
++		 * choke point for the whole family -- link_path_walk()'s
++		 * non-final component, the LOOKUP_DIRECTORY test just above,
++		 * and so chdir(), stat(p "/"), open(O_PATH|O_DIRECTORY) and
++		 * inotify's IN_ONLYDIR, all at once.
++		 *
++		 * TWO tests before the predicate, and neither is optional:
++		 *
++		 *  - !LOOKUP_RCU. ghost_hidden_path() renders d_path(), which
++		 *    needs a reference-counted path. -ENOTDIR can arrive here
++		 *    from sites that never unlazied: path_init() rejects a
++		 *    non-directory dfd or preset root before rcu_read_lock(),
++		 *    with nd->flags already carrying LOOKUP_RCU. The
++		 *    link_path_walk() site does unlazy (it returns -ECHILD if
++		 *    it cannot) and so does complete_walk() ahead of the
++		 *    LOOKUP_DIRECTORY test, which is why every oracle this
++		 *    closes still reaches the predicate.
++		 *
++		 *  - nd->path.dentry. The same path_init() failures return
++		 *    before nd->path is assigned, and __set_nameidata() left it
++		 *    NULL.
++		 *
++		 * terminate_walk() below still runs and still drops the
++		 * reference: this only rewrites the errno.
++		 */
++		if (!(nd->flags & LOOKUP_RCU) && nd->path.dentry &&
++		    ghost_hidden_path(&nd->path))
++			err = -ENOENT;
++	}
+ 	terminate_walk(nd);
+ 	return err;
+ }
+@@ -3762,8 +3797,21 @@ static int do_open(struct nameidata *nd,
+ 		if (unlikely(error))
+ 			return error;
+ 	}
+-	if ((nd->flags & LOOKUP_DIRECTORY) && !d_can_lookup(nd->path.dentry))
++	if ((nd->flags & LOOKUP_DIRECTORY) && !d_can_lookup(nd->path.dentry)) {
++		extern bool ghost_hidden_path(const struct path *gp);
++
++		/*
++		 * open(p, O_DIRECTORY) does NOT go through path_lookupat() --
++		 * path_openat() runs link_path_walk() and open_last_lookups()
++		 * itself and lands here, ahead of may_open(), so the engine's
++		 * hijacked ->permission never gets to answer -ENOENT. Same
++		 * oracle, second site. Ref-walk is guaranteed: complete_walk()
++		 * ran inside open_last_lookups() before do_open() was called.
++		 */
++		if (ghost_hidden_path(&nd->path))
++			return -ENOENT;
+ 		return -ENOTDIR;
++	}
+ 
+ 	do_truncate = false;
+ 	acc_mode = op->acc_mode;

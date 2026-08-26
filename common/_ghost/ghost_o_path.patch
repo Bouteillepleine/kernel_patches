@@ -53,8 +53,15 @@ APPLIES TO
 
 do_o_path() is byte-identical from v4.19 through torvalds/master, and on all
 five pinned OnePlus trees the builder fleet uses -- verified by md5 of the
-extracted function body. v4.9 and v4.14 differ only in vfs_open() taking a
-third current_cred() argument; use ghost_o_path_legacy.patch there.
+extracted function body, and on AOSP common android12-5.10 through
+android16-6.12.
+
+v4.9 and v4.14 differ only in vfs_open() taking a third current_cred()
+argument. The variant that covered them, ghost_o_path_legacy.patch, has been
+deleted: nothing in either fleet is older than 5.10, and the builder's
+apply_first_of() named ghost_o_path.patch as the required variant on every
+kernel version it knows, so the fallback could only ever ABORT the build --
+never be chosen. Regenerate it against a real 4.x tree if one ever appears.
 
 --- a/fs/namei.c
 +++ b/fs/namei.c

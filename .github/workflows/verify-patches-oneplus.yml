@@ -164,9 +164,9 @@ jobs:
             # NB 6.6: the OnePlus android15-6.6 trees carry the 6.12-era
             # fs/xattr.c restructure (setxattr_copy()/xattr_ctx, do_setxattr(),
             # the kname buffer in path_removexattr()), so they group with 6.12
-            # and NOT with vanilla v6.6. ghost_xattr_6_6.patch covers a shape no
-            # tree in this fleet has -- if it ever starts winning here, the tree
-            # changed, not the patch.
+            # and NOT with vanilla v6.6. AOSP common android15-6.6 carries it
+            # too, which is why ghost_xattr_6_6.patch -- a variant no tree in
+            # either fleet resolved to -- has been deleted rather than kept.
             case "$kv" in
               6.12|6.6) GX=ghost_xattr_6_12.patch ; GL=ghost_linkat_5_15.patch ;;
               6.1|5.15) GX=ghost_xattr_5_15.patch ; GL=ghost_linkat_5_15.patch ;;
@@ -174,10 +174,10 @@ jobs:
               *)        GX=                       ; GL= ;;
             esac
             if [ -n "$GX" ]; then
-              gfam ghost_o_path.patch ghost_o_path.patch ghost_o_path_legacy.patch
-              gfam "$GX" ghost_xattr_6_12.patch ghost_xattr_6_6.patch ghost_xattr_5_15.patch ghost_xattr.patch
+              gfam ghost_o_path.patch ghost_o_path.patch
+              gfam "$GX" ghost_xattr_6_12.patch ghost_xattr_5_15.patch ghost_xattr.patch
               gfam "$GL" ghost_linkat_5_15.patch ghost_linkat.patch
-              gfam ghost_notdir.patch ghost_notdir.patch ghost_notdir_5_10.patch
+              gfam ghost_notdir.patch ghost_notdir.patch
               gfam ghost_build_integration.patch ghost_build_integration.patch
             else
               echo "::warning::$name @ ${rev:0:8}: no _ghost variant map for k=$kv - _ghost not checked on this tree"
