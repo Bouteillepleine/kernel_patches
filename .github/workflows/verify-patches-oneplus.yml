@@ -134,13 +134,13 @@ jobs:
             kv=$(printf '%s' "$mk" | awk '/^VERSION/{v=$3}/^PATCHLEVEL/{p=$3}END{if(v!="")print v"."p}')
             if [ -z "$kv" ]; then echo "::warning::cannot read kernel version for $name@${rev:0:8} - skipped"; skipped=$((skipped+1)); continue; fi
             case "$kv" in 6.12) attr=hide_selinux_attr_6_12.patch ;; *) attr=hide_selinux_attr.patch ;; esac
-            case "$kv" in 6.12) sfs=hide_selinux_selinuxfs_6_12.patch ;; *) sfs=hide_selinux_selinuxfs.patch ;; esac
+            case "$kv" in 6.6|6.12) sfs=hide_selinux_selinuxfs_6_12.patch ;; *) sfs=hide_selinux_selinuxfs_5_10.patch ;; esac
             case "$kv" in 6.6|6.12) audit=quiet_selinux_audit.patch ;; *) audit=quiet_selinux_audit_legacy.patch ;; esac
             set -- \
               "_pathhide/pathhide_${kv}_integration.patch" \
               "_pathhide/pathhide_mapfiles_${kv}_integration.patch" \
               "_hook/$attr" "_hook/$sfs" \
-              "_hook/$audit" "_hook/quiet_selinux_audit_user.patch"
+              "_hook/$audit"
             row=""; bad=0
             for p in "$@"; do
               if [ ! -f "$KP/$p" ]; then row="$row MISSING:$(basename "$p")"; bad=1; continue; fi
