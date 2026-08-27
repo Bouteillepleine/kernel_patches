@@ -294,8 +294,18 @@ do_hookless() {
     [ -f "$DEFCONFIG" ] || die "defconfig $DEFCONFIG does not exist. Refusing to create it -- a defconfig invented here is not the one the build reads. Set NOMOUNT_DEFCONFIG to the fragment this build actually uses."
     rm -rf "$NM_SRC"
     git clone --depth 1 -b "${NOMOUNT_REF:-hookless}" https://github.com/Bouteillepleine/kbuild.git "$NM_SRC"
-    NM_PATCH="$NM_SRC/hookless/patches/nomount_${KERNEL_VER}_kernel_integration.patch"
-    [ -f "$NM_PATCH" ] || die "no hookless NoMount patch for $KERNEL_VER ($NM_PATCH)"
+    # kbuild collapsed the ten per-version integration patches into one that
+    # applies across 4.9-6.18. Prefer it; fall back to the per-version name so
+    # this script keeps working against a kbuild ref that still ships the ten
+    # (nomount_ref and patches_ref are chosen independently, so either pairing
+    # is a legitimate build).
+    NM_PATCH="$NM_SRC/hookless/patches/nomount_kernel_integration.patch"
+    if [ ! -f "$NM_PATCH" ]; then
+        NM_PATCH="$NM_SRC/hookless/patches/nomount_${KERNEL_VER}_kernel_integration.patch"
+        [ -f "$NM_PATCH" ] || die "no hookless NoMount patch for $KERNEL_VER: neither\
+ $NM_SRC/hookless/patches/nomount_kernel_integration.patch nor $NM_PATCH exists"
+    fi
+    echo "hookless integration patch: ${NM_PATCH##*/}"
     rm -f "$COMMON_KERNEL_FOLDER/fs/nomount.c" "$COMMON_KERNEL_FOLDER/fs/nomount.h"
     cp "$NM_SRC/hookless/src/nomount.c" "$COMMON_KERNEL_FOLDER/fs/nomount.c"
     cp "$NM_SRC/hookless/src/nomount.h" "$COMMON_KERNEL_FOLDER/fs/nomount.h"
