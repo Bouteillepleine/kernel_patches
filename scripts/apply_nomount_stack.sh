@@ -146,7 +146,13 @@ apply_first_of() {
         *" $want "*) ;;
         *) die "$family: pinned variant '$want' does not apply at fuzz 0 on $KERNEL_VER; these do:$hits. The variants do not carry the same hunks, so falling back would silently drop coverage. Refit '$want' to this tree instead." ;;
         esac
-        [ "$nhits" -eq 1 ] || echo "::warning::$family on $KERNEL_VER: '$want' is pinned and selected, but these also apply:$hits"
+        # Plain log line, NOT ::warning::. The comment above this function says
+        # why a multi-match is expected here: the variants deliberately overlap and
+        # the pin is what resolves them. Annotating an outcome that is correct on
+        # every build trains you to ignore the annotation list, which is where a
+        # real warning has to be visible. The genuine failures are still fatal --
+        # nothing pinned with several matches, or a pin that does not apply.
+        [ "$nhits" -eq 1 ] || echo "  $family: '$want' pinned (also applicable:$hits )"
     fi
     apply_or_die "$sel" "$root"
 }
@@ -201,7 +207,14 @@ assert_config() {
     elif [ "$CONFIG_STRICT" = 1 ]; then
         die "no .config found (tried KERNEL_CONFIG_FILE, $COMMON_KERNEL_FOLDER/out/.config, $COMMON_KERNEL_FOLDER/.config) -- cannot assert $sym"
     else
-        echo "::notice::no .config yet, so $sym is unverified. Run '$0 assert-config' after the defconfig step: $why"
+        # Plain log line, NOT ::notice::. At apply time the tree is not configured
+        # yet, and that is the normal case for every builder -- so this fired on
+        # every build. It is also redundant for the symbol that matters:
+        # verify_hookless() has already hard-failed unless CONFIG_NOMOUNT=y is in
+        # the defconfig, which is the file the build actually reads. `assert-config`
+        # stays available (and fatal, CONFIG_STRICT=1) for a caller that wants the
+        # post-defconfig check against a generated .config.
+        echo "  $sym: not verifiable yet (no .config at apply time; see assert-config)"
     fi
 }
 
