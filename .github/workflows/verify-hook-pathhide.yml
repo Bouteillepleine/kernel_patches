@@ -312,15 +312,31 @@ jobs:
           patch -p1 < "$P/_pathhide/pathhide_${KVER}_integration.patch"
           patch -p1 < "$P/_pathhide/pathhide_build_integration.patch"
           patch -p1 < "$P/_pathhide/pathhide_mapfiles_${KVER}_integration.patch"
-          if patch -p1 --dry-run < "$P/_hook/hide_selinux_attr_6_12.patch" >/dev/null 2>&1; then
-            patch -p1 < "$P/_hook/hide_selinux_attr_6_12.patch"; echo "attr: 6_12"
-          else patch -p1 < "$P/_hook/hide_selinux_attr.patch"; echo "attr: legacy"; fi
-          if patch -p1 --dry-run < "$P/_hook/quiet_selinux_audit.patch" >/dev/null 2>&1; then
-            patch -p1 < "$P/_hook/quiet_selinux_audit.patch"; echo "audit: non-legacy"
-          else patch -p1 < "$P/_hook/quiet_selinux_audit_legacy.patch"; echo "audit: legacy"; fi
-          if patch -p1 --dry-run < "$P/_hook/hide_selinux_selinuxfs_6_12.patch" >/dev/null 2>&1; then
-            patch -p1 < "$P/_hook/hide_selinux_selinuxfs_6_12.patch"; echo "selinuxfs: 6_12"
-          else patch -p1 < "$P/_hook/hide_selinux_selinuxfs_5_10.patch"; echo "selinuxfs: 5_10"; fi
+          case "$KVER" in
+            6.12) REQ_ATTR=hide_selinux_attr_6_12.patch ;;
+            *)    REQ_ATTR=hide_selinux_attr.patch ;;
+          esac
+          patch -p1 < "$P/_hook/$REQ_ATTR"; echo "attr: $REQ_ATTR"
+          # PIN BY VERSION, not by "first that dry-runs". Both variants apply
+          # cleanly on every tree -- they differ by one line, whether
+          # security_sid_to_context() takes `state` -- so the old test always
+          # chose non-legacy and 5.10/5.15/6.1 then failed to COMPILE with
+          # "too few arguments to function call, expected 4, have 3".
+          # This is the same table scripts/apply_nomount_stack.sh uses; keep them
+          # in step, and see apply_first_of() there for why picking the first
+          # match is not good enough.
+          case "$KVER" in
+            6.6|6.12) REQ_AUDIT=quiet_selinux_audit.patch ;;
+            5.10|5.15|6.1) REQ_AUDIT=quiet_selinux_audit_legacy.patch ;;
+            *) echo "::error::no avc-audit variant pinned for KVER=$KVER"; exit 1 ;;
+          esac
+          patch -p1 < "$P/_hook/$REQ_AUDIT"; echo "audit: $REQ_AUDIT"
+          case "$KVER" in
+            6.6|6.12)      REQ_SFS=hide_selinux_selinuxfs_6_12.patch ;;
+            5.10|5.15|6.1) REQ_SFS=hide_selinux_selinuxfs_5_10.patch ;;
+            *) echo "::error::no selinuxfs variant pinned for KVER=$KVER"; exit 1 ;;
+          esac
+          patch -p1 < "$P/_hook/$REQ_SFS"; echo "selinuxfs: $REQ_SFS"
 
           # ---- _ghost -------------------------------------------------------
           # Applied AFTER _pathhide on purpose: that is the order the builders
