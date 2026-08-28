@@ -57,11 +57,13 @@ on:
       - 'common/_pathhide/**'
       - 'common/_ghost/**'
       - '.github/workflows/verify-hook-pathhide.yml'
+      - 'scripts/**'
   pull_request:
     paths:
       - 'common/_hook/**'
       - 'common/_pathhide/**'
       - 'common/_ghost/**'
+      - 'scripts/**'
   workflow_dispatch:
     inputs:
       version:
