@@ -33,7 +33,7 @@
 #   KERNEL_VER                    5.10|5.15|6.1|6.6|6.12  [optional; cross-checked
 #                                 against COMMON_KERNEL_FOLDER/Makefile and, if it
 #                                 disagrees, the run FAILS rather than guessing]
-#   NOMOUNT_REF                   nomount branch, default suite     [hookless]
+#   NOMOUNT_REF                   NoMount-Suite branch, default main [hookless]
 #   NOMOUNT_DEFCONFIG             defconfig basename, default gki_defconfig
 #   KERNEL_CONFIG_FILE            generated .config to assert against, if it
 #                                 already exists (otherwise out/.config and
@@ -312,8 +312,15 @@ do_hookless() {
     # to say why -- so keeping them in one tree is what makes a matched pair the
     # default instead of a thing to remember. The path INSIDE the tree is
     # unchanged (hookless/src, hookless/patches); only the repo and ref move.
-    git clone --depth 1 -b "${NOMOUNT_REF:-suite}" https://github.com/Bouteillepleine/nomount.git "$NM_SRC" \
-        || die "could not clone the NoMount engine at ref '${NOMOUNT_REF:-suite}' from Bouteillepleine/nomount. It used to be kbuild@hookless; if something still passes nomount_ref=hookless, that ref does not exist in this repo -- use 'suite'."
+    # Bouteillepleine/NoMount-Suite is the canonical repo: it is what publishes
+    # the module releases, and its tree carries the engine under hookless/ --
+    # byte-identical to what the development tree served, verified by digest
+    # before this moved. Consuming the PUBLISHED tree rather than a development
+    # branch is also the better arrangement: a kernel build now pins to what was
+    # actually released, not to whatever landed on a working branch this morning.
+    # Default ref is `main`, that repo's default branch.
+    git clone --depth 1 -b "${NOMOUNT_REF:-main}" https://github.com/Bouteillepleine/NoMount-Suite.git "$NM_SRC" \
+        || die "could not clone the NoMount engine at ref '${NOMOUNT_REF:-main}' from Bouteillepleine/NoMount-Suite. It was Bouteillepleine/nomount@suite before, and kbuild@hookless before that; if something still passes nomount_ref=suite or =hookless, neither exists in this repo -- use 'main'."
     # The engine collapsed the ten per-version integration patches into one that
     # applies across 4.9-6.18. Prefer it; fall back to the per-version name so
     # this script keeps working against an engine ref that still ships the ten
