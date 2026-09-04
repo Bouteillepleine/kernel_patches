@@ -519,6 +519,9 @@ jobs:
           infn fs/namei.c  '^static int do_o_path'                   'ghost_hidden_path(&path))' 'the O_PATH guard is not inside do_o_path()'
           infn fs/namei.c  '^static int do_open'                     'op->acc_mode & MAY_WRITE' 'the open(2) guards are not inside do_open()'
           infn fs/namei.c  '^static int path_lookupat'               'unlikely(err == -ENOTDIR)' 'the ENOTDIR guard is not inside path_lookupat() -- note it applies at fuzz 0 inside path_parentat() too'
+          # BOTH walkers. path_parentat() is the CREATE family's choke point and
+          # mkdirat(p "/d") was measured leaking through it on a live OP15.
+          infn fs/namei.c  '^static int path_parentat'               'unlikely(err == -ENOTDIR)' 'the ENOTDIR guard is not inside path_parentat() -- mkdirat/mknodat/symlinkat/unlinkat/renameat reach -ENOTDIR only through there'
           infn fs/namei.c  '^static struct dentry \*filename_create' 'err2 && ghost_hidden_path' 'the create guard is not inside filename_create()'
           infn fs/namei.c  '^(static )?int do_linkat'                'ghost_hidden_path(&old_path)' 'the link(2) guard is not inside do_linkat()'
           infn fs/open.c   '^int do_fchownat'                        'ghost_hidden_path(&path))' 'the chown(2) guard is not inside do_fchownat()'
@@ -537,9 +540,8 @@ jobs:
           if awk '/^int do_renameat2/,/^}/' fs/namei.c | grep -q 'ghost_hidden_path'; then
             echo "::error::_ghost: the create guard landed in do_renameat2() instead of filename_create()"; exit 1
           fi
-          if awk '/^static int path_parentat/,/^}/' fs/namei.c | grep -q 'ghost_hidden_path'; then
-            echo "::error::_ghost: a guard landed in path_parentat() -- see ghost_notdir.patch's header"; exit 1
-          fi
+          # No "must NOT be in path_parentat" check: it needs a guard too, and
+          # the infn assertion above requires one.
           echo "all patches applied, and every guard is in the function it names"
       - name: Compile affected objects (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'

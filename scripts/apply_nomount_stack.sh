@@ -402,6 +402,11 @@ verify_ghost() {
     infn "$d/fs/namei.c" '^static int do_o_path' 'ghost_hidden_path(&path))'         "_ghost: the O_PATH guard is not inside do_o_path()"
     infn "$d/fs/namei.c" '^static int do_open' 'op->acc_mode & MAY_WRITE'         "_ghost: the open(2) guards are not inside do_open()"
     infn "$d/fs/namei.c" '^static int path_lookupat' 'unlikely(err == -ENOTDIR)'         "_ghost: the ENOTDIR guard is not inside path_lookupat(). It applies at fuzz 0 inside path_parentat() too -- that is the bug ghost_notdir.patch's header documents, and this is the assertion that catches it."
+    # BOTH walkers, not one. path_parentat() is the CREATE family's choke point
+    # (filename_create -> filename_parentat), and mkdirat(p "/d") was measured on
+    # an OP15 answering ENOTDIR for a hidden path where an absent one answers
+    # ENOENT -- one syscall, no privilege, open after every other guard closed.
+    infn "$d/fs/namei.c" '^static int path_parentat' 'unlikely(err == -ENOTDIR)'         "_ghost: the ENOTDIR guard is not inside path_parentat() -- mkdirat/mknodat/symlinkat/unlinkat/renameat reach -ENOTDIR through there and through nothing else this patch set guards"
     infn "$d/fs/namei.c" '^static struct dentry \*filename_create' 'err2 && ghost_hidden_path'         "_ghost: the create guard is not inside filename_create()"
     infn "$d/fs/namei.c" '^(static )?int do_linkat' 'ghost_hidden_path(&old_path)'         "_ghost: the link(2) guard is not inside do_linkat()"
     infn "$d/fs/open.c" '^int do_fchownat' 'ghost_hidden_path(&path))'         "_ghost: the chown(2) guard is not inside do_fchownat()"
@@ -422,9 +427,11 @@ verify_ghost() {
     if awk '/^int do_renameat2/,/^}/' "$d/fs/namei.c" | grep -q 'ghost_hidden_path'; then
         die "_ghost: the create guard landed in do_renameat2, not filename_create"
     fi
-    if awk '/^static int path_parentat/,/^}/' "$d/fs/namei.c" | grep -q 'ghost_hidden_path'; then
-        die "_ghost: a guard landed in path_parentat(). That is where ghost_notdir.patch's first hunk went on 5.10/5.15/6.1/6.6 before its context was widened -- see that file's header."
-    fi
+    # (There is deliberately no "must NOT be in path_parentat" check any more.
+    # There used to be: the first fix for the ambiguous pre-image pinned the
+    # guard to path_lookupat() and asserted it was nowhere else. That was half
+    # right -- path_parentat() needs one TOO, which is why the assertion above
+    # requires it rather than forbidding it.)
     hasnt "$d/fs/proc/ghost.c" 'proc_create' \
         "_ghost: ghost.c owns a /proc node -- a file whose job is concealing files must not own a name no stock kernel has"
     echo "_ghost: verified (no CONFIG symbol by design -- see README)"
