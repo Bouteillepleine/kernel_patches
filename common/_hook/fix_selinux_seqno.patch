@@ -1,6 +1,91 @@
+Stop KernelSU writing policyload=0 into /sys/fs/selinux/status.
+
+THIS PATCH APPLIES TO KernelSU'S TREE, NOT THE KERNEL TREE
+
+Every other file in this directory is rooted at the kernel source
+(security/selinux/...). This one is rooted at the KernelSU checkout, so
+`a/kernel/selinux/rules.c` means $KSU_FOLDER/kernel/selinux/rules.c, NOT
+<kernel>/kernel/selinux/rules.c -- which does not exist.
+scripts/apply_nomount_stack.sh gets this right:
+
+	apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
+
+Applying it by hand from the kernel root fails with "can't find file to patch",
+and nothing in this file used to say why. It was also the only patch here with
+no header, no applies-to matrix and no verification note at all.
+
+THE ORACLE
+
+`selinux_status_update_policyload(seqno)` does not INCREMENT anything -- it
+ASSIGNS `status->policyload = seqno` in the mmap'd /sys/fs/selinux/status page
+(bumping `status->sequence` either side so a concurrent reader can detect the
+update). KernelSU calls reset_avc_cache() from its runtime rule path with
+seqno == 0.
+
+So on an unpatched kernel the observable is not "a higher load count". It is
+`policyload == 0` -- a value the kernel only ever writes before the first policy
+has loaded, and therefore impossible on a running device -- sitting next to a
+`sequence` that has advanced past what a stock boot produces. Either half is a
+tell; the pair together is unambiguous, and the status page is world-readable.
+
+Dropping the two calls leaves both fields exactly as a stock boot leaves them.
+Verified on OP15: policyload = 1, sequence matching one boot-time load.
+
+WHAT IT COSTS, AND WHAT IT DELIBERATELY LEAVES
+
+`avc_ss_reset()` is KEPT, so the KERNEL's own AVC still flushes and the new rules
+take effect. Only userspace AVC caches (libselinux) miss the notification, so
+they can hold a stale decision across a KernelSU policy change. Narrow in
+practice: KernelSU installs its rules early in boot, before most userspace
+caching matters.
+
+`selnl_notify_policyload(0)` is also KEPT, and that is a decision, not an
+oversight -- it broadcasts a policy-load event on NETLINK_SELINUX that no stock
+device emits after boot. Receiving it needs a netlink_selinux_socket, and no app
+domain is allowed to create one (measured 2026-08-25 against the live OP15
+policy: untrusted_app, priv_app, isolated_app, platform_app and system_app all
+compute 0 for class 35). Gating it would trade a tell no app can observe for a
+documented bootloop risk. common/_hook/README.md records this as "Closed, will
+not fix (was M-C2)", and both this file and the CI verifier assert the call
+survives so it cannot be removed casually.
+
+APPLIES TO
+
+The `reset_avc_cache()` body is identical across the KernelSU forks the builder
+fleet uses, even though its line number is not. Pre-image counted, then dry-run
+at -F0:
+
+	KernelSU-Next/KernelSU-Next @ next    1 occurrence   applies at -F0
+	tiann/KernelSU              @ main    1 occurrence   applies at -F0
+	ShirkNeko/SukiSU-Ultra      @ main    1 occurrence   applies at -F0
+
+Both `selinux_status_update_policyload` call sites are removed -- the
+`>= 6.4` arm and the `selinux_state` arm -- so the fork's own version gating is
+untouched and only the two calls go.
+
+TWO LINES OF CONTEXT, AND THAT IS FORCED
+
+The line above the hunk is the fork-specific `#if`: KernelSU-Next splits it as
+
+	#if ((!defined(KSU_COMPAT_USE_SELINUX_STATE)) || \
+		LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+
+where tiann/KernelSU and SukiSU-Ultra put it on one line. So three lines of
+leading context reaches out of the common region and the patch stops applying to
+two of the three forks -- measured: regenerating this at -U3 made KernelSU and
+SukiSU FAIL while KernelSU-Next kept working. Two lines on each side is the most
+that is common, it is SYMMETRIC (which is what `patch -F0` cares about), and the
+pre-image is unique in all three forks -- counted, not assumed.
+
+What WAS wrong with the previous revision is everything around the hunk: no
+header, no applies-to matrix, no note that the paths are relative to the KernelSU
+checkout, and no `@@` function name. This is now generated the way every other
+file here is -- by editing a real tree and running `diff -u2 -p` -- so the
+function name is present and the hunk is correct by construction.
+
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
-@@ -39,10 +39,8 @@
+@@ -63,10 +63,8 @@ static void reset_avc_cache()
      avc_ss_reset(0);
      selnl_notify_policyload(0);
 -    selinux_status_update_policyload(0);
