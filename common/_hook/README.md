@@ -1,13 +1,13 @@
 # `_hook` — SELinux oracle cloak
 
-Four families - seven files - that close SELinux-side oracles a detector uses to
+Four families - eight files - that close SELinux-side oracles a detector uses to
 tell a rooted kernel from a stock one. Applied by the NoMount kernel builders
 after the KSU patches, at **fuzz 0**, each fail-closed
 (`scripts/apply_nomount_stack.sh hook`).
 
 | family | closes |
 |---|---|
-| `hide_selinux_attr.patch` / `hide_selinux_attr_6_12.patch` | `write(/proc/self/attr/*)`, `lsm_set_self_attr(2)` and - on the `_6_12` variant only - `setxattr(security.selinux)` returning EACCES (type exists) instead of EINVAL (type absent) |
+| `hide_selinux_attr.patch` / `_6_6.patch` / `_6_12.patch` | `write(/proc/self/attr/*)`, `lsm_set_self_attr(2)` (`_6_12` only) and - on the `_6_6` and `_6_12` variants - `setxattr(security.selinux)` returning EACCES (type exists) instead of EINVAL (type absent) |
 | `hide_selinux_selinuxfs_5_10.patch` / `hide_selinux_selinuxfs_6_12.patch` | the same probe through every `selinuxfs` write node (`access`/`create`/`relabel`/`user`/`member`/`context`/`validatetrans`), plus a reply filter so a computed context never echoes a hidden type back |
 | `quiet_selinux_audit.patch` / `_legacy.patch` | AVC denial records naming a root type, **at uid >= 2000 only** |
 | `fix_selinux_seqno.patch` | `/sys/fs/selinux/status` reporting `policyload = 0` after KSU's runtime rules |
@@ -22,7 +22,8 @@ for it, and the object each one touches was compiled (`ARCH=arm64 LLVM=1`).
 |---|---|---|---|---|---|
 | `hide_selinux_selinuxfs_6_12.patch` | - | - | - | YES | YES |
 | `hide_selinux_selinuxfs_5_10.patch` | YES | YES | YES | - | - |
-| `hide_selinux_attr_6_12.patch` | - | - | - | - | YES |
+| `hide_selinux_attr_6_12.patch` | - | - | - | YES | YES |
+| `hide_selinux_attr_6_6.patch` | - | - | - | **YES** | YES |
 | `hide_selinux_attr.patch` (fallback) | YES | YES | YES | YES | YES |
 | `quiet_selinux_audit.patch` | YES | YES | YES | YES | YES |
 | `quiet_selinux_audit_legacy.patch` | YES | YES | YES | YES | YES |
@@ -37,7 +38,10 @@ than taking the first that applies.
   whether the added code passes `state` to `security_sid_to_context()`. Both
   dry-run clean everywhere; the wrong one fails at compile time.
 * `hide_selinux_attr.patch` also applies on 6.12, where `_6_12` must win because
-  it additionally guards `selinux_inode_setxattr()`.
+  it additionally guards `selinux_inode_setxattr()`. **Three** variants now
+  overlap on 6.6 and 6.12 — the pin is what resolves them:
+  `hide_selinux_attr_6_6.patch` on 6.6, `_6_12` on 6.12, the fallback on the
+  older three.
 
 ### Deleted, and why
 
@@ -83,10 +87,15 @@ share one list. Two copies remain — `security/selinux/hooks.c`
 source files, at different kernel versions, and a shared header would have to be
 installed and included by all of them (too invasive for the patch form). Each of
 those sites carries a comment pointing at the others; adding a type means editing
-all three. It was four until `quiet_selinux_audit_user.patch` was deleted. A
-setup that adds a type those strings do not name (Magisk, APatch, a
-differently-named hook framework) leaves the oracle open for it, and nothing
-fails a build to say so.
+all three. It was four until `quiet_selinux_audit_user.patch` was deleted.
+
+**`apply_nomount_stack.sh verify hook` now asserts the three lists are EQUAL**,
+and both workflows do the same. That check did not exist: the old one was
+`grep :ksu:` per file, which a two-of-three edit passes, and this fleet includes
+a build that can rename the `ksu` domain — so a list that drifts was not
+hypothetical. A setup that adds a type those strings do not name (Magisk,
+APatch, a differently-named hook framework) still leaves the oracle open for it,
+and nothing can fail a build to say so — that one needs the device probe below.
 
 Three placement rules the guards now follow, and any new site must too:
 
@@ -105,6 +114,27 @@ Three placement rules the guards now follow, and any new site must too:
   and guards `selinux_setprocattr` only — **`setxattr(security.selinux)` is
   therefore uncovered on 5.10/5.15/6.1.** Do not read the coverage table above as
   applying to the fallback.
+
+  **This sentence used to say 5.10/5.15/6.1 while the builder pinned the fallback
+  on 6.6 as well**, so the gap was one kernel version wider than the only line
+  describing it — and `hide_selinux_attr_6_12.patch`'s own header said so ("6.6
+  … takes the fallback and keeps the setxattr gap recorded in the README") while
+  the README did not. 6.6 already carries the `mnt_idmap`-era
+  `selinux_inode_setxattr()` the 6.12 hunk guards, so it needed no new hunk
+  shape, only a variant pairing that hunk with the 6.6-shaped
+  `selinux_setprocattr()` one. That is `hide_selinux_attr_6_6.patch`, GENERATED
+  by applying both existing hunks to the real android15-6.6 tree and diffing the
+  result — so the type list and the uid gate cannot drift from the files it was
+  cut from, which matters more here than anywhere else because the list now
+  lives in four places instead of three.
+
+  5.10/5.15/6.1 remain uncovered for `setxattr`, and that is now a stated
+  decision rather than an omission: their `selinux_inode_setxattr()` takes
+  neither the `struct mnt_idmap *` nor the `struct user_namespace *` the hunk is
+  fitted to, so covering them needs a third hunk shape fitted and dry-run against
+  those three trees. Reachability there is narrow — the guard sits after
+  `FILE__RELABELFROM`, which no AOSP app domain holds on its own files — which is
+  why it has stayed open, not because nobody noticed.
 
   History worth keeping: the fallback shipped for a while with its guard at
   *function entry*, ahead of the `PROCESS__SETCURRENT` check — breaking the first
@@ -143,6 +173,39 @@ Three placement rules the guards now follow, and any new site must too:
   same inversion as a misplaced guard, arriving through the *length argument*
   rather than through placement, and it is what got the old base selinuxfs
   variant deleted.
+
+### Two residuals, deliberately not "fixed"
+
+Both are known, both are narrow, and both would take unverifiable C in a
+security-sensitive patch to close. Naming them here is the fix; the alternative
+is a hunk nobody can dry-run against a real tree, which this directory's own
+rule ("an unverifiable hunk is worse than none") refuses.
+
+* **The selinuxfs reply filter is the one guard that does not answer what an
+  absent type answers.** Every input guard returns `-EINVAL`, which is exactly
+  what stock returns for a type that is not in the policy. The reply filter in
+  `selinux_transaction_write()` is different: the *request* was well-formed and
+  stock answers it with a computed context and success, so a caller who can find
+  a `(scon, tcon, class)` whose computed context is a covered type gets `EINVAL`
+  where an unrooted kernel returns a context.
+
+  It stays, because leaking `u:r:ksu:s0` in a reply is categorically worse than a
+  refusal. What bounds it is circularity: to construct that probe you must
+  already know a transition into a covered type exists, which is the answer you
+  were trying to obtain. A brute-force sweep of triples could still notice one
+  that answers `EINVAL` where every other succeeds, and would learn that
+  *something* is hidden without learning what. Only `create`, `relabel`, `member`
+  and `user` return contexts at all, and reaching any of them needs
+  `SECURITY__COMPUTE_*`, which no app domain holds.
+
+* **The setxattr guard suppresses an audit record stock emits.** Stock
+  `selinux_inode_setxattr()`, on `security_context_to_sid() == -EINVAL` without
+  `CAP_MAC_ADMIN`, emits `audit_log(… op=setxattr invalid_context=…)` before
+  returning. The guard returns `-EINVAL` without it, so a hidden type produces no
+  record where an unknown type produces one. Not app-reachable on Android — apps
+  cannot read the audit stream — and closing it means replicating ~15 lines of
+  stock's audit-buffer code inside a patch that cannot be compiled outside a full
+  kernel build.
 
 Verify on the target rather than assume. Run as a **non-root uid** (the gate is
 `uid >= 2000`), and use `dd` rather than `echo` — toybox `echo` does not check
