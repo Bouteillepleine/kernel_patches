@@ -93,7 +93,22 @@ instead.
 * `smaps_rollup` is a `for (vma = priv->mm->mmap; vma;)` loop on 5.10/5.15 with
   the advance at the *bottom* of the body — `continue` there would hang. Those
   versions suppress the accumulation instead; 6.1/6.6/6.12 are `do`/`while` and
-  use `continue`.
+  use `continue`. That is **two behavioural differences, not one**, and both are
+  intentional: on 5.10/5.15 a hidden VMA still advances `last_vma_end` and still
+  runs the `mmap_lock_is_contended()` release block, where on 6.1+ the `continue`
+  skips both. Skipping the contention check is harmless (it is an
+  opportunistic yield); skipping `last_vma_end` shortens the `[rollup]` header
+  range when the hidden VMA is the last one. Neither closes or opens an oracle
+  the other does not — the smaps-vs-rollup mismatch is closed on all five — but
+  do not read the two shapes as equivalent when regenerating either.
+* The `extern bool pathhide_match_file(struct file *file);` in the `map_files`
+  hunks sits at **file scope in `fs/proc/base.c`**, between two `#include` lines,
+  rather than inside each function the way every other integration site declares
+  it. That is deliberate — `base.c` reaches the predicate from three functions
+  and one declaration is cheaper than three — but it is the one hunk in this set
+  whose anchor is an include block, which upstream reorders more freely than it
+  reorders function bodies. If a tree ever moves those two includes, this is the
+  hunk that fails first, and it fails loudly (`-F0`), not silently.
 * GNU `patch` reports fuzz when a hunk's trailing context is shorter than its
   leading context, even when every line matches. The wrapper hunks therefore
   carry 1 line of context on each side (the declarations below the opening brace
@@ -128,7 +143,20 @@ inconsistent, and each inconsistency is a zero-privilege existence tell:
 * `smaps_rollup` totals diverge from `VmRSS` — the contained fix above makes
   rollup skip matched VMAs, which removes the smaps-vs-rollup mismatch but
   *deepens* the rollup-vs-`VmRSS` one;
-* an address hole where the VMA used to be.
+* an address hole where the VMA used to be — and the hole is not merely
+  suspicious, it is directly **interrogable**, which the first version of this
+  list understated. Three one-syscall probes, all self-readable, all needing no
+  arithmetic and no path recognition, and none of them ever true on stock:
+
+  | probe on the hidden range | hidden VMA present | genuinely unmapped |
+  |---|---|---|
+  | `mincore(addr, len, vec)` | `0` | `ENOMEM` |
+  | `mmap(addr, …, MAP_FIXED_NOREPLACE)` | `EEXIST` | succeeds |
+  | read `/proc/self/pagemap` at `addr` | present PTEs | zero entries |
+
+  Not measured on-device — derived from the kernel source, like the rest of this
+  section. They do not change the recommendation (do not load a rule); they make
+  it firmer, because the tell is one syscall rather than a sum.
 
 `smaps_rollup`'s contended-lock slow path (`mmap_lock_is_contended`) re-gathers a
 re-fetched VMA without re-checking `pathhide_match_file()`; the contained fix only
@@ -167,7 +195,10 @@ present, off, and reachable only by a deliberate `nm k p '+needle'`.
 The real control plane is nomount's private raw-netlink channel: `nomount.c`
 forwards `NM_KNOB_PATHHIDE → pathhide_ctl()` and `NM_CMD_GET_PATHHIDE →
 pathhide_get_rule()` through **weak** externs (so the two patch sets stay
-independently applicable), behind nomount's existing **CAP_NET_ADMIN** check.
+independently applicable), behind nomount's existing **CAP_SYS_ADMIN** check.
+(It was CAP_NET_ADMIN until the engine tightened it — one `ADD_RULE` redirects
+any ROM path at any file, which is root-equivalent, and CAP_NET_ADMIN is held on
+Android by domains that are not.)
 That forwarder is supplied by the nomount engine repo, not by kernel_patches — a
 kernel built from `_pathhide` **without** that nomount commit has a dead feature.
 Ship both together, or enable `PH_ENABLE_PROC` for a standalone build.
@@ -182,6 +213,13 @@ Ship both together, or enable `PH_ENABLE_PROC` for a standalone build.
   real open oracle. **Every** integration patch now guards `show_numa_map()` the
   same way as `show_map()`; `show_numa_map()` lives inside `#ifdef CONFIG_NUMA`
   on all five versions, so the guard is a strict no-op where NUMA is off.
+* **You cannot check it afterwards.** `pathhide_match_file()` has no uid gate —
+  correct for its purpose, since a cloak that answers differently for root is a
+  cloak with a tell. The consequence is that `nm`, `nomount check` and
+  `doctor.rs` cannot see a pathhidden mapping either, so unlike `_ghost` — whose
+  `ghost_seen_by()` probe becomes the hidden uid and asks the running kernel
+  whether the cloak actually works — there is **no way to confirm from userspace
+  that a rule did what it claims**. That is part of the cost of loading one.
 * **`dl_iterate_phdr()` / the dynamic linker's `link_map`** — userspace bookkeeping
   in the process's own address space, populated by the loader, not by the kernel.
   The kernel cannot filter it; a file-backed mapping hidden from `maps` is still

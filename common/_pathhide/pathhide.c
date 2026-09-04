@@ -31,9 +31,11 @@
  *     nm k p '-'                                     # clear all
  *     nm l p                                         # list rules
  *
- * That channel is CAP_NET_ADMIN-gated, is not enumerable, and creates no dirent
- * anywhere -- see the stealth notes below for why this file no longer owns a
- * /proc node. nomount.c forwards NM_KNOB_PATHHIDE to pathhide_ctl() and
+ * That channel is CAP_SYS_ADMIN-gated (it was CAP_NET_ADMIN until the engine
+ * tightened it: one ADD_RULE redirects any ROM path at any file, which is
+ * root-equivalent, and CAP_NET_ADMIN is held on Android by domains that are not
+ * -- netd, system_server), is not enumerable, and creates no dirent anywhere --
+ * see the stealth notes below for why this file no longer owns a /proc node. nomount.c forwards NM_KNOB_PATHHIDE to pathhide_ctl() and
  * NM_CMD_GET_PATHHIDE to pathhide_get_rule(), both through WEAK symbols, so the
  * two patch sets still apply independently: a kernel with nomount but without
  * pathhide answers -EINVAL on the knob, and a kernel with pathhide but without
@@ -250,9 +252,10 @@ static int ph_del_locked(const char *s)
  * caller staging its own buffer.
  *
  * Deliberately does NOT check capabilities: every caller is already behind one
- * (CAP_NET_ADMIN on the netlink knob, CAP_SYS_ADMIN on the /proc write). Putting
- * a second, different check here would make the two paths disagree about who may
- * configure this.
+ * (CAP_SYS_ADMIN on the netlink knob and on the /proc write alike). Putting a
+ * second, different check here would make the two paths disagree about who may
+ * configure this -- so keep this comment in step with nomount.c's
+ * netlink_capable() call rather than adding a check.
  *
  * Returns 0, or a negative errno the caller MUST propagate -- see ph_add_locked
  * for why a full table has to be reported rather than swallowed.
