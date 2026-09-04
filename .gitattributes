@@ -1,0 +1,31 @@
+# Line endings for the NoMount stack. Prophylactic, not a repair: the tracked
+# files are LF today.
+#
+# WHY IT IS WORTH PINNING ANYWAY. Nothing in this repository stated a line-ending
+# policy, so it rested on every contributor's core.autocrlf. That is a bad thing
+# to rest on here, and it was demonstrated during the audit that added
+# ghost_access/ghost_chown/ghost_open: a patch generated on Windows -- python's
+# text-mode stdout translates \n to \r\n on the way through a shell redirect --
+# came out CRLF and would have been committed that way.
+#
+# What a CR costs in these four directories specifically:
+#
+#   * scripts/apply_nomount_stack.sh feeds these patches to `patch -p1 -F0`, and
+#     a CR at the end of every context line does not match an LF kernel source.
+#     The script papers over it with `dos2unix ... || true`, which is
+#     best-effort: on a runner without dos2unix the patch fails at -F0 and
+#     reports "neither applies at fuzz 0 nor is already present", which points at
+#     the tree instead of at the line endings.
+#   * ghost.c / ghost.h / pathhide.c / pathhide.h are COPIED into the kernel tree
+#     and compiled. A CR survives that copy.
+#   * apply_nomount_stack.sh is a shell script; a \r after `then` breaks it.
+#
+# Scoped to the four directories the NoMount stack owns rather than applied
+# globally, so this cannot renormalise (and so cannot appear to rewrite) the
+# several hundred unrelated patches elsewhere in this repository. Widen it when
+# those are touched, not before.
+common/_ghost/**     text eol=lf
+common/_hook/**      text eol=lf
+common/_pathhide/**  text eol=lf
+scripts/**           text eol=lf
+.gitattributes       text eol=lf
