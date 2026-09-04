@@ -42,6 +42,43 @@ where an absent one answers `EROFS` on a read-only ROM mount. Shared by
 | `mkdirat(AT_FDCWD, p, 0700)` | `EEXIST` | `EROFS` |
 | `mknodat(AT_FDCWD, p, …)` | `EEXIST` | `EROFS` |
 
+A **fourth** was found by reading `inode_permission()` rather than by probing the
+syscalls above it. `sb_permission()` runs **first** and short-circuits the whole
+call on a read-only superblock, so every `MAY_WRITE` query on a ROM partition is
+answered before `do_inode_permission()` ever dispatches to the engine's hijacked
+`->permission`:
+
+```c
+int inode_permission(struct mnt_idmap *idmap, struct inode *inode, int mask)
+{
+        retval = sb_permission(inode->i_sb, inode, mask);
+        if (retval)
+                return retval;                      /* -EROFS */
+        ...
+        retval = do_inode_permission(idmap, inode, mask);   /* the engine */
+```
+
+| probe | hidden | absent | stock visible |
+|---|---|---|---|
+| `access(p, W_OK)` | `EROFS` | `ENOENT` | `EROFS` |
+| `open(p, O_WRONLY)` / `O_RDWR` | `EROFS` | `ENOENT` | `EROFS` |
+| `open(p, O_WRONLY\|O_TRUNC)` | `EROFS` | `ENOENT` | `EROFS` |
+| `open(p, O_CREAT\|O_EXCL, 0600)` | `EEXIST` | `EROFS` | `EEXIST` |
+| `open(p, O_CREAT\|O_RDONLY, 0600)` | `ENOENT` | `EROFS` | succeeds |
+| `chown(p, -1, -1)` | `EROFS` | `ENOENT` | `EROFS` |
+
+`access(p, W_OK)` is the cheapest probe this directory closes: one syscall, no
+control path, no privilege, and it answers exactly as a stock *visible* file
+does. The `O_CREAT|O_EXCL` form is the `filename_create()` signature reached by
+the one create path that does **not** route through `filename_create()` —
+`path_openat()` runs `link_path_walk()` and `open_last_lookups()` itself, and
+`do_open()` returns `-EEXIST` ahead of `may_open()`.
+
+These six were derived from `torvalds/linux` v6.12 `fs/namei.c` and `fs/open.c`
+and are **not** device-measured, unlike the tables above. The mechanism is the
+same one the `truncate`/`utimensat`/`chmod` row was measured for; those three
+were simply the members that got probed first.
+
 Cleared by the same measurement, and deliberately NOT patched: plain
 `inotify_add_watch` (no `IN_ONLYDIR`) and `name_to_handle_at` answer identically
 for hidden and absent (`n2h` is `ENOSYS` — the fs exports no `->fh_to_dentry`).
@@ -53,11 +90,15 @@ in the engine, not here.
 
 ⚠️ The class is **not proven exhaustive**. Anything that resolves a path and then
 acts without consulting a hijacked op is a candidate. `classprobe.c` is the
-harness — extend it rather than reasoning.
+harness — extend it rather than reasoning. Reading the source found family 4
+after three rounds of probing had not, so do both.
 
-This directory closes all of them — eight families of guard. `ghost.c` supplies
-one predicate, `ghost_hidden_path()`; the `ghost_*.patch` files place the guards,
-each of which answers `-ENOENT`.
+This directory closes all of them — **eleven** families of guard. `ghost.c`
+supplies one predicate, `ghost_hidden_path()`; the `ghost_*.patch` files place
+the guards. Most answer `-ENOENT`; `ghost_create.patch` and `ghost_open.patch`
+answer what an **absent** name would have got instead, which on a read-only
+mount is `-EROFS` — see their headers for why a uniform `-ENOENT` would be a new
+oracle rather than a closed one.
 
 ## Files
 
@@ -72,6 +113,9 @@ each of which answers `-ENOENT`.
 | `ghost_truncate.patch` | guard in `do_sys_truncate()`, `fs/open.c` |
 | `ghost_utimes.patch` | guard in `do_utimes_path()`, `fs/utimes.c` |
 | `ghost_chmod*.patch` | guard in `do_fchmodat()`, `fs/open.c` |
+| `ghost_chown.patch` | guard in `do_fchownat()`, `fs/open.c` — one file, 5.10→6.12 |
+| `ghost_access.patch` | guard in `do_faccessat()`, `fs/open.c` — `access(W_OK)` only |
+| `ghost_open.patch` | guard in `do_open()`, `fs/namei.c` — write-intent and `O_CREAT` opens |
 | `ghost_create.patch` | guard in `filename_create()`, `fs/namei.c` — `mkdirat`/`mknodat`/`symlinkat`/`linkat` |
 
 Each family has variants; a builder applies the **first that dry-runs clean**,
@@ -144,7 +188,10 @@ safety argument for the whole design:
 ### Nothing here configures it
 
 Same arrangement, and the same caveat, as `_pathhide`'s M-C8. The control plane
-is nomount's private **CAP_NET_ADMIN** raw-netlink channel, which must forward
+is nomount's private **CAP_SYS_ADMIN** raw-netlink channel (it was CAP_NET_ADMIN
+until the engine tightened it — one `ADD_RULE` redirects any ROM path at any
+file, which is root-equivalent, and CAP_NET_ADMIN is held on Android by domains
+that are not), which must forward
 `NM_KNOB_GHOST → ghost_ctl()` and `NM_CMD_GET_GHOST → ghost_get_rule()` through
 **weak** externs. That forwarder is supplied by the nomount engine repo, **not**
 by `kernel_patches`.
@@ -205,6 +252,11 @@ this list.
 | **2** | `getxattr` / `listxattr` / `setxattr` / `removexattr` | **high** — returns the SELinux label | **low** — cold syscall wrappers in `fs/xattr.c`, no in-kernel callers | `fs/xattr.c` `path_*xattr()` |
 | **3** | `link()` `EXDEV` | low — one bit | **low** — `do_linkat()` is reached only by `link(2)`/`linkat(2)` | `fs/namei.c` `do_linkat()` |
 | **4** | `ENOTDIR` — `stat(p "/zzz")`, `stat(p "/")`, `chdir(p)`, `open(O_DIRECTORY)`, `open(O_PATH\|O_DIRECTORY)`, `inotify IN_ONLYDIR` | low per probe — one bit — but there are six of them and any one is a complete substitute for the other three guards | **low** — both guards sit on error paths that are only reached by a lookup already failing, and neither is in `link_path_walk()` any more | `fs/namei.c` `path_lookupat()` + `do_open()` |
+
+| **5** | `access(p, W_OK)` and `open(p, O_WRONLY\|O_RDWR\|O_TRUNC)` | **highest of the later families** — one syscall, no control path, and the answer is identical to a stock visible file | **low** for `access` (`do_faccessat()` is a cold wrapper and the guard is gated on `MAY_WRITE`); **moderate** for `open` — `do_open()` runs on every open(2), which is why that guard is gated on write intent and never evaluates the predicate for a plain read | `fs/open.c` `do_faccessat()`, `fs/namei.c` `do_open()` |
+| **6** | `open(p, O_CREAT\|O_EXCL)` / `open(p, O_CREAT\|O_RDONLY)` | high — the `mkdirat` signature on the path `filename_create()` does not cover | low — same guard as #5, same gate | `fs/namei.c` `do_open()` |
+| **7** | `truncate` / `utimensat` / `chmod` / `chown` | low per probe, four of them | **lowest** — four cold syscall wrappers, each guarded immediately after its own `user_path_at()` | `fs/open.c`, `fs/utimes.c` |
+| **8** | `mkdirat` / `mknodat` / `symlinkat` / `linkat` target | high — one syscall, no control needed | low — the guard sits on an arm that already ends in `goto fail` | `fs/namei.c` `filename_create()` |
 
 Two things about this ranking are worth spelling out, because both cut against
 the obvious guess:
@@ -269,6 +321,9 @@ columns were re-measured at `-F0`.
 | **chmod** | `ghost_chmod.patch` | 6.6 6.12, aosp and op |
 | | `ghost_chmod_5_10.patch` | 5.10 5.15 6.1, aosp and op |
 | **create** | `ghost_create.patch` | one file: 5.10…6.12 (`filename_create()`'s `-EEXIST` block is byte-identical), aosp and op |
+| **chown** | `ghost_chown.patch` | one file: 5.10…6.12 (`do_fchownat()` is byte-identical across all five), op |
+| **access** | `ghost_access.patch` | one file: 5.10…6.12 (the `retry:` → `d_backing_inode()` region is byte-identical even though `inode_permission()`'s signature is not), op |
+| **open** | `ghost_open.patch` | one file: 5.10…6.12, generated at `-U2` because the line below `audit_inode()` differs per version, op |
 | **build** | `ghost_build_integration.patch` | every tree above, v4.9 → master |
 
 ### Three variants were deleted
@@ -315,6 +370,32 @@ applies" is how a `-ENOENT` guard lands in the wrong wrapper.
   against each of the ten trees.
 * **`path_listxattr()` is byte-identical on all 14 trees** that have it — the
   only one of the four xattr wrappers that never changed shape.
+* **FUZZ 0 IS NECESSARY AND NOT SUFFICIENT. Count your pre-image.** `patch -F0`
+  proves a hunk matches *somewhere*; it says nothing about whether it matches in
+  **one** place. When a pre-image occurs twice, `patch` resolves it by proximity
+  to the `@@` line number — which is pinned to whichever tree the patch was cut
+  against — so the same file lands the guard in a different function on every
+  other tree, at fuzz 0, silently.
+
+  That is not hypothetical. `ghost_notdir.patch` used three lines of leading
+  context starting at `nd->path.mnt = NULL;`. `path_lookupat()` and
+  `path_parentat()` end with the **same five lines**, so that pre-image occurs
+  **twice** in `fs/namei.c` on every one of the five trees, and the guard landed
+  in `path_parentat()` on 5.10, 5.15, 6.1 and 6.6 — four of the five kernels the
+  fleet builds — leaving the whole `ENOTDIR` family open there while every
+  assertion in the repo stayed green. Only 6.12, the tree the hunk was generated
+  against, was correct.
+
+  The fix was one extra line of context: `*path = nd->path;`, which is what
+  `path_lookupat()` writes where `path_parentat()` writes `*parent = nd->path;`.
+  Pre-image occurrences went from 2 to 1 on all five. `apply_nomount_stack.sh`
+  and both workflows now assert the containing FUNCTION by name, so this cannot
+  recur silently.
+
+  Before you trust a dry-run: `grep -c` your hunk's pre-image in the target file,
+  on every tree. `scripts/` has no helper for this yet; the audit used a
+  throwaway that walks each `@@` block, reassembles the context and `-` lines,
+  and counts occurrences.
 * **Hand-writing these hunks does not work.** Every patch here was generated by
   editing a real source file and running `diff -u`, then dry-run against all 15
   trees. Hand-written hunks with correct pre-image text and correct `@@` counts
@@ -363,10 +444,28 @@ Applying the full `_ghost` set together was verified end to end on all five
 OnePlus trees and on vanilla v5.10 → v6.12: three of the patches touch
 `fs/namei.c` and none of them conflicts.
 
-## CI wiring this would need (not done here — do not wire it yourself)
+## CI wiring — done
 
-`_ghost` is invisible to CI as it stands. Both existing workflows filter on
-paths:
+This section used to read *"CI wiring this would need (not done here — do not
+wire it yourself)"*. It is wired. Both workflows carry `common/_ghost/**` in
+their `paths:` filters, `verify-hook-pathhide.yml` compiles `fs/proc/ghost.o`,
+`fs/namei.o`, `fs/xattr.o`, `fs/open.o` and `fs/utimes.o`, asserts
+`ghost_hidden_path` is exported from `fs/proc/built-in.a`, and asserts the
+`proc_create` absence this section asked for by name.
+
+Two things were added on top of what it asked for, and both exist because of a
+bug this directory shipped for four kernel versions:
+
+* **Every guard is asserted by FUNCTION NAME**, not by "the file mentions
+  `ghost_hidden_path`". `fs/namei.c` is touched by five families, so one
+  occurrence satisfied the old assertion even when four guards were missing.
+* **`verify-patches-oneplus.yml` now checks all eleven families.** It checked
+  five — `o_path`, `xattr`, `linkat`, `notdir`, `build` — and skipped
+  `truncate`, `utimes`, `chmod` and `create`, which is the *same four* whose
+  absence `scripts/apply_nomount_stack.sh`'s header cites as the reason that
+  script exists. It had drifted straight back.
+
+For the record, the original text, which is still accurate about the trap:
 
 * `.github/workflows/verify-patches-oneplus.yml` — dry-runs every patch against
   every `(tree, revision)` in the fleet. Broad, no compile. `_ghost` needs to be
@@ -489,6 +588,18 @@ su $U -c '...'
 | `open(p, O_PATH\|O_DIRECTORY)` | `ENOENT` |
 | `inotify_add_watch(p, IN_ONLYDIR)` | `ENOENT` |
 | `link(p, "/data/local/tmp/x")` | `ENOENT` |
+| `access(p, W_OK)` | `ENOENT` |
+| `open(p, O_WRONLY)` | `ENOENT` |
+| `open(p, O_WRONLY\|O_TRUNC)` | `ENOENT` |
+| `chown(p, -1, -1)` | `ENOENT` |
+
+Two probes are the exception and must **not** answer `ENOENT` — they answer what
+an absent name answers on a read-only mount, which is `EROFS`:
+
+| probe | required answer for both `$H` and `$A` |
+|---|---|
+| `mkdirat(AT_FDCWD, p, 0700)` | `EROFS` |
+| `open(p, O_CREAT\|O_EXCL, 0600)` | `EROFS` |
 
 Use the compiled `/data/local/tmp/leakprobe`, not shell tools: `toybox stat`
 `lstat()`s before it does anything else and `toybox readlink -f` canonicalises
