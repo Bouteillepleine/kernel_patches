@@ -170,16 +170,29 @@ jobs:
             # too, which is why ghost_xattr_6_6.patch -- a variant no tree in
             # either fleet resolved to -- has been deleted rather than kept.
             case "$kv" in
-              6.12|6.6) GX=ghost_xattr_6_12.patch ; GL=ghost_linkat_5_15.patch ;;
-              6.1|5.15) GX=ghost_xattr_5_15.patch ; GL=ghost_linkat_5_15.patch ;;
-              5.10)     GX=ghost_xattr.patch      ; GL=ghost_linkat.patch ;;
-              *)        GX=                       ; GL= ;;
+              6.12|6.6) GX=ghost_xattr_6_12.patch ; GL=ghost_linkat_5_15.patch ; GC=ghost_chmod.patch ;;
+              6.1|5.15) GX=ghost_xattr_5_15.patch ; GL=ghost_linkat_5_15.patch ; GC=ghost_chmod_5_10.patch ;;
+              5.10)     GX=ghost_xattr.patch      ; GL=ghost_linkat.patch      ; GC=ghost_chmod_5_10.patch ;;
+              *)        GX=                       ; GL=                        ; GC= ;;
             esac
             if [ -n "$GX" ]; then
+              # ALL NINE families. This used to check five -- o_path, xattr,
+              # linkat, notdir, build -- and skip truncate, utimes, chmod and
+              # create, which is the exact drift scripts/apply_nomount_stack.sh's
+              # own header cites as the reason it was written ("the verifier
+              # spent a day applying four of the seven _ghost families while
+              # reporting on all of them"). It had drifted straight back.
               gfam ghost_o_path.patch ghost_o_path.patch
               gfam "$GX" ghost_xattr_6_12.patch ghost_xattr_5_15.patch ghost_xattr.patch
               gfam "$GL" ghost_linkat_5_15.patch ghost_linkat.patch
               gfam ghost_notdir.patch ghost_notdir.patch
+              gfam ghost_truncate.patch ghost_truncate.patch
+              gfam ghost_utimes.patch ghost_utimes.patch
+              gfam "$GC" ghost_chmod.patch ghost_chmod_5_10.patch
+              gfam ghost_create.patch ghost_create.patch
+              gfam ghost_chown.patch ghost_chown.patch
+              gfam ghost_access.patch ghost_access.patch
+              gfam ghost_open.patch ghost_open.patch
               gfam ghost_build_integration.patch ghost_build_integration.patch
             else
               echo "::warning::$name @ ${rev:0:8}: no _ghost variant map for k=$kv - _ghost not checked on this tree"

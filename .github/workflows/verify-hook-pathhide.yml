@@ -307,6 +307,25 @@ jobs:
           set -e
           V="${{ matrix.version }}"; KVER="${V#*-}"; P="$GITHUB_WORKSPACE/common"
           cd "$KDIR"
+
+          # ---- pre-image ambiguity, BEFORE anything is applied ---------------
+          # `patch -F0` proves a hunk matches somewhere; it says nothing about
+          # whether it matches in ONE place. ghost_notdir.patch's pre-image
+          # occurred twice in fs/namei.c -- path_lookupat() and path_parentat()
+          # end with the same five lines -- so patch resolved it by proximity to
+          # the @@ line number, pinned to 6.12, and the guard landed in
+          # path_parentat() on 5.10/5.15/6.1/6.6 with every check in this job
+          # green. This is the check that would have caught it on day one.
+          mkdir -p "$RUNNER_TEMP/pitrees/$KVER"
+          ln -sfn "$KDIR/fs" "$RUNNER_TEMP/pitrees/$KVER/fs"
+          ln -sfn "$KDIR/security" "$RUNNER_TEMP/pitrees/$KVER/security"
+          python3 "$GITHUB_WORKSPACE/scripts/check_preimages.py" \
+            --trees "$RUNNER_TEMP/pitrees" \
+            "$P"/_ghost/*.patch "$P"/_hook/hide_selinux_attr*.patch \
+            "$P"/_hook/hide_selinux_selinuxfs*.patch "$P"/_hook/quiet*.patch \
+            "$P"/_pathhide/*.patch
+          echo "pre-images: no dangerous ambiguity on $KVER"
+
           cp "$P/_pathhide/pathhide.c" fs/proc/pathhide.c
           cp "$P/_pathhide/pathhide.h" fs/proc/pathhide.h
           patch -p1 < "$P/_pathhide/pathhide_${KVER}_integration.patch"
@@ -314,9 +333,15 @@ jobs:
           patch -p1 < "$P/_pathhide/pathhide_mapfiles_${KVER}_integration.patch"
           case "$KVER" in
             6.12) REQ_ATTR=hide_selinux_attr_6_12.patch ;;
+            # 6.6 has the mnt_idmap-era selinux_inode_setxattr() the 6.12 hunk
+            # guards, but still the 6.6-shaped selinux_setprocattr(). It used to
+            # take the setprocattr-ONLY fallback, which left
+            # setxattr(security.selinux) uncovered there while the README listed
+            # the gap as 5.10/5.15/6.1 only.
+            6.6)  REQ_ATTR=hide_selinux_attr_6_6.patch ;;
             *)    REQ_ATTR=hide_selinux_attr.patch ;;
           esac
-          patch -p1 < "$P/_hook/$REQ_ATTR"; echo "attr: $REQ_ATTR"
+          patch -p1 -F0 < "$P/_hook/$REQ_ATTR"; echo "attr: $REQ_ATTR"
           # PIN BY VERSION, not by "first that dry-runs". Both variants apply
           # cleanly on every tree -- they differ by one line, whether
           # security_sid_to_context() takes `state` -- so the old test always
@@ -330,13 +355,49 @@ jobs:
             5.10|5.15|6.1) REQ_AUDIT=quiet_selinux_audit_legacy.patch ;;
             *) echo "::error::no avc-audit variant pinned for KVER=$KVER"; exit 1 ;;
           esac
-          patch -p1 < "$P/_hook/$REQ_AUDIT"; echo "audit: $REQ_AUDIT"
+          patch -p1 -F0 < "$P/_hook/$REQ_AUDIT"; echo "audit: $REQ_AUDIT"
           case "$KVER" in
             6.6|6.12)      REQ_SFS=hide_selinux_selinuxfs_6_12.patch ;;
             5.10|5.15|6.1) REQ_SFS=hide_selinux_selinuxfs_5_10.patch ;;
             *) echo "::error::no selinuxfs variant pinned for KVER=$KVER"; exit 1 ;;
           esac
-          patch -p1 < "$P/_hook/$REQ_SFS"; echo "selinuxfs: $REQ_SFS"
+          patch -p1 -F0 < "$P/_hook/$REQ_SFS"; echo "selinuxfs: $REQ_SFS"
+          # ---- _hook landing assertions -------------------------------------
+          # Every selinuxfs WRITE NODE, by name. "selinuxfs.c contains
+          # sel_ctx_hidden" is satisfied by the DEFINITION alone, so a refit that
+          # dropped a call site passed. It matters more here than it looks:
+          # sel_write_access, sel_write_relabel and sel_write_member have
+          # character-identical bodies, so their hunks have identical pre-images
+          # and `patch` resolves them by line number. They land on the three
+          # sites in some order; this is what proves all three got a guard.
+          for w in sel_write_context sel_write_validatetrans sel_write_access \
+                   sel_write_create sel_write_relabel sel_write_user sel_write_member; do
+            SEG="$(awk "/^static ssize_t $w\(/,/^}/" security/selinux/selinuxfs.c 2>/dev/null)" || true
+            case "$SEG" in *sel_ctx_hidden*) ;; *) echo "::error::_hook: $w() has no sel_ctx_hidden() gate - that write node is an open hidden-type probe"; exit 1 ;; esac
+          done
+          # The hidden-type list is mirrored in three files. common/_hook/README.md
+          # says "adding a type means editing all three" and nothing enforced it:
+          # `grep :ksu:` per file passes a two-of-three edit, and a device on this
+          # fleet can rename the ksu domain.
+          NFS=$(grep -o '":[a-z_]*:"' security/selinux/selinuxfs.c | sort -u | tr '\n' ' ')
+          NHOOKS=$(grep -o '":[a-z_]*:"' security/selinux/hooks.c | sort -u | tr '\n' ' ')
+          NAVC=$(grep -o '":[a-z_]*:"' security/selinux/avc.c | sort -u | tr '\n' ' ')
+          [ -n "$NFS" ] || { echo "::error::_hook: no hidden-type list in selinuxfs.c"; exit 1; }
+          [ "$NFS" = "$NHOOKS" ] || { echo "::error::_hook: type list differs - selinuxfs.c [$NFS] vs hooks.c [$NHOOKS]"; exit 1; }
+          [ "$NFS" = "$NAVC" ]   || { echo "::error::_hook: type list differs - selinuxfs.c [$NFS] vs avc.c [$NAVC]"; exit 1; }
+          echo "_hook: type list mirrored in 3 files: $NFS"
+          # PLACEMENT. A guard placed BEFORE the stock avc check "shipped once and
+          # made 5.10/5.15/6.1 more detectable than unpatched" (README): every app
+          # domain is denied PROCESS__SETCURRENT, so the cloak answered
+          # EINVAL-for-hidden and EACCES-for-garbage, which stock cannot do.
+          awk '
+            /^static (int|noinline int) selinux_[a-z_]+\(/ { fn = $0; avc = 0 }
+            /avc_has_perm/                                 { avc = 1 }
+            /:ksu:/ { if (!avc) { print "EARLY " fn > "/dev/stderr"; bad = 1 } }
+            END { exit bad ? 1 : 0 }
+          ' security/selinux/hooks.c \
+            || { echo "::error::_hook: a hidden-type guard in hooks.c sits BEFORE its own function's avc_has_perm() - that inversion turns the cloak into a one-syscall root oracle"; exit 1; }
+          echo "_hook: every guard sits after its avc_has_perm()"
 
           # ---- _ghost -------------------------------------------------------
           # Applied AFTER _pathhide on purpose: that is the order the builders
@@ -413,6 +474,16 @@ jobs:
           patch -p1 -F0 --forward < "$P/_ghost/ghost_truncate.patch"
           patch -p1 -F0 --forward < "$P/_ghost/ghost_utimes.patch"
           ghost_first_of "$GC" ghost_chmod.patch ghost_chmod_5_10.patch
+          # chown is chmod's sibling in the same family; do_fchownat() is
+          # byte-identical on all five, so it needs no variant table.
+          patch -p1 -F0 --forward < "$P/_ghost/ghost_chown.patch"
+          # sb_permission() short-circuits inode_permission() before
+          # do_inode_permission() dispatches to the engine, so every MAY_WRITE
+          # probe on a read-only ROM answers -EROFS on its own: access(W_OK) is
+          # closed in do_faccessat(), and open(O_WRONLY|O_RDWR|O_TRUNC) plus the
+          # O_CREAT|O_EXCL EEXIST split in do_open().
+          patch -p1 -F0 --forward < "$P/_ghost/ghost_access.patch"
+          patch -p1 -F0 --forward < "$P/_ghost/ghost_open.patch"
           # filename_create(): mkdirat/mknodat answer EEXIST on a hidden name
           # where an absent one answers EROFS. A third ordering -- existence is
           # decided BEFORE err2 is consulted -- so this one reports err2 rather
@@ -421,20 +492,55 @@ jobs:
           patch -p1 -F0 --forward < "$P/_ghost/ghost_build_integration.patch"
           grep -q 'ghost.o' fs/proc/Makefile || { echo "::error::_ghost: ghost.o not wired into fs/proc/Makefile"; exit 1; }
           grep -q 'pathhide.o' fs/proc/Makefile || { echo "::error::_ghost build hunk displaced _pathhide's in fs/proc/Makefile"; exit 1; }
-          grep -q 'ghost_hidden_path' fs/namei.c || { echo "::error::_ghost: fs/namei.c guards missing"; exit 1; }
-          grep -q 'ghost_hidden_path' fs/xattr.c || { echo "::error::_ghost: fs/xattr.c guards missing"; exit 1; }
-          # Per-family, because "namei.c mentions ghost_hidden_path" is satisfied
-          # by ANY one of the three guards that live there.
-          grep -q 'ghost_hidden_path' fs/open.c || { echo "::error::_ghost: fs/open.c guards missing (truncate/chmod)"; exit 1; }
-          grep -q 'ghost_hidden_path' fs/utimes.c || { echo "::error::_ghost: fs/utimes.c guard missing (utimensat)"; exit 1; }
-          grep -q 'err2 && ghost_hidden_path' fs/namei.c || { echo "::error::_ghost: filename_create guard missing (mkdirat/mknodat)"; exit 1; }
-          # It must be in filename_create, NOT do_renameat2 -- both contain an
-          # `error = -EEXIST;` and a fuzzed hunk could land in the wrong one.
-          awk '/ghost_hidden_path\(&gpath\)/{found=NR} END{exit !found}' fs/namei.c || { echo "::error::_ghost: create guard not found by name"; exit 1; }
+          # LANDING ASSERTIONS, BY FUNCTION NAME.
+          #
+          # "fs/namei.c mentions ghost_hidden_path" is satisfied by ANY ONE of
+          # the five guards that live there, and that weakness hid a real bug:
+          # ghost_notdir.patch's pre-image occurs TWICE in fs/namei.c --
+          # path_lookupat() and path_parentat() end with the same five lines --
+          # so `patch` resolved it by proximity to the @@ line number, which is
+          # pinned to 6.12, and the guard landed in path_parentat() on 5.10,
+          # 5.15, 6.1 and 6.6. At fuzz 0. With every check in this job green.
+          #
+          # Fuzz 0 proves a hunk matches SOMEWHERE. Only this proves WHERE.
+          # NO PIPE INTO grep -q. This step runs under `set -o pipefail`, and
+          # `grep -q` exits the moment it matches, closing the pipe and killing
+          # awk with SIGPIPE -- so the pipeline reports failure exactly when the
+          # assertion PASSED, and whether it does depends on how much awk had
+          # already flushed. Measured while writing this: the same check passed
+          # on 6.6/6.12 and failed on 5.10/5.15/6.1 for no reason but output
+          # size. Capture, then match.
+          infn() {  # infn <file> <awk-start-regex> <needle> <what>
+            local seg
+            seg="$(awk "/$2/,/^}/" "$1" 2>/dev/null)" || true
+            case "$seg" in *"$3"*) return 0 ;; esac
+            echo "::error::_ghost: $4"; exit 1
+          }
+          infn fs/namei.c  '^static int do_o_path'                   'ghost_hidden_path(&path))' 'the O_PATH guard is not inside do_o_path()'
+          infn fs/namei.c  '^static int do_open'                     'op->acc_mode & MAY_WRITE' 'the open(2) guards are not inside do_open()'
+          infn fs/namei.c  '^static int path_lookupat'               'unlikely(err == -ENOTDIR)' 'the ENOTDIR guard is not inside path_lookupat() -- note it applies at fuzz 0 inside path_parentat() too'
+          infn fs/namei.c  '^static struct dentry \*filename_create' 'err2 && ghost_hidden_path' 'the create guard is not inside filename_create()'
+          infn fs/namei.c  '^(static )?int do_linkat'                'ghost_hidden_path(&old_path)' 'the link(2) guard is not inside do_linkat()'
+          infn fs/open.c   '^int do_fchownat'                        'ghost_hidden_path(&path))' 'the chown(2) guard is not inside do_fchownat()'
+          infn fs/open.c   '^static long do_faccessat'               'mode & MAY_WRITE) && ghost_hidden_path' 'the access(2) guard is not inside do_faccessat()'
+          infn fs/open.c   'do_fchmodat'                             'ghost_hidden_path(&path))' 'the chmod(2) guard is not inside do_fchmodat()'
+          infn fs/open.c   '^(long|int) do_sys_truncate'             'ghost_hidden_path(&path))' 'the truncate(2) guard is not inside do_sys_truncate()'
+          infn fs/utimes.c '^(static )?(long|int) do_utimes_path'    'ghost_hidden_path(&path))' 'the utimensat(2) guard is not inside do_utimes_path()'
+          # All four xattr wrappers or none: three of the four bodies are
+          # character-identical below `retry:`, so a mis-resolved hunk lands a
+          # -ENOENT guard in the wrong wrapper AND leaves another unguarded.
+          for w in path_setxattr path_getxattr path_listxattr path_removexattr; do
+            infn fs/xattr.c "^static (ssize_t|int) $w\(" 'ghost_hidden_path(&path))' "fs/xattr.c has no guard inside $w()"
+          done
+          n=$(grep -c 'ghost_hidden_path' fs/xattr.c)
+          [ "$n" -eq 8 ] || { echo "::error::_ghost: fs/xattr.c has $n ghost_hidden_path references, expected 8 (one extern + one call per wrapper)"; exit 1; }
           if awk '/^int do_renameat2/,/^}/' fs/namei.c | grep -q 'ghost_hidden_path'; then
             echo "::error::_ghost: the create guard landed in do_renameat2() instead of filename_create()"; exit 1
           fi
-          echo "all patches applied"
+          if awk '/^static int path_parentat/,/^}/' fs/namei.c | grep -q 'ghost_hidden_path'; then
+            echo "::error::_ghost: a guard landed in path_parentat() -- see ghost_notdir.patch's header"; exit 1
+          fi
+          echo "all patches applied, and every guard is in the function it names"
       - name: Compile affected objects (${{ matrix.version }})
         if: steps.gate.outputs.run == 'yes'
         run: |
