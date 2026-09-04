@@ -88,6 +88,26 @@ with it. `readlink` and `statfs` were leaks until engine v21/v25 added
 `.readlink` to both iops and a `->statfs` on the hijacked `s_op`; they are closed
 in the engine, not here.
 
+A **fifth** was not a new mechanism at all — it was the `ENOTDIR` family reached
+through a walker nobody had guarded. `filename_create()` (and `unlinkat`,
+`rmdir`, `renameat`) resolve the parent with `filename_parentat()` →
+**`path_parentat()`**, never `path_lookupat()`, and a parent walk that steps into
+a non-directory returns `-ENOTDIR` from there — before `filename_create()` gets a
+dentry for `ghost_create.patch` to guard.
+
+Found by running a **compiled probe** on a live OP15 (Android 16, 6.12.23) as
+blocked uid 10384, against a hidden path and an absent sibling. Twenty-one of
+twenty-two probes matched exactly; one did not:
+
+| probe | hidden | absent |
+|---|---|---|
+| `mkdirat(p "/d")` | `ENOTDIR` | `ENOENT` |
+
+One syscall, no privilege, no control path, still open after every other guard in
+this directory had closed. `ghost_notdir.patch` now carries a third hunk. The
+same probe run is what confirmed the other twenty-one — see *Checking it on a
+device*.
+
 ⚠️ The class is **not proven exhaustive**. Anything that resolves a path and then
 acts without consulting a hijacked op is a candidate. `classprobe.c` is the
 harness — extend it rather than reasoning. Reading the source found family 4
@@ -109,7 +129,7 @@ oracle rather than a closed one.
 | `ghost_o_path*.patch` | guard in `do_o_path()`, `fs/namei.c` |
 | `ghost_xattr*.patch` | guards in all four `path_*xattr()` wrappers, `fs/xattr.c` |
 | `ghost_linkat*.patch` | guard in `do_linkat()`, `fs/namei.c` |
-| `ghost_notdir.patch` | guards in `path_lookupat()` and `do_open()`, `fs/namei.c` |
+| `ghost_notdir.patch` | guards in `path_lookupat()`, **`path_parentat()`** and `do_open()`, `fs/namei.c` |
 | `ghost_truncate.patch` | guard in `do_sys_truncate()`, `fs/open.c` |
 | `ghost_utimes.patch` | guard in `do_utimes_path()`, `fs/utimes.c` |
 | `ghost_chmod*.patch` | guard in `do_fchmodat()`, `fs/open.c` |
@@ -588,6 +608,7 @@ su $U -c '...'
 | `open(p, O_PATH\|O_DIRECTORY)` | `ENOENT` |
 | `inotify_add_watch(p, IN_ONLYDIR)` | `ENOENT` |
 | `link(p, "/data/local/tmp/x")` | `ENOENT` |
+| `mkdirat(p "/d", 0700)` | `ENOENT` |
 | `access(p, W_OK)` | `ENOENT` |
 | `open(p, O_WRONLY)` | `ENOENT` |
 | `open(p, O_WRONLY\|O_TRUNC)` | `ENOENT` |
@@ -600,6 +621,18 @@ an absent name answers on a read-only mount, which is `EROFS`:
 |---|---|
 | `mkdirat(AT_FDCWD, p, 0700)` | `EROFS` |
 | `open(p, O_CREAT\|O_EXCL, 0600)` | `EROFS` |
+
+**A shell cannot run this table.** `[ -w p ]` collapses `EROFS` and `ENOENT` to
+the same false, and every shell redirect carries `O_CREAT` — so `access(W_OK)`
+and a plain `O_WRONLY` open, the two probes the `sb_permission()` family turns
+on, are invisible from a script. That is not a style preference: the
+`path_parentat()` hole above survived a full shell-based check and was only found
+once the probes reported **errno**. Compile one (`leakprobe.c`: `lstat`,
+`access(W_OK/R_OK/F_OK)`, `open` in seven flag combinations, `chown`, `chmod`,
+`truncate`, all four `*xattr`, `stat(p "/zzz")`, `link`, `mkdirat`), push it, and
+run it as the hidden uid against three paths at once — hidden, absent, and a
+stock **visible** sibling. The visible column is what a hidden path used to
+answer, so it is what proves the guard is doing anything at all.
 
 Use the compiled `/data/local/tmp/leakprobe`, not shell tools: `toybox stat`
 `lstat()`s before it does anything else and `toybox readlink -f` canonicalises
