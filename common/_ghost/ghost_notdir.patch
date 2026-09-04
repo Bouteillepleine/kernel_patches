@@ -1,4 +1,4 @@
-Close the -ENOTDIR existence oracle at the choke point, for the whole family.
+Close the -ENOTDIR existence oracle at every choke point.
 
 An -ENOTDIR proves a name EXISTS -- the walk stepped into something that is not
 a directory. An absent name gives -ENOENT. Every path-resolving syscall that can
@@ -8,28 +8,21 @@ hidden path:
   stat(p "/zzz")                    chdir(p)
   stat(p "/")                       open(p, O_PATH|O_DIRECTORY)
   open(p, O_DIRECTORY)              inotify_add_watch(p, IN_ONLYDIR)
+  mkdirat(p "/d")                   mknodat / symlinkat / linkat target
+  unlinkat(p "/d")                  renameat(..., p "/d")
 
-WHAT THIS REPLACES, AND WHY
+THREE SITES, AND EACH ONE WAS FOUND THE HARD WAY
 
-The two files this supersedes -- ghost_notdir.patch and ghost_notdir_5_10.patch
--- guarded ONE of those sites: link_path_walk()'s non-final-component
-`d_can_lookup()` bail. That closed `stat(p "/zzz")` and nothing else. The other
-five all reach -ENOTDIR through the LOOKUP_DIRECTORY test that link_path_walk()
-never sees, so a complete one-syscall substitute for every oracle this whole
-directory closes was still sitting there, unguarded, the entire time.
+  path_lookupat()   everything that is not an open(2) and not a create
+  path_parentat()   the CREATE family -- filename_create() and friends
+  do_open()         open(p, O_DIRECTORY), which routes through neither
 
-It also put a guard inside link_path_walk(), the hottest function in the VFS and
-the one hunk in this patch set that carried a documented bootloop risk. That risk
-is gone: link_path_walk() is no longer touched by _ghost at all.
+None of the three is reachable from the others.
 
-And it needed two variants, because 5.10 spells the unlazy step unlazy_walk()
-where 5.15+ spells it try_to_unlazy(). The choke points below do not care which,
-so ONE file now covers 5.10 / 5.15 / 6.1 / 6.6 / 6.12 with byte-identical hunks.
+*** HOW THE FIRST HUNK USED TO LAND IN THE SECOND FUNCTION ***
 
-*** THE FIRST HUNK USED TO LAND IN THE WRONG FUNCTION -- READ THIS ***
-
-This is why the hunk carries FOUR lines of context and why the first of them is
-`*path = nd->path;`. It is not style.
+This is why the hunks carry FOUR lines of context and why the first line of each
+is the one assignment that differs. It is not style.
 
 path_lookupat() and path_parentat() end with the SAME five lines:
 
@@ -42,52 +35,62 @@ path_lookupat() and path_parentat() end with the SAME five lines:
 	return err;
 }
 
-The earlier revision of this file used three lines of leading context, starting
-at `nd->path.mnt = NULL;`. That pre-image occurs TWICE in fs/namei.c on every one
-of the five trees, and `patch` resolves an ambiguous pre-image by proximity to
-the @@ line number -- which is pinned to 6.12. Measured, on the pinned OnePlus
-trees, with `patch -p1 -F0` and no fuzz reported on any of them:
+An earlier revision used three lines of leading context, starting at
+`nd->path.mnt = NULL;`. That pre-image occurs TWICE in fs/namei.c on every one of
+the five fleet trees, and `patch` resolves an ambiguous pre-image by proximity to
+the @@ line number -- which is pinned to 6.12. Measured, with `patch -p1 -F0` and
+no fuzz reported anywhere:
 
-	5.10   guard landed in path_parentat()   <- wrong
-	5.15   guard landed in path_parentat()   <- wrong
-	6.1    guard landed in path_parentat()   <- wrong
-	6.6    guard landed in path_parentat()   <- wrong
-	6.12   guard landed in path_lookupat()      correct
+	5.10   guard landed in path_parentat()   <- not where it was aimed
+	5.15   guard landed in path_parentat()   <- not where it was aimed
+	6.1    guard landed in path_parentat()   <- not where it was aimed
+	6.6    guard landed in path_parentat()   <- not where it was aimed
+	6.12   guard landed in path_lookupat()      as intended
 
-So on four of the five fleet kernels the ENOTDIR family was NOT closed at all --
-the guard sat on the parent-lookup path instead, where it rewrote an errno for
-unlink/rename/mkdir and left stat(p "/zzz"), stat(p "/"), chdir(p),
-open(O_PATH|O_DIRECTORY) and inotify IN_ONLYDIR wide open. Nothing reported it:
-the patch applied at fuzz 0, the build compiled, and every existing assertion
-("fs/namei.c contains ghost_hidden_path") passed.
+So on four of five kernels stat(p "/zzz"), stat(p "/"), chdir(p),
+open(O_PATH|O_DIRECTORY) and inotify IN_ONLYDIR were all still open. Nothing
+reported it: the patch applied at fuzz 0, the build compiled, and every existing
+assertion ("fs/namei.c contains ghost_hidden_path") passed.
 
-`*path = nd->path;` is the one line that differs between the two functions --
-path_parentat() writes `*parent = nd->path;` -- so including it makes the
-pre-image unique. Verified by counting occurrences in all five trees: 2 without
-it, 1 with it. `scripts/apply_nomount_stack.sh verify ghost` now asserts the
-guard is inside path_lookupat() by name, so this cannot regress silently again.
+AND THE ACCIDENT WAS HALF RIGHT. Pinning the guard to path_lookupat() alone --
+the obvious fix -- left the CREATE family open on all five, because
+filename_create() reaches -ENOTDIR through filename_parentat() -> path_parentat()
+and never gets far enough for ghost_create.patch's dentry guard to see anything.
+That was MEASURED on a live OP15 (Android 16, 6.12.23) with a compiled probe, as
+blocked uid 10384, against a hidden path and an absent sibling in the same
+directory. Twenty-one of twenty-two probes matched exactly; one did not:
 
-THE LESSON, STATED FOR THE NEXT PATCH IN THIS DIRECTORY: fuzz 0 is necessary and
-NOT sufficient. A hunk whose pre-image appears more than once in the target file
-lands wherever the line numbers say, and the line numbers are pinned to one tree.
-Count your pre-image before you trust the dry-run.
+	mkdirat(p "/d")   hidden -> ENOTDIR   absent -> ENOENT
 
-TWO SITES, NOT ONE
+One syscall, no privilege, no control path, still open after every other guard in
+this directory had closed. So the answer is BOTH functions, not one instead of
+the other, and `*path = nd->path;` / `*parent = nd->path;` are what make the two
+pre-images unique -- 2 occurrences without them, 1 with, counted on every tree.
 
-path_lookupat() is the choke point for everything that is not an open(2):
-link_path_walk()'s -ENOTDIR and the LOOKUP_DIRECTORY test both land in the same
-`err` before terminate_walk(), so one guard closes stat/chdir/inotify and
-open(O_PATH|O_DIRECTORY) together.
+THE LESSON, FOR THE NEXT PATCH IN THIS DIRECTORY: fuzz 0 is necessary and NOT
+sufficient. A hunk whose pre-image appears more than once lands wherever the line
+numbers say, and the line numbers are pinned to one tree. Count your pre-image
+before you trust the dry-run -- `scripts/check_preimages.py` does it for you, and
+CI runs it. And when a guard turns out to have been in the "wrong" place, check
+what it was covering there before removing it.
 
-do_open() is the second site and is NOT reachable from the first: path_openat()
-runs link_path_walk() and open_last_lookups() itself rather than calling
-path_lookupat(), and its LOOKUP_DIRECTORY test sits ahead of may_open(), so the
-engine's hijacked ->permission -- which is what answers -ENOENT for a plain
-open(2) -- never gets a turn. Guarding only path_lookupat() would leave
-`open(p, O_DIRECTORY)` as a complete replacement for all six probes.
+WHAT THIS REPLACES
 
-ghost_open.patch now places a THIRD guard in do_open(), about fifteen lines
-above this one, on write-intent and O_CREAT opens. The two do not overlap
+The two files this supersedes -- ghost_notdir.patch and ghost_notdir_5_10.patch
+-- guarded ONE site: link_path_walk()'s non-final-component `d_can_lookup()`
+bail. That closed `stat(p "/zzz")` and nothing else, and it put a guard inside
+link_path_walk(), the hottest function in the VFS and the one hunk in this patch
+set that carried a documented bootloop risk. link_path_walk() is no longer
+touched by _ghost at all.
+
+It also needed two variants, because 5.10 spells the unlazy step unlazy_walk()
+where 5.15+ spells it try_to_unlazy(). The choke points below do not care which,
+so ONE file covers 5.10 / 5.15 / 6.1 / 6.6 / 6.12.
+
+do_open() AND ghost_open.patch
+
+ghost_open.patch places a fourth guard in do_open(), about fifteen lines above
+this file's third hunk, on write-intent and O_CREAT opens. The two do not overlap
 textually and apply in either order. With both applied the earlier guard answers
 open(p, O_DIRECTORY|O_WRONLY) first; this hunk stays as the narrower,
 independently verified backstop for the read-only forms.
@@ -95,37 +98,39 @@ independently verified backstop for the read-only forms.
 THE RCU TEST IS THE DESIGN WORK
 
 ghost_hidden_path() renders d_path(), which needs a reference-counted path, and
--ENOTDIR can reach the end of path_lookupat() from sites that never unlazied:
+-ENOTDIR can reach the end of either walker from sites that never unlazied:
 path_init() rejects a non-directory dfd or a non-directory preset root with
 `nd->flags` already carrying LOOKUP_RCU, before rcu_read_lock() and before
-nd->path is assigned. So the guard tests `!(nd->flags & LOOKUP_RCU)` AND
+nd->path is assigned. Both guards therefore test `!(nd->flags & LOOKUP_RCU)` AND
 `nd->path.dentry` before touching the predicate.
 
-Both of those sites are unreachable-by-construction for the oracles here (they
-fire before the walk starts, on the dfd, not on the name), so nothing is lost:
-link_path_walk()'s site calls try_to_unlazy()/unlazy_walk() and returns -ECHILD
-if it cannot, and complete_walk() runs ahead of the LOOKUP_DIRECTORY test. Every
-probe listed at the top reaches the predicate in ref-walk mode. do_open() needs
-no such test -- complete_walk() ran inside open_last_lookups() before it.
+Nothing is lost by that: link_path_walk()'s site calls
+try_to_unlazy()/unlazy_walk() and returns -ECHILD if it cannot, and
+complete_walk() runs ahead of the LOOKUP_DIRECTORY test. Every probe listed at
+the top reaches the predicate in ref-walk mode. do_open() needs no such test --
+complete_walk() ran inside open_last_lookups() before it.
 
 APPLIES TO
 
-One file, 5.10 through 6.12. Both pre-images were counted in every tree before
-this was regenerated: the path_lookupat() one is unique with `*path = nd->path;`
-included, and do_open()'s `if ((nd->flags & LOOKUP_DIRECTORY) && ...)` is unique
-on its own (path_lookupat() spells its test `if (!err && nd->flags & ...)`).
+One file, three hunks, 5.10 through 6.12. Every pre-image was counted in every
+tree before this was generated: path_lookupat()'s and path_parentat()'s are
+unique once their `*path` / `*parent` line is included, and do_open()'s
+`if ((nd->flags & LOOKUP_DIRECTORY) && ...)` is unique on its own
+(path_lookupat() spells its test `if (!err && nd->flags & ...)`). The two walker
+hunks sit 38-43 lines apart on every tree, so -U4 keeps them separate.
 
 Verified with `patch -p1 -F0 --dry-run` on the pinned OnePlus trees for 5.10,
-5.15, 6.1, 6.6 and 6.12, and then APPLIED for real on each and the landing
-function asserted by name. fs/namei.o compiles clean on all five
-(ARCH=arm64 LLVM=1). Generated by editing the real file and running `diff -u4 -p`,
-never by hand.
+5.15, 6.1, 6.6 and 6.12, then APPLIED for real on each with the landing function
+asserted by name -- which `scripts/apply_nomount_stack.sh verify ghost` now does
+too, for path_lookupat() AND path_parentat(), so neither can go missing again.
+fs/namei.o compiles clean on all five (ARCH=arm64 LLVM=1). Generated by editing
+the real file and running `diff -u4 -p`, never by hand.
 
 NOT covered: 4.9 / 4.14 / 4.19 / 5.4, which are not in the builder fleet and
 have no tree here to verify against.
 --- a/fs/namei.c
 +++ b/fs/namei.c
-@@ -2593,8 +2593,43 @@ static int path_lookupat(struct nameidat
+@@ -2593,8 +2593,47 @@ static int path_lookupat(struct nameidat
  		*path = nd->path;
  		nd->path.mnt = NULL;
  		nd->path.dentry = NULL;
@@ -136,11 +141,15 @@ have no tree here to verify against.
 +		/*
 +		 * Every -ENOTDIR that reaches here proves a name exists: the
 +		 * walk stepped into something that is not a directory. An
-+		 * absent name would have given -ENOENT. This is the single
-+		 * choke point for the whole family -- link_path_walk()'s
-+		 * non-final component, the LOOKUP_DIRECTORY test just above,
-+		 * and so chdir(), stat(p "/"), open(O_PATH|O_DIRECTORY) and
-+		 * inotify's IN_ONLYDIR, all at once.
++		 * absent name would have given -ENOENT. This is the choke point
++		 * for everything that is not an open(2) and not a create --
++		 * link_path_walk()'s non-final component, the LOOKUP_DIRECTORY
++		 * test just above, and so chdir(), stat(p "/"),
++		 * open(O_PATH|O_DIRECTORY) and inotify's IN_ONLYDIR.
++		 *
++		 * The CREATE family does not come through here at all; see the
++		 * identical guard in path_parentat() below, and this file's
++		 * header for how that was measured.
 +		 *
 +		 * TWO tests before the predicate, and neither is optional:
 +		 *
@@ -169,7 +178,47 @@ have no tree here to verify against.
  	return err;
  }
  
-@@ -3753,10 +3788,23 @@ static int do_open(struct nameidata *nd,
+@@ -2631,8 +2670,39 @@ static int path_parentat(struct nameidat
+ 		*parent = nd->path;
+ 		nd->path.mnt = NULL;
+ 		nd->path.dentry = NULL;
+ 	}
++	if (unlikely(err == -ENOTDIR)) {
++		extern bool ghost_hidden_path(const struct path *gp);
++
++		/*
++		 * The CREATE family's choke point, and it is NOT reachable from
++		 * path_lookupat(). filename_create() -- shared by mkdirat,
++		 * mknodat, symlinkat and linkat's target -- calls
++		 * filename_parentat(), which lands here; so do unlinkat, rmdir
++		 * and renameat. When the parent walk steps into a non-directory
++		 * it returns -ENOTDIR from here, before filename_create() ever
++		 * gets a dentry for ghost_create.patch to guard.
++		 *
++		 * MEASURED on OP15 (Android 16, 6.12.23) with a compiled probe
++		 * as blocked uid 10384, against a hidden path and an absent
++		 * sibling. Twenty-one of twenty-two probes matched; this was
++		 * the one that did not:
++		 *
++		 *	mkdirat(p "/d")   hidden -> ENOTDIR   absent -> ENOENT
++		 *
++		 * A one-syscall existence probe, no privilege and no control
++		 * path, still open after every other guard in this directory
++		 * had closed. Same for mknodat, symlinkat, linkat's target,
++		 * unlinkat, renameat and open(p "/d", O_CREAT).
++		 *
++		 * The guard is byte-identical to path_lookupat()'s above, and
++		 * for the same reasons -- including both pre-predicate tests.
++		 */
++		if (!(nd->flags & LOOKUP_RCU) && nd->path.dentry &&
++		    ghost_hidden_path(&nd->path))
++			err = -ENOENT;
++	}
+ 	terminate_walk(nd);
+ 	return err;
+ }
+ 
+@@ -3753,10 +3823,23 @@ static int do_open(struct nameidata *nd,
  					     d_backing_inode(nd->path.dentry));
  		if (unlikely(error))
  			return error;
@@ -183,7 +232,7 @@ have no tree here to verify against.
 +		 * path_openat() runs link_path_walk() and open_last_lookups()
 +		 * itself and lands here, ahead of may_open(), so the engine's
 +		 * hijacked ->permission never gets to answer -ENOENT. Same
-+		 * oracle, second site. Ref-walk is guaranteed: complete_walk()
++		 * oracle, third site. Ref-walk is guaranteed: complete_walk()
 +		 * ran inside open_last_lookups() before do_open() was called.
 +		 */
 +		if (ghost_hidden_path(&nd->path))
