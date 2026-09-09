@@ -51,9 +51,13 @@
 # they predate 8b9d7a7a and the bisect cleared them: OP11 boots on 2482c569 and
 # bootloops on 8b9d7a7a with everything else held constant.
 #
-# NO SILENT NO-OP. A KernelSU-Next that does not contain the defect is reported
-# and skipped; a KernelSU-Next whose wrappers no longer have the shape this
-# rewrites FAILS the build rather than passing an unpatched tree through.
+# NO SILENT NO-OP, AND NO CREDIT FOR SOMEONE ELSE'S FIX. A KernelSU-Next that
+# does not contain the defect is reported and skipped. A KernelSU-Next whose
+# wrappers no longer have the shape this rewrites FAILS the build rather than
+# passing an unpatched tree through -- unless upstream's CONFIG_ANDROID bypass
+# (1b2316be) is in the tree, in which case the code is not compiled on Android,
+# the assertions are downgraded to a skip, and the closing line says the bypass
+# is what is protecting the build. See the bypass block below.
 #
 # ENV CONTRACT:
 #   KSU_FOLDER   KernelSU-Next tree (the dir holding kernel/)   [required]
@@ -69,11 +73,34 @@ note() { echo "  $*"; }
 
 SRC="$KSU_FOLDER/kernel/selinux/selinux.c"
 HDR="$KSU_FOLDER/kernel/infra/symbol_resolver.h"
+KSUH="$KSU_FOLDER/kernel/include/ksu.h"
 
 echo "::group::KSU CFI symbol-call fix"
 note "tree: $KSU_FOLDER"
 
 [ -f "$SRC" ] || die "$SRC not found -- the KernelSU-Next layout changed; this fix needs re-targeting."
+
+# Upstream's own fix, KernelSU-Next 1b2316be ("kernel: selinux: Bypass dynamic
+# wrappers conditionally"): under CONFIG_ANDROID the wrappers become
+# `#define ksu_security_* security_*` and the whole dynamic block moves into the
+# `#else`. Every kernel these builders produce is CONFIG_ANDROID=y -- measured on
+# the OP11 5.15.180 Image, where `ksu_security_secctx_to_secid` is present as a
+# SYMBOL in the bootlooping 33264 build and absent in 33267.
+#
+# So when the bypass is in the tree, the edits below land in a preprocessor arm
+# the compiler discards, and this script MUST NOT report that it made an Android
+# build CFI-safe: upstream did. They are still applied, because they are the fix
+# for the non-Android arm that survives, and because they are the guard if
+# upstream ever drops the bypass -- but the shape assertions stop being fatal.
+# Dead code must never be able to fail a build.
+bypass=0
+if grep -q '^#define ksu_security_secid_to_secctx security_secid_to_secctx' "$SRC" 2>/dev/null ||
+   grep -q '^#define ksu_security_secctx_to_secid security_secctx_to_secid' "$KSUH" 2>/dev/null; then
+    bypass=1
+    note "upstream CONFIG_ANDROID bypass present (KernelSU-Next 1b2316be)"
+    note "-> on an Android build the dynamic wrappers are NOT compiled and the"
+    note "   edits below change nothing. Applying them for the non-Android arm."
+fi
 
 raw_before=$(grep -c 'find_kernel_symbol_exact(' "$SRC" || true)
 
@@ -91,14 +118,24 @@ fi
 # Every raw call must be the pointer-assignment shape we know how to rewrite.
 # If upstream grows a use that is NOT assigned to a function pointer, a blind
 # swap could change a value's type, so refuse instead.
+refuse() {
+    if [ "$bypass" -eq 1 ]; then
+        note "SKIPPING: $*"
+        note "Not fatal: the bypass means this code is not compiled on Android."
+        echo "::endgroup::"
+        exit 0
+    fi
+    die "$*"
+}
+
 if [ "$raw_before" -gt 0 ]; then
     shaped=$(grep -c '(void \*)find_kernel_symbol_exact("' "$SRC" || true)
     [ "$shaped" -eq "$raw_before" ] || \
-        die "selinux.c has $raw_before find_kernel_symbol_exact() calls but only $shaped in the expected '(void *)find_kernel_symbol_exact(\"...\")' form. Upstream changed shape -- re-check this fix before shipping."
+        refuse "selinux.c has $raw_before find_kernel_symbol_exact() calls but only $shaped in the expected '(void *)find_kernel_symbol_exact(\"...\")' form. Upstream changed shape -- re-check this fix before shipping."
 
-    [ -f "$HDR" ] || die "$HDR not found, but selinux.c still calls find_kernel_symbol_exact()"
+    [ -f "$HDR" ] || refuse "$HDR not found, but selinux.c still calls find_kernel_symbol_exact()"
     grep -q 'ksu_resolve_symbol_for_functable_hook' "$HDR" || \
-        die "ksu_resolve_symbol_for_functable_hook() is not declared in $HDR -- cannot swap to a helper that does not exist."
+        refuse "ksu_resolve_symbol_for_functable_hook() is not declared in $HDR -- cannot swap to a helper that does not exist."
 fi
 
 # Definitions we must annotate. Both the >= 6.14 and the < 6.14 arms are present
@@ -108,7 +145,7 @@ defs=$(grep -cE "$defs_re" "$SRC" || true)
 # A re-run finds them already annotated, which is success, not absence.
 nocfi_pre=$(grep -cE '^(static )?(int|void) __nocfi ksu_security_' "$SRC" || true)
 [ $((defs + nocfi_pre)) -gt 0 ] || \
-    die "no ksu_security_* wrapper definitions found in selinux.c -- upstream renamed them; re-check this fix."
+    refuse "no ksu_security_* wrapper definitions found in selinux.c -- upstream renamed them; re-check this fix."
 
 # __nocfi comes from <linux/compiler.h>; it expands to nothing without
 # CONFIG_CFI_CLANG. Include it explicitly rather than relying on a transitive
@@ -140,5 +177,10 @@ left=$(grep -cE "$defs_re" "$SRC" || true)
 [ "$left" -eq 0 ] || die "$left ksu_security_* definition(s) left without __nocfi"
 
 note "selinux.c now: $swapped resolver call(s), $nocfi __nocfi wrapper definition(s)"
-echo "✅ KSU SELinux helpers are CFI-safe"
+if [ "$bypass" -eq 1 ]; then
+    echo "✅ upstream bypass in force -- Android builds never compile these wrappers;"
+    echo "   the edits above harden the non-Android arm only"
+else
+    echo "✅ KSU SELinux helpers are CFI-safe"
+fi
 echo "::endgroup::"
