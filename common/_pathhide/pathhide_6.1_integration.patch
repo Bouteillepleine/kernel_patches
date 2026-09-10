@@ -1,70 +1,9 @@
-Hide pathhide-matched file-backed mappings from /proc/<pid>/maps, smaps,
-smaps_rollup and numa_maps.
-
-OFF BY DEFAULT, AND EXPERIMENTAL. pathhide.c ships with an empty rule set and
-nothing in this patch set seeds one, so on a stock build pathhide_match_file()
-short-circuits on its first line and every guard below is dead code. Read
-common/_pathhide/README.md before loading a rule: hiding a mapping trades a
-heuristic signal (a recognisable .so named in maps) for a categorical one (the
-accounting stops balancing), and that trade is not obviously a win.
-
-THE /proc/<pid>/fd HALF IS GONE, DELIBERATELY
-
-Earlier revisions also filtered fd readdir, fd lookup/readlink, fdinfo and -- on
-6.6 and 6.12 -- the fd count behind stat(/proc/<pid>/fd).st_size. All of it has
-been removed, for two independent reasons:
-
-  * It was a CATEGORICAL tell. Hiding an fd from /proc does not close it: the
-    descriptor stays allocated, so fcntl(N, F_GETFD) succeeds on an N that
-    /proc/self/fd/N reports as ENOENT. That probe needs no knowledge of what is
-    being hidden, no rule list and no privilege, and it is never true on a stock
-    kernel. It replaced a heuristic tell with a certain one.
-
-  * The fd count rewrite made every device pay. proc_readfd_count() is what
-    stat("/proc/<pid>/fd") answers with, and stock computes it as one
-    bitmap_weight() over the open-fd bitmap. The replacement was an O(max_fds)
-    loop taking task_lock per descriptor inside a single un-rescheduled RCU
-    section -- on every such stat(), on every shipped device, including the
-    overwhelming majority that carry no rules and get nothing back for it.
-
-Gating that loop on ph_nrules would have answered the second point on its own.
-Removing the half answers both, and leaves fs/proc/fd.c untouched by this patch
-set entirely.
-
-Generated hunk by hunk against the real tree the fleet pins for this kernel
-version:
-
-    OnePlusOSS/android_kernel_common_oneplus_sm8650 @ oneplus/sm8650_b_16.0.0_pad2
-
-and dry-run at fuzz 0 against every distinct fs/proc variant the manifests
-resolve to. A hunk that only lands "with fuzz" can silently guard the wrong
-function, so treat a fuzz report from `patch` as a failure and regenerate.
-
-Version notes:
-  * The fleet's 6.1 trees carry TWO shapes of show_map()/show_smap(): some open
-    with `struct vm_area_struct *vma = v;`, others with get_pad_vma()/
-    get_data_vma(). Wrapping the function is the only form that is correct for
-    both -- it needs no knowledge of the declarations, and it decides before the
-    pad copies (freed only by show_map_pad_vma()) are ever allocated, so it
-    cannot leak them. That is also why the wrapper hunk carries a single line of
-    trailing context: the declarations below the brace are the part that differs.
-  * smaps_rollup is a do/while here, so `continue` reaches the advance.
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -358,3 +358,26 @@
+@@ -358,3 +358,16 @@
  
 +static int ph_show_map(struct seq_file *m, void *v);
 +
-+/*
-+ * pathhide: decided here rather than inside show_map_vma() for two reasons.
-+ * show_map_pad_vma() emits a second, synthesized VMA for a 16kB-compat padded
-+ * mapping and that pad is anonymous (vm_file == NULL), so a guard further in
-+ * would leave an orphan "[page size compat]" line behind a hidden .so --
-+ * present in maps, absent from smaps, which is the mismatch itself. Deciding
-+ * before the body runs also means get_pad_vma()/get_data_vma() are never
-+ * called, so on trees where they hand back heap copies (freed by
-+ * show_map_pad_vma()) an early return cannot leak them.
-+ */
  static int show_map(struct seq_file *m, void *v)
 +{
 +	extern bool pathhide_match_file(struct file *f);
@@ -78,20 +17,10 @@ Version notes:
 +
 +static int ph_show_map(struct seq_file *m, void *v)
  {
-@@ -923,3 +946,26 @@
+@@ -923,3 +936,16 @@
  
 +static int ph_show_smap(struct seq_file *m, void *v);
 +
-+/*
-+ * pathhide: decided here rather than inside show_map_vma() for two reasons.
-+ * show_map_pad_vma() emits a second, synthesized VMA for a 16kB-compat padded
-+ * mapping and that pad is anonymous (vm_file == NULL), so a guard further in
-+ * would leave an orphan "[page size compat]" line behind a hidden .so --
-+ * present in maps, absent from smaps, which is the mismatch itself. Deciding
-+ * before the body runs also means get_pad_vma()/get_data_vma() are never
-+ * called, so on trees where they hand back heap copies (freed by
-+ * show_map_pad_vma()) an early return cannot leak them.
-+ */
  static int show_smap(struct seq_file *m, void *v)
 +{
 +	extern bool pathhide_match_file(struct file *f);
@@ -105,27 +34,22 @@ Version notes:
 +
 +static int ph_show_smap(struct seq_file *m, void *v)
  {
-@@ -1064,6 +1110,13 @@
+@@ -1064,6 +1090,10 @@
  
  	vma_start = vma->vm_start;
  	do {
 +		extern bool pathhide_match_file(struct file *f);
 +
-+		/* smaps_rollup accumulates on its own and never
-+		 * consulted pathhide, so sum(smaps Rss) != rollup Rss
-+		 * for a hidden mapping -- a zero-privilege oracle. */
 +		if (vma->vm_file && pathhide_match_file(vma->vm_file))
 +			continue;
  		smap_gather_stats(vma, &mss, 0);
  		last_vma_end = vma->vm_end;
  
-@@ -2103,6 +2156,15 @@
+@@ -2103,6 +2133,13 @@
  	if (!mm)
  		return 0;
  
 +	{
-+		/* numa_maps prints the backing path too; without this a
-+		 * mapping hidden from maps is still named here. */
 +		extern bool pathhide_match_file(struct file *f);
 +
 +		if (file && pathhide_match_file(file))

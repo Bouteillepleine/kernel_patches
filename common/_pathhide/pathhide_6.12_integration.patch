@@ -1,71 +1,17 @@
-Hide pathhide-matched file-backed mappings from /proc/<pid>/maps, smaps,
-smaps_rollup and numa_maps.
-
-OFF BY DEFAULT, AND EXPERIMENTAL. pathhide.c ships with an empty rule set and
-nothing in this patch set seeds one, so on a stock build pathhide_match_file()
-short-circuits on its first line and every guard below is dead code. Read
-common/_pathhide/README.md before loading a rule: hiding a mapping trades a
-heuristic signal (a recognisable .so named in maps) for a categorical one (the
-accounting stops balancing), and that trade is not obviously a win.
-
-THE /proc/<pid>/fd HALF IS GONE, DELIBERATELY
-
-Earlier revisions also filtered fd readdir, fd lookup/readlink, fdinfo and -- on
-6.6 and 6.12 -- the fd count behind stat(/proc/<pid>/fd).st_size. All of it has
-been removed, for two independent reasons:
-
-  * It was a CATEGORICAL tell. Hiding an fd from /proc does not close it: the
-    descriptor stays allocated, so fcntl(N, F_GETFD) succeeds on an N that
-    /proc/self/fd/N reports as ENOENT. That probe needs no knowledge of what is
-    being hidden, no rule list and no privilege, and it is never true on a stock
-    kernel. It replaced a heuristic tell with a certain one.
-
-  * The fd count rewrite made every device pay. proc_readfd_count() is what
-    stat("/proc/<pid>/fd") answers with, and stock computes it as one
-    bitmap_weight() over the open-fd bitmap. The replacement was an O(max_fds)
-    loop taking task_lock per descriptor inside a single un-rescheduled RCU
-    section -- on every such stat(), on every shipped device, including the
-    overwhelming majority that carry no rules and get nothing back for it.
-
-Gating that loop on ph_nrules would have answered the second point on its own.
-Removing the half answers both, and leaves fs/proc/fd.c untouched by this patch
-set entirely.
-
-Generated hunk by hunk against the real tree the fleet pins for this kernel
-version:
-
-    OnePlusOSS/android_kernel_common_oneplus_sm8850 @ oneplus/sm8850_b_16.0.0_oneplus_15
-
-and dry-run at fuzz 0 against every distinct fs/proc variant the manifests
-resolve to. A hunk that only lands "with fuzz" can silently guard the wrong
-function, so treat a fuzz report from `patch` as a failure and regenerate.
-
-Version notes:
-  * show_map()/show_smap() take @v as the VMA directly, so the guard sits
-    inline.
-  * smaps_rollup is a do/while here, so `continue` reaches the advance.
-  * query_matching_vma() backs the PROCMAP_QUERY ioctl, which is a second,
-    independent reader of the same VMA list and exists only on 6.12. A matched
-    file-backed VMA is skipped there exactly as a permission mismatch is, so the
-    range and the name vanish together.
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -495,6 +495,14 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+@@ -495,6 +495,10 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
  static int show_map(struct seq_file *m, void *v)
  {
  	struct vm_area_struct *vma = v;
 +	extern bool pathhide_match_file(struct file *file);
 +
-+	/* One decision point for the main line and the pad VMA: the pad is
-+	 * synthesized anonymous (vm_file == NULL), so a guard inside
-+	 * show_map_vma() would miss it and leave an orphan [page size compat]
-+	 * line that smaps drops -- a maps-vs-smaps mismatch. */
 +	if (vma->vm_file && pathhide_match_file(vma->vm_file))
 +		return 0;
  
  	if (vma_pages(vma))
  		show_map_vma(m, vma);
-@@ -548,12 +556,18 @@ static struct vm_area_struct *query_matching_vma(struct mm_struct *mm,
+@@ -548,12 +552,16 @@ static struct vm_area_struct *query_matching_vma(struct mm_struct *mm,
  						 unsigned long addr, u32 flags)
  {
  	struct vm_area_struct *vma;
@@ -76,15 +22,13 @@ Version notes:
  	if (!vma)
  		goto no_vma;
  
-+	/* pathhide: a matched file-backed VMA must vanish -- range and name
-+	 * together -- so treat it exactly like a permission mismatch. */
 +	if (vma->vm_file && pathhide_match_file(vma->vm_file))
 +		goto skip_vma;
 +
  	/* user requested only file-backed VMA, keep iterating */
  	if ((flags & PROCMAP_QUERY_FILE_BACKED_VMA) && !vma->vm_file)
  		goto skip_vma;
-@@ -1303,6 +1317,10 @@ static int show_smap(struct seq_file *m, void *v)
+@@ -1303,6 +1311,10 @@ static int show_smap(struct seq_file *m, void *v)
  {
  	struct vm_area_struct *vma = v;
  	struct mem_size_stats mss = {};
@@ -95,7 +39,7 @@ Version notes:
  
  	if (!vma_pages(vma))
  		goto show_pad;
-@@ -1341,6 +1359,7 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
+@@ -1341,6 +1353,7 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
  	unsigned long vma_start = 0, last_vma_end = 0;
  	int ret = 0;
  	VMA_ITERATOR(vmi, mm, 0);
@@ -103,7 +47,7 @@ Version notes:
  
  	priv->task = get_proc_task(priv->inode);
  	if (!priv->task)
-@@ -1363,6 +1382,8 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
+@@ -1363,6 +1376,8 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
  
  	vma_start = vma->vm_start;
  	do {
@@ -112,7 +56,7 @@ Version notes:
  		smap_gather_stats(vma, &mss, 0);
  		last_vma_end = vma->vm_end;
  
-@@ -3267,10 +3288,14 @@ static int show_numa_map(struct seq_file *m, void *v)
+@@ -3267,10 +3282,14 @@ static int show_numa_map(struct seq_file *m, void *v)
  	struct mempolicy *pol;
  	pgoff_t ilx;
  	int nid;
