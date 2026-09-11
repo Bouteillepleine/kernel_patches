@@ -9,6 +9,12 @@
 #include <linux/user_namespace.h>
 #include <linux/percpu.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/list.h>
+#include <linux/rculist.h>
+#include <linux/rcupdate.h>
+#include <linux/stringhash.h>
 #include <linux/string.h>
 #include <linux/limits.h>
 #include <linux/err.h>
@@ -16,17 +22,30 @@
 #include <linux/compiler.h>
 #include "ghost.h"
 
-#define GH_MAX_RULES	512
 #define GH_RULE_LEN	192
 #define GH_MAX_UIDS	128
+#define GH_MAX_RULES	65536
+#define GH_HASH_BITS	13
+#define GH_HASH_SIZE	(1u << GH_HASH_BITS)
 
-static char ghost_rules[GH_MAX_RULES][GH_RULE_LEN];
-static u8   ghost_rlen[GH_MAX_RULES];
-static int  ghost_nrules;
-static u32  ghost_uids[GH_MAX_UIDS];
-static int  ghost_nuids;
+struct gh_rule {
+	struct hlist_node hnode;
+	struct list_head lnode;
+	struct rcu_head rcu;
+	u32 hash;
+	u16 len;
+	bool prefix;
+	char path[];
+};
 
-static DEFINE_SPINLOCK(ghost_lock);
+static struct hlist_head ghost_ht[GH_HASH_SIZE];
+static HLIST_HEAD(ghost_prefixes);
+static LIST_HEAD(ghost_all);
+static int ghost_nrules;
+static u32 ghost_uids[GH_MAX_UIDS];
+static int ghost_nuids;
+
+static DEFINE_MUTEX(ghost_mutex);
 
 static DEFINE_PER_CPU(char [PATH_MAX], ghost_pathbuf);
 
@@ -42,21 +61,28 @@ static bool ghost_uid_hidden(u32 uid)
 	return false;
 }
 
-static bool ghost_path_locked(const char *path, size_t plen)
+static struct hlist_head *ghost_bucket(u32 hash)
 {
-	int i, n = ghost_nrules;
+	return &ghost_ht[hash & (GH_HASH_SIZE - 1)];
+}
 
-	for (i = 0; i < n; i++) {
-		size_t rlen = ghost_rlen[i];
+static bool ghost_path_rcu(const char *path, size_t plen)
+{
+	struct gh_rule *r;
+	u32 hash;
 
-		if (!rlen)
-			continue;
-		if (ghost_rules[i][rlen - 1] == '/') {
-			if (plen > rlen && !memcmp(path, ghost_rules[i], rlen))
+	if (plen < GH_RULE_LEN) {
+		hash = full_name_hash(NULL, path, plen);
+		hlist_for_each_entry_rcu(r, ghost_bucket(hash), hnode) {
+			if (r->hash == hash && r->len == plen &&
+			    !memcmp(r->path, path, plen))
 				return true;
-		} else if (plen == rlen && !memcmp(path, ghost_rules[i], rlen)) {
-			return true;
 		}
+	}
+
+	hlist_for_each_entry_rcu(r, &ghost_prefixes, hnode) {
+		if (plen > r->len && !memcmp(path, r->path, r->len))
+			return true;
 	}
 	return false;
 }
@@ -83,9 +109,9 @@ bool ghost_hidden_path(const struct path *path)
 	if (!IS_ERR(p)) {
 		size_t plen = strlen(p);
 
-		spin_lock(&ghost_lock);
-		hit = ghost_path_locked(p, plen);
-		spin_unlock(&ghost_lock);
+		rcu_read_lock();
+		hit = ghost_path_rcu(p, plen);
+		rcu_read_unlock();
 	}
 	put_cpu_ptr(&ghost_pathbuf);
 
@@ -116,38 +142,74 @@ static int ghost_rule_sane(const char *s)
 	return slashes >= 2 ? 0 : -EINVAL;
 }
 
+static struct gh_rule *ghost_find_locked(const char *s, size_t slen)
+{
+	struct gh_rule *r;
+	u32 hash;
+
+	if (slen && s[slen - 1] == '/') {
+		hlist_for_each_entry(r, &ghost_prefixes, hnode)
+			if (r->len == slen && !memcmp(r->path, s, slen))
+				return r;
+		return NULL;
+	}
+	hash = full_name_hash(NULL, s, slen);
+	hlist_for_each_entry(r, ghost_bucket(hash), hnode)
+		if (r->hash == hash && r->len == slen && !memcmp(r->path, s, slen))
+			return r;
+	return NULL;
+}
+
+static void ghost_drop_locked(struct gh_rule *r)
+{
+	hlist_del_rcu(&r->hnode);
+	list_del(&r->lnode);
+	WRITE_ONCE(ghost_nrules, ghost_nrules - 1);
+	kfree_rcu(r, rcu);
+}
+
 static int ghost_add_path_locked(const char *s, size_t slen)
 {
-	int i;
+	struct gh_rule *r;
 
-	for (i = 0; i < ghost_nrules; i++)
-		if (ghost_rlen[i] == slen && !memcmp(ghost_rules[i], s, slen))
-			return 0;
+	if (ghost_find_locked(s, slen))
+		return 0;
 	if (ghost_nrules >= GH_MAX_RULES)
 		return -ENOSPC;
-	memcpy(ghost_rules[ghost_nrules], s, slen);
-	ghost_rules[ghost_nrules][slen] = '\0';
-	ghost_rlen[ghost_nrules] = (u8)slen;
+	r = kzalloc(sizeof(*r) + slen + 1, GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	memcpy(r->path, s, slen);
+	r->path[slen] = '\0';
+	r->len = (u16)slen;
+	r->prefix = s[slen - 1] == '/';
+	r->hash = full_name_hash(NULL, s, slen);
+	list_add_tail(&r->lnode, &ghost_all);
+	if (r->prefix)
+		hlist_add_head_rcu(&r->hnode, &ghost_prefixes);
+	else
+		hlist_add_head_rcu(&r->hnode, ghost_bucket(r->hash));
 	WRITE_ONCE(ghost_nrules, ghost_nrules + 1);
 	return 0;
 }
 
 static int ghost_del_path_locked(const char *s)
 {
-	size_t slen = strlen(s);
-	int i, n = ghost_nrules;
+	struct gh_rule *r = ghost_find_locked(s, strlen(s));
 
-	for (i = 0; i < n; i++) {
-		if (ghost_rlen[i] == slen && !memcmp(ghost_rules[i], s, slen)) {
-			memmove(&ghost_rules[i], &ghost_rules[i + 1],
-				(n - i - 1) * GH_RULE_LEN);
-			memmove(&ghost_rlen[i], &ghost_rlen[i + 1],
-				(n - i - 1) * sizeof(ghost_rlen[0]));
-			WRITE_ONCE(ghost_nrules, n - 1);
-			return 0;
-		}
-	}
-	return -ENOENT;
+	if (!r)
+		return -ENOENT;
+	ghost_drop_locked(r);
+	return 0;
+}
+
+static void ghost_clear_paths_locked(void)
+{
+	struct gh_rule *r, *tmp;
+
+	list_for_each_entry_safe(r, tmp, &ghost_all, lnode)
+		ghost_drop_locked(r);
+	WRITE_ONCE(ghost_nrules, 0);
 }
 
 static int ghost_add_uid_locked(u32 uid)
@@ -224,12 +286,12 @@ int ghost_ctl(const char *buf, size_t count)
 		for (p = buf + 2; p < end; p++)
 			if (*p != '\n' && *p != '\r')
 				return -EINVAL;
-		spin_lock(&ghost_lock);
+		mutex_lock(&ghost_mutex);
 		if (op == 'p')
-			WRITE_ONCE(ghost_nrules, 0);
+			ghost_clear_paths_locked();
 		else
 			WRITE_ONCE(ghost_nuids, 0);
-		spin_unlock(&ghost_lock);
+		mutex_unlock(&ghost_mutex);
 		return 0;
 	}
 	if (mode != '+' && mode != '~' && mode != '=')
@@ -257,10 +319,10 @@ int ghost_ctl(const char *buf, size_t count)
 		}
 	}
 
-	spin_lock(&ghost_lock);
+	mutex_lock(&ghost_mutex);
 	if (replace) {
 		if (op == 'p')
-			WRITE_ONCE(ghost_nrules, 0);
+			ghost_clear_paths_locked();
 		else
 			WRITE_ONCE(ghost_nuids, 0);
 	}
@@ -290,7 +352,7 @@ int ghost_ctl(const char *buf, size_t count)
 			first_err = ret;
 		ntok++;
 	}
-	spin_unlock(&ghost_lock);
+	mutex_unlock(&ghost_mutex);
 
 	if (!first_err && !ntok)
 		return -EINVAL;
@@ -299,19 +361,25 @@ int ghost_ctl(const char *buf, size_t count)
 
 int ghost_get_rule(int idx, char *out, size_t outsz)
 {
-	int len = 0;
+	struct gh_rule *r;
+	int len = 0, i = 0;
 
 	if (!out || outsz < GH_RULE_LEN + 4 || idx < 0)
 		return -EINVAL;
 
-	spin_lock(&ghost_lock);
+	mutex_lock(&ghost_mutex);
 	if (idx < ghost_nrules) {
-		len = scnprintf(out, outsz, "p %s", ghost_rules[idx]);
+		list_for_each_entry(r, &ghost_all, lnode) {
+			if (i++ != idx)
+				continue;
+			len = scnprintf(out, outsz, "p %s", r->path);
+			break;
+		}
 	} else {
 		idx -= ghost_nrules;
 		if (idx < ghost_nuids)
 			len = scnprintf(out, outsz, "u %u", ghost_uids[idx]);
 	}
-	spin_unlock(&ghost_lock);
+	mutex_unlock(&ghost_mutex);
 	return len;
 }
