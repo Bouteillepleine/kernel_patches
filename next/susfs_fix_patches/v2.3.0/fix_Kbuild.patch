@@ -1,8 +1,8 @@
 diff --git a/kernel/Kbuild b/kernel/Kbuild
-index cb7f51ea..96e164fb 100644
+index cb7f51ea..3b933eef 100644
 --- a/kernel/Kbuild
 +++ b/kernel/Kbuild
-@@ -4,25 +4,13 @@ kernelsu-objs += feature/kernel_umount.o
+@@ -4,18 +4,7 @@ kernelsu-objs += feature/kernel_umount.o
  kernelsu-objs += feature/sulog.o
  kernelsu-objs += feature/sucompat.o
  
@@ -21,14 +21,7 @@ index cb7f51ea..96e164fb 100644
  kernelsu-objs += extras.o
  
  kernelsu-objs += infra/file_wrapper.o
- kernelsu-objs += infra/event_queue.o
- kernelsu-objs += infra/seccomp_cache.o
- kernelsu-objs += infra/su_mount_ns.o
--kernelsu-objs += infra/symbol_resolver.o
- 
- ifneq ($(CONFIG_KSU_DISABLE_MANAGER),y)
- kernelsu-objs += manager/apk_sign.o
-@@ -154,4 +142,14 @@ ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
+@@ -154,4 +143,14 @@ ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
  ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes -Wno-missing-declarations
  ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable
  
