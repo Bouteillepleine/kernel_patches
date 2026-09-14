@@ -49,15 +49,33 @@ static DEFINE_MUTEX(ghost_mutex);
 
 static DEFINE_PER_CPU(char [PATH_MAX], ghost_pathbuf);
 
+#define GH_PER_USER_RANGE	100000
+#define GH_SDKSANDBOX_START	20000
+#define GH_SDKSANDBOX_END	29999
+#define GH_SDKSANDBOX_OFF	10000
+
+static u32 ghost_appid(u32 uid)
+{
+	u32 appid = uid % GH_PER_USER_RANGE;
+
+	if (appid >= GH_SDKSANDBOX_START && appid <= GH_SDKSANDBOX_END)
+		appid -= GH_SDKSANDBOX_OFF;
+	return appid;
+}
+
 static bool ghost_uid_hidden(u32 uid)
 {
 	int i, n = READ_ONCE(ghost_nuids);
+	u32 appid = ghost_appid(uid);
 
 	if (n > GH_MAX_UIDS)
 		n = GH_MAX_UIDS;
-	for (i = 0; i < n; i++)
-		if (READ_ONCE(ghost_uids[i]) == uid)
+	for (i = 0; i < n; i++) {
+		u32 e = READ_ONCE(ghost_uids[i]);
+
+		if (e == uid || e == appid)
 			return true;
+	}
 	return false;
 }
 
