@@ -23,11 +23,11 @@ index c57485cc..45358571 100644
 +	struct file *f;
 +	int ret;
 +
-+	ret = kern_path(path, 0, &p);
++	ret = kern_path(path, (flags & O_NOFOLLOW) ? 0 : LOOKUP_FOLLOW, &p);
 +	if (ret)
 +		return ERR_PTR(ret);
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 +	f = dentry_open_nonotify(&p, flags, current_cred());
 +#else
 +	f = dentry_open(&p, flags | __FMODE_NONOTIFY, current_cred());
