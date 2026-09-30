@@ -659,9 +659,25 @@ do_pathhide() {
     # 6.6 is the odd tree here, not 6.12: it reads the RSS counters through
     # get_mm_counter_sum(), which sits inside this hunk's context, while
     # 6.12 still uses get_mm_counter().
+    #
+    # KERNEL_VER cannot separate the 6.12 case on its own. The OP15 6.12.58
+    # manifest tracks a branch carrying OnePlus's page-size emulation, where
+    # task_statm() returns __page_size_count(mm->total_vm) and reads the counters
+    # through get_mm_counter_sum(); the 6.12.23 manifest does neither. Both report
+    # 6.12, so the tree itself is the only honest discriminator. The subtraction
+    # has to land INSIDE the conversion: pathhide_hidden_vm_pages() counts real
+    # PAGE_SIZE pages while __page_size_count() DIV_ROUND_UPs into the emulated
+    # size, so converting first and subtracting after rounds twice and can
+    # over-deduct a page.
     case "$KERNEL_VER" in
     6.6) REQ_ACCT=pathhide_accounting_6.6_integration.patch ;;
-    *) REQ_ACCT=pathhide_accounting_integration.patch ;;
+    *)
+        if grep -q '__page_size_count(mm->total_vm)' "$d/fs/proc/task_mmu.c"; then
+            REQ_ACCT=pathhide_accounting_pgcompat_integration.patch
+        else
+            REQ_ACCT=pathhide_accounting_integration.patch
+        fi
+        ;;
     esac
     apply_first_of pathhide-pagemap "$REQ_PAGEMAP" \
         "$PH/pathhide_pagemap_6.12_integration.patch" \
@@ -672,6 +688,7 @@ do_pathhide() {
         "$PH/pathhide_mincore_5.10_integration.patch"
     apply_first_of pathhide-accounting "$REQ_ACCT" \
         "$PH/pathhide_accounting_6.6_integration.patch" \
+        "$PH/pathhide_accounting_pgcompat_integration.patch" \
         "$PH/pathhide_accounting_integration.patch"
     # pathhide.c/.h live in fs/, not fs/proc/, so this appends the obj-y line
     # rather than applying pathhide_build_integration.patch (which is the
