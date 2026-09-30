@@ -7,7 +7,6 @@ child inherits both icsk_ca_priv slot 0 -- the struct bbr3 * -- and
 icsk_ca_initialized from its parent, and inet_csk_clone_lock() clears neither.
 
 If the parent's congestion control was already initialized before the clone,
-which any setsockopt(TCP_CONGESTION) on a listening socket does, then
 tcp_init_transfer() skips tcp_init_congestion_control() for the child because
 icsk_ca_initialized is already 1. bbr3_init() therefore never runs for that
 child and it uses the parent's heap ctx for its whole lifetime, and
@@ -20,6 +19,22 @@ Upstream BBR cannot hit this because its state lives inline in icsk_ca_priv,
 where the byte copy hands the child an independent copy. Storing a pointer
 there instead -- which is what keeps struct tcp_sock and struct rate_sample
 byte-identical for KMI -- is what turns that copy into shared ownership.
+
+No reachable trigger is known on a stock stack. A listener is the only clone
+source TCP has, and neither path that could initialize one does so:
+tcp_assign_congestion_control() never calls .init, and
+tcp_reinit_congestion_control(), where setsockopt(TCP_CONGESTION) lands, skips
+it outright --
+
+	if (!((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN)))
+		tcp_init_congestion_control(sk);
+
+-- so a listener reaches accept() with icsk_ca_initialized still 0 and slot 0
+still NULL, and tcp_init_transfer() then runs init for every child, which
+allocates each one its own ctx. This patch is therefore hardening of the
+ownership invariant, not a fix for an observed corruption. The only documented
+way the flag arrives already set is the case tcp_init_transfer() names in its
+own comment, BPF initializing congestion control ahead of it.
 
 Record the owning socket in the ctx and test it in both accessors. A ctx the
 socket does not own now reads as absent, so the guarded callbacks take the
