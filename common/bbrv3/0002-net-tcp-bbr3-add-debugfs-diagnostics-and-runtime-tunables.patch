@@ -91,11 +91,12 @@ diff --git a/net/ipv4/tcp_bbr3.c b/net/ipv4/tcp_bbr3.c
 index b65a91f..256e6ef 100644
 --- a/net/ipv4/tcp_bbr3.c
 +++ b/net/ipv4/tcp_bbr3.c
-@@ -64,13 +64,41 @@
+@@ -64,13 +64,42 @@
  #include <linux/inet.h>
  #include <linux/random.h>
  #include <linux/win_minmax.h>
 +#include <linux/debugfs.h>
++#include <linux/nsproxy.h>
 +#include <linux/seq_file.h>
  
  #include <trace/events/tcp.h>
@@ -134,20 +135,22 @@ index b65a91f..256e6ef 100644
  
  /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
   * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
-@@ -106,14 +134,24 @@ struct bbr_context {
+@@ -106,14 +134,26 @@ struct bbr_context {
  };
  
  /* Window length of min_rtt filter (in sec): */
 -static const u32 bbr_min_rtt_win_sec = 10;
 +static u32 bbr_min_rtt_win_sec __read_mostly = 10;
-+BBR3_PARAM_CLAMP(min_rtt_win_sec, 1, U32_MAX);	/* nonzero window */
++BBR3_PARAM_CLAMP(min_rtt_win_sec, 1, 3600);	/* nonzero; win_sec * HZ must fit u32 */
 +module_param_cb(bbr_min_rtt_win_sec, &bbr3_paramops_min_rtt_win_sec,
 +		&bbr_min_rtt_win_sec, 0644);
 +MODULE_PARM_DESC(bbr_min_rtt_win_sec, "min_rtt filter window (sec)");
  /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
 -static const u32 bbr_probe_rtt_mode_ms = 200;
 +static u32 bbr_probe_rtt_mode_ms __read_mostly = 200;
-+module_param(bbr_probe_rtt_mode_ms, uint, 0644);
++BBR3_PARAM_CLAMP(probe_rtt_mode_ms, 0, U32_MAX);	/* 0 is valid */
++module_param_cb(bbr_probe_rtt_mode_ms, &bbr3_paramops_probe_rtt_mode_ms,
++		&bbr_probe_rtt_mode_ms, 0644);
 +MODULE_PARM_DESC(bbr_probe_rtt_mode_ms, "min time at cwnd_min_target in PROBE_RTT (ms)");
  /* Window length of probe_rtt_min_us filter (in ms), and consequently the
   * typical interval between PROBE_RTT mode entries. The default is 5000ms.
@@ -162,13 +165,15 @@ index b65a91f..256e6ef 100644
  /* Proportion of cwnd to estimated BDP in PROBE_RTT, in units of BBR_UNIT: */
  static const u32 bbr_probe_rtt_cwnd_gain = BBR_UNIT * 1 / 2;
  
-@@ -189,7 +227,9 @@ static const bool bbr_precise_ece_ack = true;
+@@ -189,7 +227,11 @@ static const bool bbr_precise_ece_ack = true;
  /* Max RTT (in usec) at which to use sender-side ECN logic.
   * Disabled when 0 (ECN allowed at any RTT).
   */
 -static const u32 bbr_ecn_max_rtt_us = 5000;
 +static u32 bbr_ecn_max_rtt_us __read_mostly = 5000;
-+module_param(bbr_ecn_max_rtt_us, uint, 0644);
++BBR3_PARAM_CLAMP(ecn_max_rtt_us, 0, U32_MAX);	/* 0 = ECN at any RTT */
++module_param_cb(bbr_ecn_max_rtt_us, &bbr3_paramops_ecn_max_rtt_us,
++		&bbr_ecn_max_rtt_us, 0644);
 +MODULE_PARM_DESC(bbr_ecn_max_rtt_us, "max RTT (us) for sender-side ECN logic; 0 = any RTT");
  
  /* On losses, scale down inflight and pacing rate by beta scaled by BBR_SCALE.
@@ -222,7 +227,7 @@ index b65a91f..256e6ef 100644
  
  /* Exit STARTUP if number of round trips with ECN mark rate above ecn_thresh
   * meets this count.
-@@ -2035,6 +2091,82 @@ out:
+@@ -2035,6 +2091,84 @@ out:
  
  static struct kmem_cache *bbr3_cache __read_mostly;
  
@@ -262,6 +267,8 @@ index b65a91f..256e6ef 100644
 +
 +			if (!sk_fullsock(sk))
 +				continue;	/* skip timewait/request socks */
++			if (!net_eq(sock_net(sk), current->nsproxy->net_ns))
++				continue;	/* other netns: not ours to report */
 +			if (!spin_trylock_bh(&sk->sk_lock.slock))
 +				continue;	/* contended: skip, don't block */
 +			/* A process owner may be inside .release freeing the

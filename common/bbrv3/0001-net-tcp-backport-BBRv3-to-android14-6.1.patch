@@ -533,10 +533,10 @@ index f68762c..00b1073 100644
 +		return -ENOMEM;
 +	
 +	ctx->params.sysctl_tcp_plb_enabled = 0;
-+	ctx->params.sysctl_tcp_plb_idle_rehash_rounds = tcp_plb_max_rounds;
-+	ctx->params.sysctl_tcp_plb_rehash_rounds = tcp_plb_max_rounds;
-+	ctx->params.sysctl_tcp_plb_suspend_rto_sec = 0;
-+	ctx->params.sysctl_tcp_plb_cong_thresh = tcp_plb_max_cong_thresh;
++	ctx->params.sysctl_tcp_plb_idle_rehash_rounds = 3;
++	ctx->params.sysctl_tcp_plb_rehash_rounds = 12;
++	ctx->params.sysctl_tcp_plb_suspend_rto_sec = 60;
++	ctx->params.sysctl_tcp_plb_cong_thresh = (1 << TCP_PLB_SCALE) / 2;
 +
 +	table = kmemdup(plb_ctl_table_template, sizeof(plb_ctl_table_template), GFP_KERNEL);
 +	if (!table) {
@@ -3063,7 +3063,7 @@ index 6042766..e33922c 100644
  }
  
  void tcp_mark_skb_lost(struct sock *sk, struct sk_buff *skb)
-@@ -1474,6 +1487,17 @@ static bool tcp_shifted_skb(struct sock *sk, struct sk_buff *prev,
+@@ -1474,6 +1487,19 @@ static bool tcp_shifted_skb(struct sock *sk, struct sk_buff *prev,
  	WARN_ON_ONCE(tcp_skb_pcount(skb) < pcount);
  	tcp_skb_pcount_add(skb, -pcount);
  
@@ -3076,7 +3076,9 @@ index 6042766..e33922c 100644
 +		TCP_SKB_CB(skb)->tx.in_flight = 0;
 +	else
 +		TCP_SKB_CB(skb)->tx.in_flight -= pcount;
-+	TCP_SKB_CB(prev)->tx.in_flight += pcount;
++	TCP_SKB_CB(prev)->tx.in_flight =
++		min_t(u32, TCP_SKB_CB(prev)->tx.in_flight + pcount,
++		      TCPCB_IN_FLIGHT_MAX);
 +
  	/* When we're adding to gso_segs == 1, gso_size will be zero,
  	 * in theory this shouldn't be necessary but as long as DSACK
@@ -3091,11 +3093,15 @@ index 6042766..e33922c 100644
  {
  	struct tcp_sock *tp = tcp_sk(sk);
  
-@@ -3785,6 +3810,7 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
+@@ -3785,6 +3810,11 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
  		/* ACK advances: there was a loss, so reduce cwnd. Reset
  		 * tlp_high_seq in tcp_init_cwnd_reduction()
  		 */
-+		tcp_ca_event(sk, CA_EVENT_TLP_RECOVERY);
++		/* CA_EVENT_TLP_RECOVERY is a BBRv3-specific standalone value; only
++		 * deliver it to CCs that opt into the private loss hook. */
++		if (inet_csk(sk)->icsk_ca_ops &&
++		    (inet_csk(sk)->icsk_ca_ops->flags & TCP_CONG_HAS_LOSS_HOOK))
++			tcp_ca_event(sk, CA_EVENT_TLP_RECOVERY);
  		tcp_init_cwnd_reduction(sk);
  		tcp_set_ca_state(sk, TCP_CA_CWR);
  		tcp_end_cwnd_reduction(sk);
@@ -3252,7 +3258,7 @@ index f75d365..65b46f4 100644
  	long limit;
  	int nlen;
  	u8 flags;
-@@ -1614,6 +1617,30 @@ int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
+@@ -1614,6 +1617,31 @@ int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
  
  		if (diff)
  			tcp_adjust_pcount(sk, skb, diff);
@@ -3274,12 +3280,13 @@ index f75d365..65b46f4 100644
 +			inflight_prev = 0;
 +		}
 +		/* Set 1st tx.in_flight as if 1st were sent by itself: */
-+		TCP_SKB_CB(skb)->tx.in_flight = inflight_prev +
-+						 tcp_skb_pcount(skb);
++		TCP_SKB_CB(skb)->tx.in_flight =
++			min_t(u32, inflight_prev + tcp_skb_pcount(skb),
++			      TCPCB_IN_FLIGHT_MAX);
 +		/* Set 2nd tx.in_flight with new 1st and 2nd pcounts: */
-+		TCP_SKB_CB(buff)->tx.in_flight = inflight_prev +
-+						 tcp_skb_pcount(skb) +
-+						 tcp_skb_pcount(buff);
++		TCP_SKB_CB(buff)->tx.in_flight =
++			min_t(u32, inflight_prev + tcp_skb_pcount(skb) +
++			      tcp_skb_pcount(buff), TCPCB_IN_FLIGHT_MAX);
  	}
  
  	/* Link BUFF into the send queue. */
