@@ -656,29 +656,32 @@ do_pathhide() {
     6.12 | 6.6) REQ_MINCORE=pathhide_mincore_6.12_integration.patch ;;
     *) REQ_MINCORE=pathhide_mincore_5.10_integration.patch ;;
     esac
-    # 6.6 is the odd tree here, not 6.12: it reads the RSS counters through
-    # get_mm_counter_sum(), which sits inside this hunk's context, while
-    # 6.12 still uses get_mm_counter().
+    # KERNEL_VER cannot pick this one at all, so do not try. What the three
+    # variants differ on is how task_statm() reads its counters, and that tracks
+    # the vendor branch rather than the GKI version:
     #
-    # KERNEL_VER cannot separate the 6.12 case on its own. The OP15 6.12.58
-    # manifest tracks a branch carrying OnePlus's page-size emulation, where
-    # task_statm() returns __page_size_count(mm->total_vm) and reads the counters
-    # through get_mm_counter_sum(); the 6.12.23 manifest does neither. Both report
-    # 6.12, so the tree itself is the only honest discriminator. The subtraction
-    # has to land INSIDE the conversion: pathhide_hidden_vm_pages() counts real
-    # PAGE_SIZE pages while __page_size_count() DIV_ROUND_UPs into the emulated
-    # size, so converting first and subtracting after rounds twice and can
-    # over-deduct a page.
-    case "$KERNEL_VER" in
-    6.6) REQ_ACCT=pathhide_accounting_6.6_integration.patch ;;
-    *)
-        if grep -q '__page_size_count(mm->total_vm)' "$d/fs/proc/task_mmu.c"; then
-            REQ_ACCT=pathhide_accounting_pgcompat_integration.patch
-        else
-            REQ_ACCT=pathhide_accounting_integration.patch
-        fi
-        ;;
-    esac
+    #   __page_size_count(mm->total_vm)  OnePlus's page-size emulation. OP15's
+    #                                    6.12.58 manifest carries it, its 6.12.23
+    #                                    manifest does not, and both report 6.12.
+    #   get_mm_counter_sum(...ANONPAGES) the summed-counter shape. Some 6.6 trees
+    #                                    have it; sm8750 at 6.6.89 does not, which
+    #                                    is what a version-keyed pin got wrong.
+    #   get_mm_counter(...ANONPAGES)     everything else.
+    #
+    # Order matters: the emulated shape reads through get_mm_counter_sum() too, so
+    # it has to be tested first or it would match the 6.6 variant.
+    #
+    # For the emulated tree the subtraction also has to land INSIDE the
+    # conversion: pathhide_hidden_vm_pages() counts real PAGE_SIZE pages while
+    # __page_size_count() DIV_ROUND_UPs into the emulated size, so converting
+    # first and subtracting after rounds twice and can over-deduct a page.
+    if grep -q '__page_size_count(mm->total_vm)' "$d/fs/proc/task_mmu.c"; then
+        REQ_ACCT=pathhide_accounting_pgcompat_integration.patch
+    elif grep -q 'get_mm_counter_sum(mm, MM_ANONPAGES)' "$d/fs/proc/task_mmu.c"; then
+        REQ_ACCT=pathhide_accounting_6.6_integration.patch
+    else
+        REQ_ACCT=pathhide_accounting_integration.patch
+    fi
     apply_first_of pathhide-pagemap "$REQ_PAGEMAP" \
         "$PH/pathhide_pagemap_6.12_integration.patch" \
         "$PH/pathhide_pagemap_6.6_integration.patch" \
