@@ -360,13 +360,14 @@ verify_pathhide() {
     objy "$d/fs/Makefile" 'pathhide.o' "_pathhide"
     has "$d/fs/proc/task_mmu.c" 'pathhide_match_file' "_pathhide: maps/smaps guards missing from task_mmu.c"
     has "$d/fs/proc/base.c" 'pathhide_match_file' "_pathhide: map_files guards missing from base.c"
+    infn "$d/fs/proc/task_mmu.c" '^static int pagemap_pmd_range' 'pathhide_match_file'         "_pathhide: the pagemap guard is not inside pagemap_pmd_range() -- resident pages sitting at an address maps does not list is the whole gap, stated outright"
+    infn "$d/mm/mincore.c" '^static long do_mincore' 'pathhide_match_file'         "_pathhide: the mincore(2) guard is not inside do_mincore(). It has to sit before can_do_mincore(), which answers resident-for-everything by memset for a file the caller cannot write."
+    infn "$d/fs/proc/task_mmu.c" '^void task_mem' 'pathhide_hidden_vm_pages'         "_pathhide: the VmSize/VmPeak deduction is not inside task_mem() -- summing the visible maps ranges against VmSize is exact arithmetic, which is what makes it worth closing while RSS is deliberately left alone"
+    infn "$d/fs/proc/task_mmu.c" '^unsigned long task_statm' 'pathhide_hidden_vm_pages'         "_pathhide: the statm size deduction is not inside task_statm()"
+    # PAGEMAP_SCAN landed in 6.7, so only 6.12 has a second residency window.
     case "$KERNEL_VER" in
     6.12)
-        infn "$d/fs/proc/task_mmu.c" '^static int pagemap_pmd_range' 'pathhide_match_file'         "_pathhide: the pagemap guard is not inside pagemap_pmd_range() -- resident pages sitting at an address maps does not list is the whole gap, stated outright"
         infn "$d/fs/proc/task_mmu.c" '^static int pagemap_scan_test_walk' 'pathhide_match_file'         "_pathhide: the PAGEMAP_SCAN guard is not inside pagemap_scan_test_walk() -- the ioctl is a second residency window onto the same vma"
-        infn "$d/mm/mincore.c" '^static long do_mincore' 'pathhide_match_file'         "_pathhide: the mincore(2) guard is not inside do_mincore(). It has to sit before can_do_mincore(), which answers resident-for-everything by memset for a file the caller cannot write."
-        infn "$d/fs/proc/task_mmu.c" '^void task_mem' 'ph_hidden'         "_pathhide: the VmSize/VmPeak deduction is not inside task_mem() -- summing the visible maps ranges against VmSize is exact arithmetic, which is what makes it worth closing while RSS is left alone"
-        infn "$d/fs/proc/task_mmu.c" '^unsigned long task_statm' 'ph_total_vm'         "_pathhide: the statm size deduction is not inside task_statm()"
         ;;
     esac
     # The /proc/<pid>/fd half was removed on purpose: a hidden fd stays
@@ -425,11 +426,7 @@ verify_ghost() {
     # a path whose getxattr/listxattr already answered ENOENT. vfs_statx() is the
     # single choke point for stat/lstat/statx/newfstatat on 6.12; the older trees
     # reach it through a differently shaped vfs_statx and still need their own.
-    case "$KERNEL_VER" in
-    6.12)
-        infn "$d/fs/stat.c" '^static int vfs_statx' 'ghost_hidden_path(&path))'         "_ghost: the stat(2) family guard is not inside vfs_statx() -- lstat/statx/newfstatat read the hidden object's real metadata where every other ghost surface answers ENOENT"
-        ;;
-    esac
+    infn "$d/fs/stat.c" '^(static )?int vfs_statx' 'ghost_hidden_path(&path))'         "_ghost: the stat(2) family guard is not inside vfs_statx() -- lstat/statx/newfstatat read the hidden object's real metadata where every other ghost surface answers ENOENT. This is the whole family through one choke point on all five trees; there is no version where it is optional."
     infn "$d/fs/open.c" 'do_fchmodat' 'ghost_hidden_path(&path))'         "_ghost: the chmod(2) guard is not inside do_fchmodat()"
     infn "$d/fs/open.c" '^(long|int) do_sys_truncate' 'ghost_hidden_path(&path))'         "_ghost: the truncate(2) guard is not inside do_sys_truncate()"
     infn "$d/fs/utimes.c" '^(static )?(long|int) do_utimes_path' 'ghost_hidden_path(&path))'         "_ghost: the utimensat(2) guard is not inside do_utimes_path()"
@@ -619,15 +616,42 @@ do_pathhide() {
     # Dropping a vma's line from maps leaves the mapping itself in place, so the
     # gap stays readable through pagemap, mincore(2) and the accounting-derived
     # counters (VmSize/VmPeak/statm) -- none of which the maps cloak touches.
-    # 6.12 only: pagemap_pmd_range() and task_statm() are shaped differently on
-    # every tree, so the other four need their own pre-images.
+    # The groupings below are measured, not guessed: each variant applies at
+    # fuzz 0 on exactly the trees named and is refused on every other one.
+    local REQ_PAGEMAP REQ_MINCORE REQ_ACCT
+    # pagemap_pmd_range()'s trailing context carries `bool migration = false;`
+    # on 5.10/5.15/6.1 and not on 6.6/6.12; 6.12 additionally guards the
+    # PAGEMAP_SCAN ioctl, which does not exist before 6.7.
     case "$KERNEL_VER" in
-    6.12)
-        apply_or_die "$PH/pathhide_pagemap_${KERNEL_VER}_integration.patch"
-        apply_or_die "$PH/pathhide_mincore_${KERNEL_VER}_integration.patch"
-        apply_or_die "$PH/pathhide_accounting_${KERNEL_VER}_integration.patch"
-        ;;
+    6.12) REQ_PAGEMAP=pathhide_pagemap_6.12_integration.patch ;;
+    6.6) REQ_PAGEMAP=pathhide_pagemap_6.6_integration.patch ;;
+    *) REQ_PAGEMAP=pathhide_pagemap_5.10_integration.patch ;;
     esac
+    # do_mincore() finds the vma with find_vma()+vm_start on 5.10/5.15/6.1 and
+    # with vma_lookup() on 6.6/6.12. The guard has to sit before
+    # can_do_mincore(), which memsets "resident" for a file the caller cannot
+    # write -- so the unwritable case leaks through the side channel, not the walk.
+    case "$KERNEL_VER" in
+    6.12 | 6.6) REQ_MINCORE=pathhide_mincore_6.12_integration.patch ;;
+    *) REQ_MINCORE=pathhide_mincore_5.10_integration.patch ;;
+    esac
+    # 6.6 is the odd tree here, not 6.12: it reads the RSS counters through
+    # get_mm_counter_sum(), which sits inside this hunk's context, while
+    # 6.12 still uses get_mm_counter().
+    case "$KERNEL_VER" in
+    6.6) REQ_ACCT=pathhide_accounting_6.6_integration.patch ;;
+    *) REQ_ACCT=pathhide_accounting_integration.patch ;;
+    esac
+    apply_first_of pathhide-pagemap "$REQ_PAGEMAP" \
+        "$PH/pathhide_pagemap_6.12_integration.patch" \
+        "$PH/pathhide_pagemap_6.6_integration.patch" \
+        "$PH/pathhide_pagemap_5.10_integration.patch"
+    apply_first_of pathhide-mincore "$REQ_MINCORE" \
+        "$PH/pathhide_mincore_6.12_integration.patch" \
+        "$PH/pathhide_mincore_5.10_integration.patch"
+    apply_first_of pathhide-accounting "$REQ_ACCT" \
+        "$PH/pathhide_accounting_6.6_integration.patch" \
+        "$PH/pathhide_accounting_integration.patch"
     # pathhide.c/.h live in fs/, not fs/proc/, so this appends the obj-y line
     # rather than applying pathhide_build_integration.patch (which is the
     # fs/proc/ layout). verify_pathhide() asserts the RESULT, not this write.
@@ -690,12 +714,21 @@ do_ghost() {
     apply_or_die "$GH/ghost_open.patch"
     apply_or_die "$GH/ghost_create.patch"
     apply_or_die "$GH/ghost_build_integration.patch"
-    # stat(2) family. 6.12 only: vfs_statx() delegates to vfs_statx_path() there,
-    # so this pre-image does not exist on 5.10/5.15/6.1/6.6 and each of those
-    # needs a hunk cut against its own vfs_statx().
+    # stat(2) family -- the plainest existence oracle there is, and the last
+    # surface that had no guard at all. Three shapes: 5.10/5.15 resolve with
+    # user_path_at(), 6.1/6.6 with filename_lookup() into vfs_getattr(), 6.12
+    # with filename_lookup() into vfs_statx_path(). All three take their error
+    # path with `goto out`, where out: is a bare `return error` that does NOT
+    # path_put -- so each guard puts the path itself rather than falling through.
+    local REQ_STATX
     case "$KERNEL_VER" in
-    6.12) apply_or_die "$GH/ghost_statx_6_12.patch" ;;
+    6.12) REQ_STATX=ghost_statx_6_12.patch ;;
+    6.6 | 6.1) REQ_STATX=ghost_statx_6_1.patch ;;
+    5.15 | 5.10) REQ_STATX=ghost_statx_5_10.patch ;;
     esac
+    apply_first_of ghost-statx "$REQ_STATX" \
+        "$GH/ghost_statx_6_12.patch" "$GH/ghost_statx_6_1.patch" \
+        "$GH/ghost_statx_5_10.patch"
     verify_ghost
     echo "::endgroup::"
 }

