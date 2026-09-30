@@ -27,5 +27,6 @@
 common/_ghost/**     text eol=lf
 common/_hook/**      text eol=lf
 common/_pathhide/**  text eol=lf
+common/bbrv3/**      text eol=lf
 scripts/**           text eol=lf
 .gitattributes       text eol=lf

@@ -468,7 +468,7 @@ index f68762c..00b1073 100644
  static u32 fib_multipath_hash_fields_all_mask __maybe_unused =
  	FIB_MULTIPATH_HASH_FIELD_ALL_MASK;
  static unsigned int tcp_child_ehash_entries_max = 16 * 1024 * 1024;
-+static u8 tcp_plb_max_rounds = 31;
++static int tcp_plb_max_rounds = 31;
 +static int tcp_plb_max_cong_thresh = 256;
  
  /* obsolete */
