@@ -637,25 +637,36 @@ do_pathhide() {
     # Dropping a vma's line from maps leaves the mapping itself in place, so the
     # gap stays readable through pagemap, mincore(2) and the accounting-derived
     # counters (VmSize/VmPeak/statm) -- none of which the maps cloak touches.
-    # The groupings below are measured, not guessed: each variant applies at
-    # fuzz 0 on exactly the trees named and is refused on every other one.
+    # Every pin below reads the tree instead of KERNEL_VER. A version key was
+    # correct for these two across all 54 vendor trees the builders build, but it
+    # was also correct for the accounting pin right up until sm8750 at 6.6.89,
+    # where the shape tracked the vendor branch rather than the GKI number. The
+    # markers were measured over those same 54 trees and separate them exactly.
     local REQ_PAGEMAP REQ_MINCORE REQ_ACCT
-    # pagemap_pmd_range()'s trailing context carries `bool migration = false;`
-    # on 5.10/5.15/6.1 and not on 6.6/6.12; 6.12 additionally guards the
-    # PAGEMAP_SCAN ioctl, which does not exist before 6.7.
-    case "$KERNEL_VER" in
-    6.12) REQ_PAGEMAP=pathhide_pagemap_6.12_integration.patch ;;
-    6.6) REQ_PAGEMAP=pathhide_pagemap_6.6_integration.patch ;;
-    *) REQ_PAGEMAP=pathhide_pagemap_5.10_integration.patch ;;
-    esac
-    # do_mincore() finds the vma with find_vma()+vm_start on 5.10/5.15/6.1 and
-    # with vma_lookup() on 6.6/6.12. The guard has to sit before
+    # PAGEMAP_SCAN arrived in 6.7, so pagemap_scan_test_walk() exists only on the
+    # 6.12 trees (6 of 54) and is the extra hunk the 6.12 variant carries.
+    # pagemap_pmd_range() otherwise splits on `bool migration`, present on
+    # 5.10/5.15/6.1 (33 trees) and gone by 6.6 (15). The marker has to be scoped
+    # to that function: `bool migration` appears elsewhere in task_mmu.c, and
+    # the 6.12 variant's userfaultfd_wp_async() context belongs to the
+    # PAGEMAP_SCAN hunk, not to pagemap_pmd_range.
+    if grep -q 'pagemap_scan_test_walk' "$d/fs/proc/task_mmu.c"; then
+        REQ_PAGEMAP=pathhide_pagemap_6.12_integration.patch
+    elif awk '/^static int pagemap_pmd_range/,/^}/' "$d/fs/proc/task_mmu.c" |
+        grep -q 'bool migration'; then
+        REQ_PAGEMAP=pathhide_pagemap_5.10_integration.patch
+    else
+        REQ_PAGEMAP=pathhide_pagemap_6.6_integration.patch
+    fi
+    # do_mincore() finds the vma with find_vma()+vm_start on the older trees and
+    # with vma_lookup() from 6.6 on. The guard has to sit before
     # can_do_mincore(), which memsets "resident" for a file the caller cannot
     # write -- so the unwritable case leaks through the side channel, not the walk.
-    case "$KERNEL_VER" in
-    6.12 | 6.6) REQ_MINCORE=pathhide_mincore_6.12_integration.patch ;;
-    *) REQ_MINCORE=pathhide_mincore_5.10_integration.patch ;;
-    esac
+    if grep -q 'vma_lookup(current->mm, addr)' "$d/mm/mincore.c"; then
+        REQ_MINCORE=pathhide_mincore_6.12_integration.patch
+    else
+        REQ_MINCORE=pathhide_mincore_5.10_integration.patch
+    fi
     # KERNEL_VER cannot pick this one at all, so do not try. What the three
     # variants differ on is how task_statm() reads its counters, and that tracks
     # the vendor branch rather than the GKI version:
