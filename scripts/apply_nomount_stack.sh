@@ -290,6 +290,18 @@ verify_hook() {
     has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
     has "$d/security/selinux/selinuxfs.c" 'sel_hidden_bytes' "_hook: selinuxfs.c reply filter missing"
     has "$d/security/selinux/hooks.c" ':ksu:' "_hook: hooks.c attr guard missing"
+    # Per function, not per file: a file-level ':ksu:' grep stayed green for as
+    # long as 5.10/5.15/6.1 carried the setprocattr arm alone.
+    infn "$d/security/selinux/hooks.c" '^static int selinux_inode_setxattr' ':ksu:'         "_hook: selinux_inode_setxattr() has no hidden-type guard -- setxattr(security.selinux) then tells an unprivileged caller apart 'type not in policy' (-EINVAL) from 'type exists, denied' (-EACCES), which is a probe for the hidden types"
+    # 6.12 renamed the process-attr hook; every older tree still has setprocattr.
+    case "$KERNEL_VER" in
+    6.12)
+        infn "$d/security/selinux/hooks.c" '^static int selinux_lsm_setattr' ':ksu:'         "_hook: selinux_lsm_setattr() has no hidden-type guard"
+        ;;
+    *)
+        infn "$d/security/selinux/hooks.c" '^static int selinux_setprocattr' ':ksu:'         "_hook: selinux_setprocattr() has no hidden-type guard"
+        ;;
+    esac
     has "$d/security/selinux/avc.c" ':ksu:' "_hook: avc.c denial filter missing"
     # The avc filter must stay uid-gated. Ungated it deletes the whole record
     # class, including the uid-1000 servicemanager denial that diagnosed the
@@ -417,9 +429,10 @@ verify_ghost() {
     # an OP15 answering ENOTDIR for a hidden path where an absent one answers
     # ENOENT -- one syscall, no privilege, open after every other guard closed.
     infn "$d/fs/namei.c" '^static int path_parentat' 'unlikely(err == -ENOTDIR)'         "_ghost: the ENOTDIR guard is not inside path_parentat() -- mkdirat/mknodat/symlinkat/unlinkat/renameat reach -ENOTDIR through there and through nothing else this patch set guards"
-    infn "$d/fs/namei.c" '^static struct dentry \*filename_create' 'err2 && ghost_hidden_path'         "_ghost: the create guard is not inside filename_create()"
+    infn "$d/fs/namei.c" '^static struct dentry \*filename_create' 'error = err2 ? err2 : -EACCES'         "_ghost: the create guard is not inside filename_create(), or it went back to masking only on a read-only mount. mkdirat/mknodat/symlinkat/linkat all reach -EEXIST through here before may_create() runs, so a hidden name has to answer what an absent one would: err2 when the mount is read-only, -EACCES otherwise."
     infn "$d/fs/namei.c" '^(static )?int do_linkat' 'ghost_hidden_path(&old_path)'         "_ghost: the link(2) guard is not inside do_linkat()"
     infn "$d/fs/open.c" '^int do_fchownat' 'ghost_hidden_path(&path))'         "_ghost: the chown(2) guard is not inside do_fchownat()"
+    infn "$d/fs/stat.c" '^static int do_readlinkat' 'ghost_hidden_path(&path))'         "_ghost: the readlink(2) guard is not inside do_readlinkat() -- it returns the hidden symlink's target where an absent path answers ENOENT"
     infn "$d/fs/open.c" '^static long do_faccessat' 'unlikely(ghost_hidden_path(&path))'         "_ghost: the access(2) guard is not inside do_faccessat(), or it is gated on the mode again. It used to fire only for MAY_WRITE, so access(F_OK) and access(R_OK) reported the hidden path as present while access(W_OK) answered ENOENT -- one syscall, two answers, and only one of them what an absent path gives."
     # The stat family is the plainest existence oracle there is, and it was the
     # one surface with no guard at all: lstat/statx handed back full metadata for
@@ -440,8 +453,9 @@ verify_ghost() {
     n=$(grep -c 'ghost_hidden_path' "$d/fs/xattr.c" 2>/dev/null || echo 0)
     [ "$n" -eq 8 ] || die "_ghost: fs/xattr.c has $n ghost_hidden_path references, expected 8 (one extern + one call per wrapper)"
 
-    if awk '/^int do_renameat2/,/^}/' "$d/fs/namei.c" | grep -q 'ghost_hidden_path'; then
-        die "_ghost: the create guard landed in do_renameat2, not filename_create"
+    infn "$d/fs/namei.c" '^int do_renameat2' 'struct path gpath = { .mnt = old_path.mnt, .dentry = old_dentry }'         "_ghost: the rename(2) source guard is not inside do_renameat2() -- a hidden source renames like any other file, which both answers where an absent one says ENOENT and moves the object out of the path that hides it"
+    if awk '/^int do_renameat2/,/^}/' "$d/fs/namei.c" | grep -q 'err2'; then
+        die "_ghost: the create guard landed in do_renameat2, not filename_create. The rename guard belongs there; the err2/-EACCES one does not."
     fi
     # (There is deliberately no "must NOT be in path_parentat" check any more.
     # There used to be: the first fix for the ambiguous pre-image pinned the
@@ -585,16 +599,23 @@ do_hook() {
     # setprocattr-ONLY fallback, which left setxattr(security.selinux) uncovered
     # there while the README listed the gap as 5.10/5.15/6.1 only.
     6.6)  REQ_ATTR=hide_selinux_attr_6_6.patch ;;
-    # 5.10/5.15/6.1 keep the setprocattr-only fallback: their
-    # selinux_inode_setxattr() has neither shape the setxattr hunk is fitted to,
-    # so setxattr(security.selinux) stays uncovered there -- see the README.
+    # 5.10/5.15/6.1 now have their own two-arm variant. They were on the
+    # setprocattr-only fallback because the 6.6 setxattr hunk did not fit: all
+    # three pass &selinux_state to security_context_to_sid(), which sits in that
+    # hunk's context. One variant covers the three -- the pre-image is identical
+    # in each. Without it, setxattr(security.selinux, "...:ksu_file:...") still
+    # separated "type not in policy" (-EINVAL) from "type exists, denied"
+    # (-EACCES), which is an app-reachable probe for the hidden types.
+    5.10 | 5.15 | 6.1) REQ_ATTR=hide_selinux_attr_5_10.patch ;;
+    # Kept only as the multi-match partner apply_first_of resolves against: the
+    # setprocattr-only patch still applies everywhere, so the pin is what picks.
     *) REQ_ATTR=hide_selinux_attr.patch ;;
     esac
 
     apply_first_of selinuxfs "$REQ_SFS" \
         "$HOOK/hide_selinux_selinuxfs_6_12.patch" "$HOOK/hide_selinux_selinuxfs_5_10.patch"
     apply_first_of attr "$REQ_ATTR" \
-        "$HOOK/hide_selinux_attr_6_12.patch" "$HOOK/hide_selinux_attr_6_6.patch"         "$HOOK/hide_selinux_attr.patch"
+        "$HOOK/hide_selinux_attr_6_12.patch" "$HOOK/hide_selinux_attr_6_6.patch"         "$HOOK/hide_selinux_attr_5_10.patch" "$HOOK/hide_selinux_attr.patch"
     apply_first_of avc-audit "$REQ_AUDIT" \
         "$HOOK/quiet_selinux_audit.patch" "$HOOK/quiet_selinux_audit_legacy.patch"
     apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
@@ -729,6 +750,30 @@ do_ghost() {
     apply_first_of ghost-statx "$REQ_STATX" \
         "$GH/ghost_statx_6_12.patch" "$GH/ghost_statx_6_1.patch" \
         "$GH/ghost_statx_5_10.patch"
+    # readlink(2). Two shapes: 6.12 resolves through filename_lookup() and owns a
+    # struct filename the guard has to putname(); everything older goes through
+    # user_path_at_empty() and has only the path to drop.
+    local REQ_READLINK
+    case "$KERNEL_VER" in
+    6.12) REQ_READLINK=ghost_readlink_6_12.patch ;;
+    *) REQ_READLINK=ghost_readlink_5_10.patch ;;
+    esac
+    apply_first_of ghost-readlink "$REQ_READLINK" \
+        "$GH/ghost_readlink_6_12.patch" "$GH/ghost_readlink_5_10.patch"
+    # rename(2), SOURCE half only. At that point `error` is already -ENOENT and
+    # exit4 is the unwind a genuinely absent source takes, so a hidden source is
+    # byte-identical to an absent one -- and it also stops a hidden file being
+    # renamed out of the path that hides it. The TARGET half is deliberately not
+    # guarded: rename onto an absent target SUCCEEDS, and no error a guard can
+    # return matches that without performing the rename, so RENAME_NOREPLACE
+    # onto a hidden target still answers -EEXIST. Same trade as filename_create.
+    local REQ_RENAME
+    case "$KERNEL_VER" in
+    5.10) REQ_RENAME=ghost_rename_5_10.patch ;;
+    *) REQ_RENAME=ghost_rename_5_15.patch ;;
+    esac
+    apply_first_of ghost-rename "$REQ_RENAME" \
+        "$GH/ghost_rename_5_10.patch" "$GH/ghost_rename_5_15.patch"
     verify_ghost
     echo "::endgroup::"
 }

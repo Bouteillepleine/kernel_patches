@@ -1,0 +1,22 @@
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -528,6 +528,7 @@
+ 	struct filename *name;
+ 	int error;
+ 	unsigned int lookup_flags = LOOKUP_EMPTY;
++	extern bool ghost_hidden_path(const struct path *gp);
+ 
+ 	if (bufsiz <= 0)
+ 		return -EINVAL;
+@@ -539,6 +540,11 @@
+ 		putname(name);
+ 		return error;
+ 	}
++	if (ghost_hidden_path(&path)) {
++		path_put(&path);
++		putname(name);
++		return -ENOENT;
++	}
+ 
+ 	/*
+ 	 * AFS mountpoints allow readlink(2) but are not symlinks

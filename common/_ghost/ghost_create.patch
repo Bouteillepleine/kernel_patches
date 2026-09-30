@@ -9,8 +9,8 @@
 +		extern bool ghost_hidden_path(const struct path *gp);
 +		struct path gpath = { .mnt = path->mnt, .dentry = dentry };
 +
-+		if (err2 && ghost_hidden_path(&gpath))
-+			error = err2;
++		if (ghost_hidden_path(&gpath))
++			error = err2 ? err2 : -EACCES;
  		goto fail;
 +	}
  

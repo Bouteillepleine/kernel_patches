@@ -1,0 +1,36 @@
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -3227,6 +3227,16 @@
+ 	if (rc)
+ 		return rc;
+ 
++	if (__kuid_val(current_uid()) >= 2000 && size && value) {
++		size_t hidden_len = strnlen(value, size);
++
++		if (strnstr(value, ":ksu:", hidden_len) ||
++		    strnstr(value, ":ksu_file:", hidden_len) ||
++		    strnstr(value, ":lsposed_file:", hidden_len) ||
++		    strnstr(value, ":zygisk_file:", hidden_len))
++			return -EINVAL;
++	}
++
+ 	rc = security_context_to_sid(&selinux_state, value, size, &newsid,
+ 				     GFP_KERNEL);
+ 	if (rc == -EINVAL) {
+@@ -6482,6 +6492,16 @@
+ 	if (error)
+ 		return error;
+ 
++	if (__kuid_val(current_uid()) >= 2000 && size && value) {
++		size_t hidden_len = strnlen(value, size);
++
++		if (strnstr(value, ":ksu:", hidden_len) ||
++		    strnstr(value, ":ksu_file:", hidden_len) ||
++		    strnstr(value, ":lsposed_file:", hidden_len) ||
++		    strnstr(value, ":zygisk_file:", hidden_len))
++			return -EINVAL;
++	}
++
+ 	/* Obtain a SID for the context, if one was specified. */
+ 	if (size && str[0] && str[0] != '\n') {
+ 		if (str[size-1] == '\n') {

@@ -65,7 +65,7 @@ static u32 ghost_appid(u32 uid)
 
 static bool ghost_uid_hidden(u32 uid)
 {
-	int i, n = READ_ONCE(ghost_nuids);
+	int i, n = smp_load_acquire(&ghost_nuids);
 	u32 appid = ghost_appid(uid);
 
 	if (n > GH_MAX_UIDS)
@@ -278,6 +278,8 @@ static int ghost_next_token(const char **pp, const char *end, char *out)
 		*pp = p;
 		if (len >= GH_RULE_LEN)
 			return -ENAMETOOLONG;
+		if (memchr(s, '\0', len))
+			return -EINVAL;
 		memcpy(out, s, len);
 		out[len] = '\0';
 		return len;
@@ -315,13 +317,12 @@ int ghost_ctl(const char *buf, size_t count)
 	if (mode != '+' && mode != '~' && mode != '=')
 		return -EINVAL;
 	replace = (mode == '=');
-	if (replace && op != 'p' && op != 'u')
-		return -EINVAL;
 
 	p = buf + 2;
 
 	if (replace) {
 		const char *scan = p;
+		int nnew = 0;
 
 		while ((len = ghost_next_token(&scan, end, line)) != 0) {
 			if (len < 0)
@@ -334,7 +335,10 @@ int ghost_ctl(const char *buf, size_t count)
 				if (kstrtou32(line, 10, &uid) || uid == 0)
 					return -EINVAL;
 			}
+			nnew++;
 		}
+		if (nnew > (op == 'p' ? GH_MAX_RULES : GH_MAX_UIDS))
+			return -ENOSPC;
 	}
 
 	mutex_lock(&ghost_mutex);
