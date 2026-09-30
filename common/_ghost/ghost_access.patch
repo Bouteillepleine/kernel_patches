@@ -7,7 +7,7 @@
 +	{
 +		extern bool ghost_hidden_path(const struct path *gp);
 +
-+		if (unlikely(mode & MAY_WRITE) && ghost_hidden_path(&path)) {
++		if (unlikely(ghost_hidden_path(&path))) {
 +			res = -ENOENT;
 +			goto out_path_release;
 +		}

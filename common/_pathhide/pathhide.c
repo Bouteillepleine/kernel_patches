@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/kernel.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -67,9 +68,51 @@ bool pathhide_match_file(struct file *file)
 	return hit;
 }
 
+static bool ph_rule_sane(const char *s)
+{
+	size_t len = strlen(s);
+	size_t i;
+
+	if (len < 3 || len >= PH_RULE_LEN)
+		return false;
+	for (i = 0; i < len; i++)
+		if (s[i] != '/')
+			return true;
+	return false;
+}
+
+unsigned long pathhide_hidden_vm_pages(struct mm_struct *mm)
+{
+	struct vm_area_struct *vma;
+	unsigned long pages = 0;
+
+	if (!mm || !READ_ONCE(ph_nrules))
+		return 0;
+	if (mmap_read_lock_killable(mm))
+		return 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	{
+		VMA_ITERATOR(vmi, mm, 0);
+
+		for_each_vma(vmi, vma)
+			if (vma->vm_file && pathhide_match_file(vma->vm_file))
+				pages += vma_pages(vma);
+	}
+#else
+	for (vma = mm->mmap; vma; vma = vma->vm_next)
+		if (vma->vm_file && pathhide_match_file(vma->vm_file))
+			pages += vma_pages(vma);
+#endif
+	mmap_read_unlock(mm);
+	return pages;
+}
+
 static int ph_add_locked(const char *s)
 {
 	int i;
+
+	if (!ph_rule_sane(s))
+		return -EINVAL;
 
 	for (i = 0; i < ph_nrules; i++)
 		if (!strcmp(ph_rules[i], s))

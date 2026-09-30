@@ -360,6 +360,15 @@ verify_pathhide() {
     objy "$d/fs/Makefile" 'pathhide.o' "_pathhide"
     has "$d/fs/proc/task_mmu.c" 'pathhide_match_file' "_pathhide: maps/smaps guards missing from task_mmu.c"
     has "$d/fs/proc/base.c" 'pathhide_match_file' "_pathhide: map_files guards missing from base.c"
+    case "$KERNEL_VER" in
+    6.12)
+        infn "$d/fs/proc/task_mmu.c" '^static int pagemap_pmd_range' 'pathhide_match_file'         "_pathhide: the pagemap guard is not inside pagemap_pmd_range() -- resident pages sitting at an address maps does not list is the whole gap, stated outright"
+        infn "$d/fs/proc/task_mmu.c" '^static int pagemap_scan_test_walk' 'pathhide_match_file'         "_pathhide: the PAGEMAP_SCAN guard is not inside pagemap_scan_test_walk() -- the ioctl is a second residency window onto the same vma"
+        infn "$d/mm/mincore.c" '^static long do_mincore' 'pathhide_match_file'         "_pathhide: the mincore(2) guard is not inside do_mincore(). It has to sit before can_do_mincore(), which answers resident-for-everything by memset for a file the caller cannot write."
+        infn "$d/fs/proc/task_mmu.c" '^void task_mem' 'ph_hidden'         "_pathhide: the VmSize/VmPeak deduction is not inside task_mem() -- summing the visible maps ranges against VmSize is exact arithmetic, which is what makes it worth closing while RSS is left alone"
+        infn "$d/fs/proc/task_mmu.c" '^unsigned long task_statm' 'ph_total_vm'         "_pathhide: the statm size deduction is not inside task_statm()"
+        ;;
+    esac
     # The /proc/<pid>/fd half was removed on purpose: a hidden fd stays
     # allocated, so fcntl(N, F_GETFD) succeeds where /proc/self/fd/N is ENOENT.
     hasnt "$d/fs/proc/fd.c" 'pathhide' \
@@ -400,7 +409,7 @@ verify_ghost() {
     objy "$d/fs/proc/Makefile" 'ghost.o' "_ghost"
 
     infn "$d/fs/namei.c" '^static int do_o_path' 'ghost_hidden_path(&path))'         "_ghost: the O_PATH guard is not inside do_o_path()"
-    infn "$d/fs/namei.c" '^static int do_open' 'op->acc_mode & MAY_WRITE'         "_ghost: the open(2) guards are not inside do_open()"
+    infn "$d/fs/namei.c" '^static int do_open' 'unlikely(ghost_hidden_path(&nd->path))'         "_ghost: the open(2) guard is not inside do_open(). It is unconditional now: any open of a hidden path that did not just create it answers ENOENT, so plain O_RDONLY and O_CREAT agree with O_PATH instead of handing back an fd -- and, with O_TRUNC, emptying the file."
     infn "$d/fs/namei.c" '^static int path_lookupat' 'unlikely(err == -ENOTDIR)'         "_ghost: the ENOTDIR guard is not inside path_lookupat(). It applies at fuzz 0 inside path_parentat() too -- that is the bug ghost_notdir.patch's header documents, and this is the assertion that catches it."
     # BOTH walkers, not one. path_parentat() is the CREATE family's choke point
     # (filename_create -> filename_parentat), and mkdirat(p "/d") was measured on
@@ -410,7 +419,17 @@ verify_ghost() {
     infn "$d/fs/namei.c" '^static struct dentry \*filename_create' 'err2 && ghost_hidden_path'         "_ghost: the create guard is not inside filename_create()"
     infn "$d/fs/namei.c" '^(static )?int do_linkat' 'ghost_hidden_path(&old_path)'         "_ghost: the link(2) guard is not inside do_linkat()"
     infn "$d/fs/open.c" '^int do_fchownat' 'ghost_hidden_path(&path))'         "_ghost: the chown(2) guard is not inside do_fchownat()"
-    infn "$d/fs/open.c" '^static long do_faccessat' 'mode & MAY_WRITE) && ghost_hidden_path'         "_ghost: the access(2) guard is not inside do_faccessat()"
+    infn "$d/fs/open.c" '^static long do_faccessat' 'unlikely(ghost_hidden_path(&path))'         "_ghost: the access(2) guard is not inside do_faccessat(), or it is gated on the mode again. It used to fire only for MAY_WRITE, so access(F_OK) and access(R_OK) reported the hidden path as present while access(W_OK) answered ENOENT -- one syscall, two answers, and only one of them what an absent path gives."
+    # The stat family is the plainest existence oracle there is, and it was the
+    # one surface with no guard at all: lstat/statx handed back full metadata for
+    # a path whose getxattr/listxattr already answered ENOENT. vfs_statx() is the
+    # single choke point for stat/lstat/statx/newfstatat on 6.12; the older trees
+    # reach it through a differently shaped vfs_statx and still need their own.
+    case "$KERNEL_VER" in
+    6.12)
+        infn "$d/fs/stat.c" '^static int vfs_statx' 'ghost_hidden_path(&path))'         "_ghost: the stat(2) family guard is not inside vfs_statx() -- lstat/statx/newfstatat read the hidden object's real metadata where every other ghost surface answers ENOENT"
+        ;;
+    esac
     infn "$d/fs/open.c" 'do_fchmodat' 'ghost_hidden_path(&path))'         "_ghost: the chmod(2) guard is not inside do_fchmodat()"
     infn "$d/fs/open.c" '^(long|int) do_sys_truncate' 'ghost_hidden_path(&path))'         "_ghost: the truncate(2) guard is not inside do_sys_truncate()"
     infn "$d/fs/utimes.c" '^(static )?(long|int) do_utimes_path' 'ghost_hidden_path(&path))'         "_ghost: the utimensat(2) guard is not inside do_utimes_path()"
@@ -597,6 +616,18 @@ do_pathhide() {
     normalise "$PH"/*.patch
     apply_or_die "$PH/pathhide_${KERNEL_VER}_integration.patch"
     apply_or_die "$PH/pathhide_mapfiles_${KERNEL_VER}_integration.patch"
+    # Dropping a vma's line from maps leaves the mapping itself in place, so the
+    # gap stays readable through pagemap, mincore(2) and the accounting-derived
+    # counters (VmSize/VmPeak/statm) -- none of which the maps cloak touches.
+    # 6.12 only: pagemap_pmd_range() and task_statm() are shaped differently on
+    # every tree, so the other four need their own pre-images.
+    case "$KERNEL_VER" in
+    6.12)
+        apply_or_die "$PH/pathhide_pagemap_${KERNEL_VER}_integration.patch"
+        apply_or_die "$PH/pathhide_mincore_${KERNEL_VER}_integration.patch"
+        apply_or_die "$PH/pathhide_accounting_${KERNEL_VER}_integration.patch"
+        ;;
+    esac
     # pathhide.c/.h live in fs/, not fs/proc/, so this appends the obj-y line
     # rather than applying pathhide_build_integration.patch (which is the
     # fs/proc/ layout). verify_pathhide() asserts the RESULT, not this write.
@@ -659,6 +690,12 @@ do_ghost() {
     apply_or_die "$GH/ghost_open.patch"
     apply_or_die "$GH/ghost_create.patch"
     apply_or_die "$GH/ghost_build_integration.patch"
+    # stat(2) family. 6.12 only: vfs_statx() delegates to vfs_statx_path() there,
+    # so this pre-image does not exist on 5.10/5.15/6.1/6.6 and each of those
+    # needs a hunk cut against its own vfs_statx().
+    case "$KERNEL_VER" in
+    6.12) apply_or_die "$GH/ghost_statx_6_12.patch" ;;
+    esac
     verify_ghost
     echo "::endgroup::"
 }
