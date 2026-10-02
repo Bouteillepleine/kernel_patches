@@ -22,6 +22,21 @@
 #include <linux/compiler.h>
 #include "ghost.h"
 
+/* The engine owns the block list; this file keeps a replica of it, and a replica
+ * that drifts is a leak rather than a stale cache. nomount hides from the two
+ * isolated-process pools as well as from the appids on the list, and this table
+ * never carried them -- so an isolated child of a hidden app was answered by
+ * the engine's hijacked ops but NOT by the guards here, which re-opened every
+ * oracle this file exists to close (measured on OP15 6.12.58: open(O_PATH)
+ * returned the injected path and getxattr returned its label, as uid 90000,
+ * 99000 and 99500).
+ *
+ * So ask the engine when it is linked in. Weak, so a tree built without nomount
+ * still links and falls back to the table below -- the same arrangement the
+ * engine already uses in the other direction for ghost_ctl().
+ */
+extern bool nm_uid_blocked(uid_t uid) __attribute__((weak));
+
 #define GH_RULE_LEN	192
 #define GH_MAX_UIDS	128
 #define GH_MAX_RULES	65536
@@ -50,6 +65,10 @@ static DEFINE_MUTEX(ghost_mutex);
 static DEFINE_PER_CPU(char [PATH_MAX], ghost_pathbuf);
 
 #define GH_PER_USER_RANGE	100000
+#define GH_APPZYGOTE_START	90000
+#define GH_APPZYGOTE_END	98999
+#define GH_ISOLATED_START	99000
+#define GH_ISOLATED_END		99999
 #define GH_SDKSANDBOX_START	20000
 #define GH_SDKSANDBOX_END	29999
 #define GH_SDKSANDBOX_OFF	10000
@@ -63,7 +82,11 @@ static u32 ghost_appid(u32 uid)
 	return appid;
 }
 
-static bool ghost_uid_hidden(u32 uid)
+/* Table membership alone. The add path dedupes with this and not with
+ * ghost_uid_hidden(), which also answers true for the isolated pools: dedupe
+ * against that would make adding a pool uid a silent no-op.
+ */
+static bool ghost_uid_in_table(u32 uid)
 {
 	int i, n = smp_load_acquire(&ghost_nuids);
 	u32 appid = ghost_appid(uid);
@@ -77,6 +100,34 @@ static bool ghost_uid_hidden(u32 uid)
 			return true;
 	}
 	return false;
+}
+
+static bool ghost_uid_hidden(u32 uid)
+{
+	u32 appid;
+
+	/* The engine's answer is the definition of this predicate. Prefer it,
+	 * never OR with it: a uid this table holds that the engine does NOT
+	 * block would be answered -ENOENT by the guards while the engine served
+	 * it real content -- one process, two views, which is a louder tell
+	 * than the oracle being closed.
+	 */
+	if (nm_uid_blocked)
+		return nm_uid_blocked(uid);
+
+	/* No engine in this tree. Answer what it would have, including the two
+	 * pools. This arm cannot read nm_hide_isolated, so it assumes that
+	 * knob's default of both; on `nomount uid isolated none` it over-hides
+	 * from isolated processes. That is the one case this fallback gets
+	 * wrong, and it needs an engine too old to export the symbol above.
+	 */
+	appid = uid % GH_PER_USER_RANGE;
+	if (appid >= GH_APPZYGOTE_START && appid <= GH_APPZYGOTE_END)
+		return true;	/* an app's own zygote children */
+	if (appid >= GH_ISOLATED_START && appid <= GH_ISOLATED_END)
+		return true;	/* the platform isolated pool */
+
+	return ghost_uid_in_table(uid);
 }
 
 static struct hlist_head *ghost_bucket(u32 hash)
@@ -112,7 +163,14 @@ bool ghost_hidden_path(const struct path *path)
 	bool hit;
 	u32 uid;
 
-	if (!READ_ONCE(ghost_nrules) || !READ_ONCE(ghost_nuids))
+	if (!READ_ONCE(ghost_nrules))
+		return false;
+	/* An empty uid table means "no uid source" only when the engine is not
+	 * the source. Keeping the old combined test here would make every guard
+	 * dead code the moment userspace stops pushing a table it no longer
+	 * needs to push.
+	 */
+	if (!nm_uid_blocked && !READ_ONCE(ghost_nuids))
 		return false;
 	if (!path || !path->dentry || !path->mnt)
 		return false;
@@ -232,7 +290,7 @@ static void ghost_clear_paths_locked(void)
 
 static int ghost_add_uid_locked(u32 uid)
 {
-	if (ghost_uid_hidden(uid))
+	if (ghost_uid_in_table(uid))
 		return 0;
 	if (ghost_nuids >= GH_MAX_UIDS)
 		return -ENOSPC;
