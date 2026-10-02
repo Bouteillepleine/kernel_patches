@@ -168,7 +168,7 @@ list below is what it was; the table after it says where each one now stands.
 | `sum(maps ranges) < VmSize` | **closed** — `pathhide_accounting_*` deducts hidden VMAs from `VmSize`, `VmPeak` and statm's size |
 | `mincore(addr, len, vec)` → `0` | **closed** — `pathhide_mincore_*` answers `ENOMEM` |
 | `/proc/self/pagemap` → present PTEs | **closed** — `pathhide_pagemap_*`, including the `PAGEMAP_SCAN` ioctl on 6.12 |
-| `mmap(addr, …, MAP_FIXED_NOREPLACE)` → `EEXIST` | **open**. Nothing here guards `mmap(2)`, and no error it could return matches "succeeded" without actually placing the mapping — the same trade `filename_create()` and the rename target half take in `_ghost` |
+| `mmap(addr, …, MAP_FIXED_NOREPLACE)` → `EEXIST` | **open, and not closeable here** — see below |
 | `smaps_rollup` vs `VmRSS` | **open, deliberately**. RSS is left alone: a resident page that is really there stays counted, see below |
 
 RSS is not deducted, and `pathhide_hidden_vm_pages()` clamps itself because of
@@ -207,10 +207,24 @@ Approach 1 (emit a benign anonymous line with the same range) was not, and the
 two must still not be mixed: substituting a line while also deducting its pages
 would under-report by exactly the range it substituted.
 
-What approach 2 does not reach is the address hole itself. `maps` no longer
-disagrees with `VmSize`, and the range can no longer be interrogated through
-`mincore` or `pagemap`, but `MAP_FIXED_NOREPLACE` still refuses it. Closing that
-needs approach 1, i.e. a line to land on.
+### `MAP_FIXED_NOREPLACE` — why approach 1 does not close it either
+
+An earlier version of this file said closing it "needs approach 1, i.e. a line to
+land on". That is wrong. Measured on OP15 6.12.58 with the live `/data/adb/` rule:
+a process `dlopen()`s a library from `/data/adb` and probes each gap in its own
+`maps` — 3 of 23 answer `EEXIST`, and all three read back `7f 45 4c 46`.
+
+**The leak is the mapped bytes, not the `maps` line**, and the process owns them.
+So nothing printed for that range closes it: a hole asserts nothing but leaves the
+`EEXIST` mismatch; an anonymous line manufactures a large `r-xp` anonymous mapping
+(a top-tier RASP signal) that still contains an ELF; a benign file-backed line
+needs the bytes at that address to match a `stat()`-able file, which is
+unsatisfiable. Approach 1 would also mean reverting the accounting, mincore and
+pagemap guards, which exist to make the range look unmapped.
+
+The fix is a **loader** change, not a patch here: load the root stack's libraries
+from a path that is legitimately present — an injection the engine serves — so
+`maps`, `dev`/`ino` and the bytes agree and nothing needs hiding.
 
 ## M-C8 — the control-plane forwarder lives in the nomount engine, not here
 
