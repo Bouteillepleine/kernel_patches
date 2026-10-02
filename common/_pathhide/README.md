@@ -176,9 +176,13 @@ it. `VmRSS <= VmSize` and `VmHWM <= VmPeak` hold on every stock kernel and cost
 one read to check, so a deduction taken out of `VmSize` while RSS stands can push
 the pair into a state no stock kernel produces — trading a quantity mismatch for
 an impossible value, which is the louder of the two. The helper therefore never
-returns more than the headroom those two inequalities leave. It counts real
-`PAGE_SIZE` pages, so a page-size-compat tree converts after the subtraction and
-never before.
+returns more than the headroom those two inequalities leave, minus the bound on
+percpu-counter drift: it reads RSS with `get_mm_counter()`, while every tree that
+has `get_mm_counter_sum()` reads it *with* the per-CPU deltas folded in and so
+reports a larger figure. Measured at 59 pages on OP15 6.12.58 — enough to put
+VmSize under VmRSS and defeat the clamp entirely, which is how it was found. It
+counts real `PAGE_SIZE` pages, so a page-size-compat tree converts after the
+subtraction and never before.
 
 The helper also memoises on `vma->vm_file`. It runs under `mmap_read_lock` for
 every reader of `/proc/<pid>/status` and `/proc/<pid>/statm` — which on Android

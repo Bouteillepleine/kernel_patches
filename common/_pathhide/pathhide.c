@@ -13,6 +13,8 @@
 #include <linux/capability.h>
 #include <linux/init.h>
 #include <linux/version.h>
+#include <linux/percpu_counter.h>
+#include <linux/cpumask.h>
 #include "pathhide.h"
 
 #ifndef PH_PROC_NAME
@@ -105,7 +107,7 @@ unsigned long pathhide_hidden_vm_pages(struct mm_struct *mm)
 	struct vm_area_struct *vma;
 	struct ph_vm_memo memo = { NULL, false };
 	unsigned long pages = 0;
-	unsigned long rss, total, peak, peak_rss, room, peak_room;
+	unsigned long rss, total, peak, peak_rss, room, peak_room, slack;
 
 	if (!mm || !READ_ONCE(ph_nrules))
 		return 0;
@@ -139,10 +141,27 @@ unsigned long pathhide_hidden_vm_pages(struct mm_struct *mm)
 	 * Real PAGE_SIZE pages, so a page-size-compat tree converts after this
 	 * and never before.
 	 */
+	/* get_mm_counter() reads the percpu counter without folding in the
+	 * per-CPU deltas. Some trees -- every one that has get_mm_counter_sum()
+	 * -- read RSS *with* them in task_mem()/task_statm(), so their figure is
+	 * the larger one and this headroom would be an over-estimate: measured
+	 * at 59 pages on OP15 6.12.58, which was enough to put VmSize under
+	 * VmRSS and defeat the clamp. Subtract the bound on that drift rather
+	 * than reach for an accessor this file cannot know the tree has:
+	 * |sum - read| <= percpu_counter_batch per CPU per counter.
+	 *
+	 * It costs nothing where it does not matter. Headroom is ~95% of
+	 * total_vm on a real process, so `pages` is still the smaller term and
+	 * the deduction is exact; the margin only ever binds in the pathological
+	 * case this guards, where erring low is the whole point.
+	 */
+	slack = 3UL * (unsigned long)percpu_counter_batch * num_online_cpus();
+
 	room = total > rss ? total - rss : 0;
 	peak_room = peak > peak_rss ? peak - peak_rss : 0;
 	if (peak_room < room)
 		room = peak_room;
+	room = room > slack ? room - slack : 0;
 
 	return min(pages, room);
 }
