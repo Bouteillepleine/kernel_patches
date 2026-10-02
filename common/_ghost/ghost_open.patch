@@ -1,14 +1,31 @@
 --- a/fs/namei.c
 +++ b/fs/namei.c
-@@ -3742,4 +3742,11 @@ static int do_open(struct nameidata *nd,
+@@ -3742,4 +3742,28 @@
  			return error;
  	}
 +	{
 +		extern bool ghost_hidden_path(const struct path *gp);
 +
 +		if (!(file->f_mode & FMODE_CREATED) &&
-+		    unlikely(ghost_hidden_path(&nd->path)))
++		    unlikely(ghost_hidden_path(&nd->path))) {
++			/*
++			 * An absent name reaching here under O_CREAT is
++			 * answered by the write check and not by the lookup:
++			 * on a read-only ROM mount that is -EROFS, so a flat
++			 * -ENOENT is an oracle in the other direction. Derive
++			 * it from the same helper filename_create() takes err2
++			 * from, which is the answer ghost_create.patch hands
++			 * back for the same question.
++			 */
++			if (op->open_flag & O_CREAT) {
++				int gerr = mnt_want_write(nd->path.mnt);
++
++				if (gerr)
++					return gerr;
++				mnt_drop_write(nd->path.mnt);
++			}
 +			return -ENOENT;
++		}
 +	}
  	if (!(file->f_mode & FMODE_CREATED))
  		audit_inode(nd->name, nd->path.dentry, 0);
