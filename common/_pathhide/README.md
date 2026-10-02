@@ -18,6 +18,9 @@ against the *displayed* path of a VMA's backing file. The per-kernel
 |---|---|
 | `pathhide_<ver>_integration.patch` | `maps`, `smaps`, `smaps_rollup`, `numa_maps` — plus the `PROCMAP_QUERY` ioctl on 6.12 |
 | `pathhide_mapfiles_<ver>_integration.patch` | `/proc/<pid>/map_files/` readdir, name lookup, symlink resolve — **mandatory**, see that file's header |
+| `pathhide_pagemap_<ver>_integration.patch` | `pagemap_pmd_range()` — a hidden VMA reads back as a hole; plus `pagemap_scan_test_walk()` on 6.12, the `PAGEMAP_SCAN` ioctl's second window onto the same vma |
+| `pathhide_mincore_<ver>_integration.patch` | `do_mincore()` — a hidden VMA answers `ENOMEM`, like an unmapped address. Must sit **before** `can_do_mincore()`, which `memset`s resident-for-everything for a file the caller cannot write |
+| `pathhide_accounting_<shape>_integration.patch` | `task_mem()` and `task_statm()` — deducts hidden VMAs from `VmSize`, `VmPeak` and statm's size. Three shapes, picked by grepping the tree for `__page_size_count()` then `get_mm_counter_sum()`, not by version |
 | `pathhide_build_integration.patch` | optional `obj-y += pathhide.o` for the `fs/proc/` drop-in layout. `scripts/apply_nomount_stack.sh` uses the `fs/` layout instead and appends the line itself; either way `apply_nomount_stack.sh verify pathhide` asserts the obj-y line exists |
 
 ## The `/proc/<pid>/fd` half was removed
@@ -134,10 +137,11 @@ and not totals. This pass deliberately did **not** attempt the reconciliation �
 see the two candidate designs below, and note the warning that a half-done
 version makes the tells worse.
 
-## H8 — the accounting leak is only partly closed (STAGED, needs a decision)
+## H8 — mostly closed now; approach 2 was taken
 
 Deleting a VMA's `maps` line hides the name but leaves the *accounting*
-inconsistent, and each inconsistency is a zero-privilege existence tell:
+inconsistent, and each inconsistency is a zero-privilege existence tell. The
+list below is what it was; the table after it says where each one now stands.
 
 * `sum(maps ranges) < VmSize` (from `/proc/<pid>/status` / `statm`);
 * `smaps_rollup` totals diverge from `VmRSS` — the contained fix above makes
@@ -155,8 +159,35 @@ inconsistent, and each inconsistency is a zero-privilege existence tell:
   | read `/proc/self/pagemap` at `addr` | present PTEs | zero entries |
 
   Not measured on-device — derived from the kernel source, like the rest of this
-  section. They do not change the recommendation (do not load a rule); they make
-  it firmer, because the tell is one syscall rather than a sum.
+  section.
+
+### Where each one stands
+
+| tell | state |
+|---|---|
+| `sum(maps ranges) < VmSize` | **closed** — `pathhide_accounting_*` deducts hidden VMAs from `VmSize`, `VmPeak` and statm's size |
+| `mincore(addr, len, vec)` → `0` | **closed** — `pathhide_mincore_*` answers `ENOMEM` |
+| `/proc/self/pagemap` → present PTEs | **closed** — `pathhide_pagemap_*`, including the `PAGEMAP_SCAN` ioctl on 6.12 |
+| `mmap(addr, …, MAP_FIXED_NOREPLACE)` → `EEXIST` | **open**. Nothing here guards `mmap(2)`, and no error it could return matches "succeeded" without actually placing the mapping — the same trade `filename_create()` and the rename target half take in `_ghost` |
+| `smaps_rollup` vs `VmRSS` | **open, deliberately**. RSS is left alone: a resident page that is really there stays counted, see below |
+
+RSS is not deducted, and `pathhide_hidden_vm_pages()` clamps itself because of
+it. `VmRSS <= VmSize` and `VmHWM <= VmPeak` hold on every stock kernel and cost
+one read to check, so a deduction taken out of `VmSize` while RSS stands can push
+the pair into a state no stock kernel produces — trading a quantity mismatch for
+an impossible value, which is the louder of the two. The helper therefore never
+returns more than the headroom those two inequalities leave. It counts real
+`PAGE_SIZE` pages, so a page-size-compat tree converts after the subtraction and
+never before.
+
+The helper also memoises on `vma->vm_file`. It runs under `mmap_read_lock` for
+every reader of `/proc/<pid>/status` and `/proc/<pid>/statm` — which on Android
+means `ps`, ActivityManager and `dumpsys meminfo`, continuously — and each
+`pathhide_match_file()` is a `d_path()` render plus a rule scan under a global
+spinlock with preemption disabled. An ELF contributes several consecutive VMAs
+from one `struct file`, so a one-entry memo is most of the win for one `if`.
+system_server was measured at 5442 file-backed mappings on OP15; that is the
+number this loop is sized against.
 
 `smaps_rollup`'s contended-lock slow path (`mmap_lock_is_contended`) re-gathers a
 re-fetched VMA without re-checking `pathhide_match_file()`; the contained fix only
@@ -169,17 +200,17 @@ header range; on 5.10/5.15 the range is left intact and only the accounting is
 suppressed. Both close the smaps-vs-rollup mismatch, which is the oracle that
 mattered.
 
-Closing this properly is a design change, not a patch tweak, and must not ship
-half-done (a half version makes the tells *worse*). Two candidate approaches:
+This section used to end by naming two candidate approaches and saying to pick
+one before extending H8. **Approach 2 was taken** — deduct at the source, in
+`task_mem()` and `task_statm()`, so the totals agree with the thinned `maps`.
+Approach 1 (emit a benign anonymous line with the same range) was not, and the
+two must still not be mixed: substituting a line while also deducting its pages
+would under-report by exactly the range it substituted.
 
-1. **Substitute, don't delete** — emit a benign anonymous line with the same
-   address range in `maps`/`smaps` instead of dropping it, so ranges still sum to
-   `VmSize` and there is no hole. More faithful, more code, per-reader.
-2. **Deduct at the source** — patch `task_mem()` / `proc_pid_statm()` to subtract
-   matched VMAs from `total_vm` / `RssFile` etc., so the totals agree with the
-   thinned `maps`. Fewer sites, but changes reported process memory.
-
-Pick one before extending H8; do not mix.
+What approach 2 does not reach is the address hole itself. `maps` no longer
+disagrees with `VmSize`, and the range can no longer be interrogated through
+`mincore` or `pagemap`, but `MAP_FIXED_NOREPLACE` still refuses it. Closing that
+needs approach 1, i.e. a line to land on.
 
 ## M-C8 — the control-plane forwarder lives in the nomount engine, not here
 

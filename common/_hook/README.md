@@ -7,7 +7,7 @@ after the KSU patches, at **fuzz 0**, each fail-closed
 
 | family | closes |
 |---|---|
-| `hide_selinux_attr.patch` / `_6_6.patch` / `_6_12.patch` | `write(/proc/self/attr/*)`, `lsm_set_self_attr(2)` (`_6_12` only) and - on the `_6_6` and `_6_12` variants - `setxattr(security.selinux)` returning EACCES (type exists) instead of EINVAL (type absent) |
+| `hide_selinux_attr.patch` / `_5_10` / `_6_6` / `_6_12` | `write(/proc/self/attr/*)`, `lsm_set_self_attr(2)` (`_6_12` only) and - on every variant except the bare fallback - `setxattr(security.selinux)` returning EACCES (type exists) instead of EINVAL (type absent) |
 | `hide_selinux_selinuxfs_5_10.patch` / `hide_selinux_selinuxfs_6_12.patch` | the same probe through every `selinuxfs` write node (`access`/`create`/`relabel`/`user`/`member`/`context`/`validatetrans`), plus a reply filter so a computed context never echoes a hidden type back |
 | `quiet_selinux_audit.patch` / `_legacy.patch` | AVC denial records naming a root type, **at uid >= 2000 only** |
 | `fix_selinux_seqno.patch` | `/sys/fs/selinux/status` reporting `policyload = 0` after KSU's runtime rules |
@@ -22,9 +22,10 @@ for it, and the object each one touches was compiled (`ARCH=arm64 LLVM=1`).
 |---|---|---|---|---|---|
 | `hide_selinux_selinuxfs_6_12.patch` | - | - | - | YES | YES |
 | `hide_selinux_selinuxfs_5_10.patch` | YES | YES | YES | - | - |
-| `hide_selinux_attr_6_12.patch` | - | - | - | YES | YES |
+| `hide_selinux_attr_6_12.patch` | - | - | - | - | YES |
 | `hide_selinux_attr_6_6.patch` | - | - | - | **YES** | YES |
-| `hide_selinux_attr.patch` (fallback) | YES | YES | YES | YES | YES |
+| `hide_selinux_attr_5_10.patch` | YES | YES | YES | - | - |
+| `hide_selinux_attr.patch` (fallback, one hunk) | YES | YES | YES | YES | YES |
 | `quiet_selinux_audit.patch` | YES | YES | YES | YES | YES |
 | `quiet_selinux_audit_legacy.patch` | YES | YES | YES | YES | YES |
 
@@ -37,11 +38,13 @@ than taking the first that applies.
   `a->selinux_audit_data = &sad;` that never changed - and differ only in
   whether the added code passes `state` to `security_sid_to_context()`. Both
   dry-run clean everywhere; the wrong one fails at compile time.
-* `hide_selinux_attr.patch` also applies on 6.12, where `_6_12` must win because
-  it additionally guards `selinux_inode_setxattr()`. **Three** variants now
-  overlap on 6.6 and 6.12 — the pin is what resolves them:
-  `hide_selinux_attr_6_6.patch` on 6.6, `_6_12` on 6.12, the fallback on the
-  older three.
+* `hide_selinux_attr.patch` applies on **all five**, and it is the only variant
+  with one hunk — it guards `selinux_setprocattr()` and leaves
+  `selinux_inode_setxattr()` open. Every other variant guards both. So the
+  fallback winning anywhere is a silent downgrade to half the family, and the pin
+  is the only thing that stops it: `_5_10` on 5.10/5.15/6.1, `_6_6` on 6.6,
+  `_6_12` on 6.12. Nothing selects the bare fallback any more; it is kept for a
+  tree that matches none of the three.
 
 ### Deleted, and why
 
@@ -128,13 +131,16 @@ Three placement rules the guards now follow, and any new site must too:
   cut from, which matters more here than anywhere else because the list now
   lives in four places instead of three.
 
-  5.10/5.15/6.1 remain uncovered for `setxattr`, and that is now a stated
-  decision rather than an omission: their `selinux_inode_setxattr()` takes
-  neither the `struct mnt_idmap *` nor the `struct user_namespace *` the hunk is
-  fitted to, so covering them needs a third hunk shape fitted and dry-run against
-  those three trees. Reachability there is narrow — the guard sits after
-  `FILE__RELABELFROM`, which no AOSP app domain holds on its own files — which is
-  why it has stayed open, not because nobody noticed.
+  5.10/5.15/6.1 **are covered now** — that gap used to be recorded here as a
+  stated decision, on the grounds that their `selinux_inode_setxattr()` takes
+  neither the `struct mnt_idmap *` nor the `struct user_namespace *` the 6.12
+  hunk is fitted to, and that reachability was narrow anyway (the guard sits
+  after `FILE__RELABELFROM`, which no AOSP app domain holds on its own files).
+  `hide_selinux_attr_5_10.patch` fits the third hunk shape and carries both
+  arms; it dry-runs clean at `-F0` on 5.10, 5.15 and 6.1, and on none of the
+  other two. So the family is all four call sites on all five trees, and the
+  rule this directory states about hidden types — add them at *every* site or
+  none — now holds without a footnote.
 
   History worth keeping: the fallback shipped for a while with its guard at
   *function entry*, ahead of the `PROCESS__SETCURRENT` check — breaking the first

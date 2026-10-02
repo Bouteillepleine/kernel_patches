@@ -84,9 +84,10 @@ Cleared by the same measurement, and deliberately NOT patched: plain
 for hidden and absent (`n2h` is `ENOSYS` — the fs exports no `->fh_to_dentry`).
 `IN_ONLYDIR` is a different question and *is* a leak — it sets
 `LOOKUP_DIRECTORY`, so it lands on the `-ENOTDIR` oracle above and is closed
-with it. `readlink` and `statfs` were leaks until engine v21/v25 added
-`.readlink` to both iops and a `->statfs` on the hijacked `s_op`; they are closed
-in the engine, not here.
+with it. `statfs` was a leak until engine v25 added a `->statfs` on the
+hijacked `s_op`; it is closed in the engine, not here. `readlink` was closed the
+same way at v21 and is **now guarded here as well**, because the engine's arm
+only covers a hidden path that is itself a symlink.
 
 A **fifth** was not a new mechanism at all — it was the `ENOTDIR` family reached
 through a walker nobody had guarded. `filename_create()` (and `unlinkat`,
@@ -113,12 +114,14 @@ acts without consulting a hijacked op is a candidate. `classprobe.c` is the
 harness — extend it rather than reasoning. Reading the source found family 4
 after three rounds of probing had not, so do both.
 
-This directory closes all of them — **eleven** families of guard. `ghost.c`
+This directory closes all of them — **fourteen** families of guard. `ghost.c`
 supplies one predicate, `ghost_hidden_path()`; the `ghost_*.patch` files place
 the guards. Most answer `-ENOENT`; `ghost_create.patch` and `ghost_open.patch`
 answer what an **absent** name would have got instead, which on a read-only
-mount is `-EROFS` — see their headers for why a uniform `-ENOENT` would be a new
-oracle rather than a closed one.
+mount is `-EROFS`, because a uniform `-ENOENT` is a new oracle rather than a
+closed one. Both derive that answer from `mnt_want_write()` — the same helper
+`filename_create()` takes `err2` from — so the two cannot disagree about one
+question.
 
 ## Files
 
@@ -134,9 +137,12 @@ oracle rather than a closed one.
 | `ghost_utimes.patch` | guard in `do_utimes_path()`, `fs/utimes.c` |
 | `ghost_chmod*.patch` | guard in `do_fchmodat()`, `fs/open.c` |
 | `ghost_chown.patch` | guard in `do_fchownat()`, `fs/open.c` — one file, 5.10→6.12 |
-| `ghost_access.patch` | guard in `do_faccessat()`, `fs/open.c` — `access(W_OK)` only |
-| `ghost_open.patch` | guard in `do_open()`, `fs/namei.c` — write-intent and `O_CREAT` opens |
+| `ghost_access.patch` | guard in `do_faccessat()`, `fs/open.c` — every mode, not just `W_OK` |
+| `ghost_open.patch` | guard in `do_open()`, `fs/namei.c` — every open that did not just create |
 | `ghost_create.patch` | guard in `filename_create()`, `fs/namei.c` — `mkdirat`/`mknodat`/`symlinkat`/`linkat` |
+| `ghost_statx*.patch` | guard in `vfs_statx()`, `fs/stat.c` — the whole `stat`/`lstat`/`statx`/`newfstatat` family through one choke point |
+| `ghost_readlink*.patch` | guard in `do_readlinkat()`, `fs/stat.c` |
+| `ghost_rename*.patch` | guard on the **source** half of `do_renameat2()`, `fs/namei.c` |
 
 Each family has variants; a builder applies the **first that dry-runs clean**,
 newest-shape first, and fails the build if none does. See the coverage table.
@@ -150,17 +156,70 @@ without making core VFS depend on the engine — which would stop these patches
 applying to a tree that does not carry it, and would couple two patch sets that
 are deliberately independent.
 
-So `ghost.c` keeps its own copy of the decision, pushed down from userspace over
-the control plane `_pathhide` already uses. **It is a replica**, and everything
-about its shape follows from what happens when a replica drifts:
+So the **path** half of the decision is pushed down from userspace over the
+control plane `_pathhide` already uses, and the **uid** half asks the engine:
 
 ```
-hidden(path, caller)  ==  path ∈ ghost path table  ∧  uid(caller) ∈ ghost uid table
+hidden(path, caller)  ==  path ∈ ghost path table  ∧  nm_uid_blocked(uid(caller))
 ```
 
-Two tables, both global, because that is exactly the shape of the engine's own
-state: one injected-path set, one blocked-uid set (`/data/adb/nomount/uidhide`,
-resolved to uids in `uidhide.cache`). Nothing per-rule-per-uid is needed.
+`nm_uid_blocked()` is a thin non-static wrapper the engine puts over its own
+`nomount_is_uid_blocked()`, and `ghost.c` declares it **weak**: a tree built
+without nomount links fine and falls back to the uid table below. That is the
+same arrangement the engine already uses in the other direction for
+`ghost_ctl()` — it does not make core VFS depend on the engine, because only
+`ghost.c` names the symbol and nothing in `fs/namei.c` or `fs/xattr.c` does.
+
+### The uid half was a replica, and it drifted
+
+It is worth spelling out why it stopped being one, because the failure was
+measured rather than reasoned about.
+
+The uid table was fed the appids on the hide list, and normalised them the way
+the engine does — `uid % 100000`, with the SDK-sandbox range followed back to
+its owner. What it never carried were the two **isolated-process pools** the
+engine also hides from, unconditionally, once anything is blocked at all:
+`[90000, 98999]` for an app's own zygote children and `[99000, 99999]` for the
+platform pool (`nm_hide_isolated`, default both).
+
+So a hidden app spawned an isolated child, and that child was answered `-ENOENT`
+by the engine's hijacked ops — but **not** by any guard in this directory, since
+`ghost_hidden_path()` short-circuits on the uid before it ever renders the path.
+Every oracle these fourteen families exist to close was open again, to a process
+the hidden app starts itself with no privilege and no control path.
+
+Measured on a live OP15 (`6.12.58-android16-6`, engine `uid isolated` = both,
+cloak holding 3 paths and 20 uids, all of them `10xxx`) with `leakprobe.c` as
+`su <uid>`, against a ghosted path and an absent sibling in the same directory:
+
+| caller | probes matching an absent path |
+|---|---|
+| uid 10438, on the cloak's uid list | 20 of 22 |
+| uid 90000 / 99000 / 99500, in the pools | **5 of 22** |
+
+The seventeen that diverged include the two worst in the set: `open(O_PATH)`
+**succeeded**, so `readlink("/proc/self/fd/N")` handed back
+`/product/etc/permissions/privapp-permissions-zz-contacts17cn.xml` in full, and
+`getxattr(p, "security.selinux")` returned `u:object_r:system_file:s0`. The five
+that held — `lstat`, `access(R_OK)`, `access(F_OK)`, `open(O_RDONLY)`,
+`listxattr` — are exactly the ones the engine's own ops answer, which is what
+makes the split diagnostic instead of ambiguous.
+
+Asking the engine closes that by construction, and closes the next one too: the
+pools, the SDK-sandbox remap and the `nm_hide_isolated` knob are now read from
+the one place that defines them, so there is no second copy left to drift.
+
+⚠️ Two consequences worth knowing:
+
+* **The fallback arm cannot read `nm_hide_isolated`**, so it assumes that knob's
+  default of both pools. On `nomount uid isolated none` it over-hides from
+  isolated processes — `-ENOENT` from the guards while the engine serves real
+  content, one process with two views. That needs an engine too old to export
+  the symbol, and it is the one case the fallback gets wrong.
+* **A weak extern binds at vmlinux link time.** If nomount is ever built as a
+  module the symbol stays unresolved and this silently falls back forever. It is
+  built in today; if that changes, the engine should register the predicate
+  rather than be weak-externed.
 
 ### Differences from `_pathhide`, and why each one exists
 
@@ -177,8 +236,9 @@ own a `/proc` node. Three things are deliberately **not** copied:
   `nm add /product` rule on a partition **root** masked the overlays and took
   SystemUI down with `SIGABRT`. Rules are absolute paths matched whole; a
   trailing `/` makes a rule match the subtree strictly below it.
-* **A uid table.** `_pathhide` hides from everyone; this hides per-uid, because
-  a non-blocked uid must keep seeing the injected file.
+* **A uid gate.** `_pathhide` hides from everyone; this hides per-uid, because
+  a non-blocked uid must keep seeing the injected file. The engine answers that
+  question when it is linked in — see above for why it stopped being a table.
 * **`ghost_rule_sane()`.** Refuses a rule that is not absolute, contains `//`,
   or has fewer than two `/` (three for a subtree rule) — so `/system/build.prop`
   is accepted and a bare `/system`, `/vendor`, `/product` is not. A backstop for
@@ -273,8 +333,8 @@ this list.
 | **3** | `link()` `EXDEV` | low — one bit | **low** — `do_linkat()` is reached only by `link(2)`/`linkat(2)` | `fs/namei.c` `do_linkat()` |
 | **4** | `ENOTDIR` — `stat(p "/zzz")`, `stat(p "/")`, `chdir(p)`, `open(O_DIRECTORY)`, `open(O_PATH\|O_DIRECTORY)`, `inotify IN_ONLYDIR` | low per probe — one bit — but there are six of them and any one is a complete substitute for the other three guards | **low** — both guards sit on error paths that are only reached by a lookup already failing, and neither is in `link_path_walk()` any more | `fs/namei.c` `path_lookupat()` + `do_open()` |
 
-| **5** | `access(p, W_OK)` and `open(p, O_WRONLY\|O_RDWR\|O_TRUNC)` | **highest of the later families** — one syscall, no control path, and the answer is identical to a stock visible file | **low** for `access` (`do_faccessat()` is a cold wrapper and the guard is gated on `MAY_WRITE`); **moderate** for `open` — `do_open()` runs on every open(2), which is why that guard is gated on write intent and never evaluates the predicate for a plain read | `fs/open.c` `do_faccessat()`, `fs/namei.c` `do_open()` |
-| **6** | `open(p, O_CREAT\|O_EXCL)` / `open(p, O_CREAT\|O_RDONLY)` | high — the `mkdirat` signature on the path `filename_create()` does not cover | low — same guard as #5, same gate | `fs/namei.c` `do_open()` |
+| **5** | `access(p, W_OK)` and `open(p, O_WRONLY\|O_RDWR\|O_TRUNC)` | **highest of the later families** — one syscall, no control path, and the answer is identical to a stock visible file | **low** for `access` (`do_faccessat()` is a cold wrapper); **moderate** for `open` — `do_open()` runs on every open(2) and the guard is **not** gated, see the note below | `fs/open.c` `do_faccessat()`, `fs/namei.c` `do_open()` |
+| **6** | `open(p, O_CREAT\|O_EXCL)` / `open(p, O_CREAT\|O_RDONLY)` | high — the `mkdirat` signature on the path `filename_create()` does not cover | low — same guard as #5 | `fs/namei.c` `do_open()` |
 | **7** | `truncate` / `utimensat` / `chmod` / `chown` | low per probe, four of them | **lowest** — four cold syscall wrappers, each guarded immediately after its own `user_path_at()` | `fs/open.c`, `fs/utimes.c` |
 | **8** | `mkdirat` / `mknodat` / `symlinkat` / `linkat` target | high — one syscall, no control needed | low — the guard sits on an arm that already ends in `goto fail` | `fs/namei.c` `filename_create()` |
 
@@ -344,6 +404,13 @@ columns were re-measured at `-F0`.
 | **chown** | `ghost_chown.patch` | one file: 5.10…6.12 (`do_fchownat()` is byte-identical across all five), op |
 | **access** | `ghost_access.patch` | one file: 5.10…6.12 (the `retry:` → `d_backing_inode()` region is byte-identical even though `inode_permission()`'s signature is not), op |
 | **open** | `ghost_open.patch` | one file: 5.10…6.12, generated at `-U2` because the line below `audit_inode()` differs per version, op |
+| **statx** | `ghost_statx_6_12.patch` | 6.12 |
+| | `ghost_statx_6_1.patch` | 6.1 6.6 |
+| | `ghost_statx_5_10.patch` | 5.10 5.15 |
+| **readlink** | `ghost_readlink_6_12.patch` | 6.12 |
+| | `ghost_readlink_5_10.patch` | 5.10 5.15 6.1 6.6 |
+| **rename** | `ghost_rename_5_15.patch` | 5.15 6.1 6.6 6.12 |
+| | `ghost_rename_5_10.patch` | 5.10 |
 | **build** | `ghost_build_integration.patch` | every tree above, v4.9 → master |
 
 ### Three variants were deleted
@@ -479,7 +546,7 @@ bug this directory shipped for four kernel versions:
 * **Every guard is asserted by FUNCTION NAME**, not by "the file mentions
   `ghost_hidden_path`". `fs/namei.c` is touched by five families, so one
   occurrence satisfied the old assertion even when four guards were missing.
-* **`verify-patches-oneplus.yml` now checks all eleven families.** It checked
+* **`verify-patches-oneplus.yml` now checks all fourteen families.** It checked
   five — `o_path`, `xattr`, `linkat`, `notdir`, `build` — and skipped
   `truncate`, `utimes`, `chmod` and `create`, which is the *same four* whose
   absence `scripts/apply_nomount_stack.sh`'s header cites as the reason that
