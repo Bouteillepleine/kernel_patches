@@ -517,15 +517,19 @@ jobs:
             echo "::error::_ghost: $4"; exit 1
           }
           infn fs/namei.c  '^static int do_o_path'                   'ghost_hidden_path(&path))' 'the O_PATH guard is not inside do_o_path()'
-          infn fs/namei.c  '^static int do_open'                     'op->acc_mode & MAY_WRITE' 'the open(2) guards are not inside do_open()'
+          # Unconditional since the write-intent gate was dropped: a plain O_RDONLY
+          # open of a hidden path handed back an fd, and with O_TRUNC emptied the file.
+          infn fs/namei.c  '^static int do_open'                     'unlikely(ghost_hidden_path(&nd->path))' 'the open(2) guard is not inside do_open(), or the write-intent gate is back'
           infn fs/namei.c  '^static int path_lookupat'               'unlikely(err == -ENOTDIR)' 'the ENOTDIR guard is not inside path_lookupat() -- note it applies at fuzz 0 inside path_parentat() too'
           # BOTH walkers. path_parentat() is the CREATE family's choke point and
           # mkdirat(p "/d") was measured leaking through it on a live OP15.
           infn fs/namei.c  '^static int path_parentat'               'unlikely(err == -ENOTDIR)' 'the ENOTDIR guard is not inside path_parentat() -- mkdirat/mknodat/symlinkat/unlinkat/renameat reach -ENOTDIR only through there'
-          infn fs/namei.c  '^static struct dentry \*filename_create' 'err2 && ghost_hidden_path' 'the create guard is not inside filename_create()'
+          infn fs/namei.c  '^static struct dentry \*filename_create' 'error = err2 ? err2 : -EACCES' 'the create guard is not inside filename_create(), or it no longer answers with err2'
           infn fs/namei.c  '^(static )?int do_linkat'                'ghost_hidden_path(&old_path)' 'the link(2) guard is not inside do_linkat()'
           infn fs/open.c   '^int do_fchownat'                        'ghost_hidden_path(&path))' 'the chown(2) guard is not inside do_fchownat()'
-          infn fs/open.c   '^static long do_faccessat'               'mode & MAY_WRITE) && ghost_hidden_path' 'the access(2) guard is not inside do_faccessat()'
+          # Every mode, not just W_OK: gated on MAY_WRITE, access(F_OK) and access(R_OK)
+          # reported a hidden path as present while access(W_OK) answered ENOENT.
+          infn fs/open.c   '^static long do_faccessat'               'unlikely(ghost_hidden_path(&path))' 'the access(2) guard is not inside do_faccessat(), or it is gated on the mode again'
           infn fs/open.c   'do_fchmodat'                             'ghost_hidden_path(&path))' 'the chmod(2) guard is not inside do_fchmodat()'
           infn fs/open.c   '^(long|int) do_sys_truncate'             'ghost_hidden_path(&path))' 'the truncate(2) guard is not inside do_sys_truncate()'
           infn fs/utimes.c '^(static )?(long|int) do_utimes_path'    'ghost_hidden_path(&path))' 'the utimensat(2) guard is not inside do_utimes_path()'
