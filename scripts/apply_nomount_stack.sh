@@ -46,6 +46,9 @@
 #                                 disagrees, the run FAILS rather than guessing]
 #   NOMOUNT_REF                   NoMount-Suite branch, default main [hookless]
 #   NOMOUNT_DEFCONFIG             defconfig basename, default gki_defconfig
+#   NOMOUNT_LKM                   1 = build the engine as a MODULE (CONFIG_NOMOUNT=m)
+#                                 instead of built in.  Experiment only - see
+#                                 nm_lkm_convert().  Default unset = built in.
 #   KERNEL_CONFIG_FILE            generated .config to assert against, if it
 #                                 already exists (otherwise out/.config and
 #                                 .config under the kernel root are tried)
@@ -259,6 +262,48 @@ assert_config() {
     fi
 }
 
+# CONFIG_NOMOUNT=m instead of =y.  Two edits, both idempotent, both no-ops when the
+# toggle is unset:
+#
+#   - fs/Kconfig says `bool`, so the symbol can only be y or n; a module build needs
+#     `tristate`.  Scoped to the `config NOMOUNT` block so no other symbol is touched.
+#   - fs/nomount.c needs MODULE_IMPORT_NS(VFS_internal_...) to reach the VFS-internal
+#     exports a module links against (d_splice_alias, __vfs_*, clear_inode,
+#     dentry_open, generic_fillattr).  Harmless when built in, which is why it is
+#     appended rather than conditionally compiled.
+#
+# No init change is needed: nomount.c uses fs_initcall(), which init.h maps to
+# module_init() in a module build, and it already has module_exit().
+#
+# This is an EXPERIMENT (does the engine work when it starts at post-fs-data instead
+# of fs_initcall, and can susfs hide_modules hide it).  A module named `nomount` is
+# enumerable in /proc/modules unless something hides it, so =m is not a shipping
+# configuration on its own.
+nm_lkm_convert() {
+    local d="$COMMON_KERNEL_FOLDER"
+    local KC="$d/fs/Kconfig" NC="$d/fs/nomount.c"
+    local NS='MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);'
+
+    [ -f "$KC" ] || die "_hookless lkm: fs/Kconfig missing"
+    [ -f "$NC" ] || die "_hookless lkm: fs/nomount.c missing"
+
+    if grep -qE '^[[:space:]]*tristate "NoMount Path Redirection Subsystem"' "$KC"; then
+        echo "  lkm: fs/Kconfig already tristate"
+    else
+        sed -i '/^config NOMOUNT$/,/^$/ s/^\([[:space:]]*\)bool "NoMount Path Redirection Subsystem"/\1tristate "NoMount Path Redirection Subsystem"/' "$KC"
+        grep -qE '^[[:space:]]*tristate "NoMount Path Redirection Subsystem"' "$KC" ||
+            die "_hookless lkm: could not make config NOMOUNT tristate in fs/Kconfig"
+        echo "  lkm: fs/Kconfig bool -> tristate"
+    fi
+
+    if grep -qF "$NS" "$NC"; then
+        echo "  lkm: MODULE_IMPORT_NS already present"
+    else
+        printf '\n%s\n' "$NS" >>"$NC"
+        echo "  lkm: appended MODULE_IMPORT_NS to fs/nomount.c"
+    fi
+}
+
 verify_hookless() {
     local d="$COMMON_KERNEL_FOLDER"
     [ -f "$d/fs/nomount.c" ] || die "_hookless: fs/nomount.c missing"
@@ -267,8 +312,16 @@ verify_hookless() {
     has "$d/fs/Makefile" 'obj-$(CONFIG_NOMOUNT) += nomount.o' "_hookless: fs/Makefile edit missing"
     grep -qE 'vfs_map_meta_override|nomount_spoof_mmap_metadata' "$d/fs/proc/task_mmu.c" ||
         die "_hookless: task_mmu.c hook missing"
-    grep -qx 'CONFIG_NOMOUNT=y' "$(defconfig_path)" ||
-        die "_hookless: CONFIG_NOMOUNT=y is not in $(defconfig_path)"
+    local want=y
+    [ "${NOMOUNT_LKM:-0}" = 1 ] && want=m
+    grep -qx "CONFIG_NOMOUNT=$want" "$(defconfig_path)" ||
+        die "_hookless: CONFIG_NOMOUNT=$want is not in $(defconfig_path)"
+    if [ "$want" = m ]; then
+        grep -qE '^[[:space:]]*tristate "NoMount Path Redirection Subsystem"' "$d/fs/Kconfig" ||
+            die "_hookless lkm: CONFIG_NOMOUNT=m but fs/Kconfig still says bool - the symbol cannot be m"
+        grep -qF 'MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);' "$d/fs/nomount.c" ||
+            die "_hookless lkm: MODULE_IMPORT_NS is missing - the module will not link against the VFS-internal exports"
+    fi
     assert_config CONFIG_NOMOUNT "the engine is behind CONFIG_NOMOUNT; without it fs/nomount.o is not built at all and every hookless hook is absent"
     echo "_hookless: verified"
 }
@@ -557,8 +610,15 @@ do_hookless() {
         patch -p1 --forward --fuzz=1 -d "$COMMON_KERNEL_FOLDER" <"$NM_PATCH" ||
             die "NoMount hookless patch failed to apply for $KERNEL_VER, at fuzz 0 and at fuzz 1"
     fi
+    if [ "${NOMOUNT_LKM:-0}" = 1 ]; then
+        nm_lkm_convert
+        NM_CONFIG_VAL=m
+        echo "::warning::CONFIG_NOMOUNT=m - the engine is a MODULE in this build, so this kernel has NO NoMount until nomount.ko is loaded. Experiment only."
+    else
+        NM_CONFIG_VAL=y
+    fi
     sed -i '/^CONFIG_NOMOUNT=/d' "$DEFCONFIG"
-    echo "CONFIG_NOMOUNT=y" >>"$DEFCONFIG"
+    echo "CONFIG_NOMOUNT=$NM_CONFIG_VAL" >>"$DEFCONFIG"
     verify_hookless
     echo "::endgroup::"
 }
