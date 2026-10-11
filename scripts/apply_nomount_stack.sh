@@ -243,19 +243,26 @@ find_config() {
 # not configured yet, which is the one case that can only be reported.
 CONFIG_STRICT=0
 assert_config() {
-    local sym="$1" why="$2" cfg
+    local sym="$1" why="$2" cfg val=y
+    # NOMOUNT_LKM builds the engine as a module, so the generated .config carries
+    # CONFIG_NOMOUNT=m.  Only that one symbol is allowed to be m - everything else this
+    # asserts is a built-in or a hook site, where =m would be wrong.
+    if [ "${NOMOUNT_LKM:-0}" = 1 ] && [ "$sym" = CONFIG_NOMOUNT ]; then
+        val=m
+    fi
     if cfg="$(find_config)"; then
-        grep -qx "$sym=y" "$cfg" ||
-            die "$sym is not set in $cfg -- $why"
-        echo "  config: $sym=y in $cfg"
+        grep -qx "$sym=$val" "$cfg" ||
+            die "$sym is not set to $val in $cfg -- $why"
+        echo "  config: $sym=$val in $cfg"
     elif [ "$CONFIG_STRICT" = 1 ]; then
         die "no .config found (tried KERNEL_CONFIG_FILE, $COMMON_KERNEL_FOLDER/out/.config, $COMMON_KERNEL_FOLDER/.config) -- cannot assert $sym"
     else
         # Plain log line, NOT ::notice::. At apply time the tree is not configured
         # yet, and that is the normal case for every builder -- so this fired on
         # every build. It is also redundant for the symbol that matters:
-        # verify_hookless() has already hard-failed unless CONFIG_NOMOUNT=y is in
-        # the defconfig, which is the file the build actually reads. `assert-config`
+        # verify_hookless() has already hard-failed unless CONFIG_NOMOUNT=y (or =m
+        # under NOMOUNT_LKM) is in the defconfig, which is the file the build actually
+        # reads. `assert-config`
         # stays available (and fatal, CONFIG_STRICT=1) for a caller that wants the
         # post-defconfig check against a generated .config.
         echo "  $sym: not verifiable yet (no .config at apply time; see assert-config)"
