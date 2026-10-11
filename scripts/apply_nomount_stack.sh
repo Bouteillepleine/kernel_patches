@@ -267,6 +267,10 @@ verify_hookless() {
     has "$d/fs/Makefile" 'obj-$(CONFIG_NOMOUNT) += nomount.o' "_hookless: fs/Makefile edit missing"
     grep -qE 'vfs_map_meta_override|nomount_spoof_mmap_metadata' "$d/fs/proc/task_mmu.c" ||
         die "_hookless: task_mmu.c hook missing"
+    # Only assert this when the engine ref actually carries the guard:
+    # nomount_ref and patches_ref are chosen independently, so an older engine
+    # whose patch has no fs/xattr.c hunk is a legitimate build, not a failure.
+    if grep -q 'nm_inode_hidden_from_caller' "$d/fs/nomount.c" 2>/dev/null; then
     # The xattr guard must sit between the LSM permission call and the
     # security.* branch. vfs_getxattr() hands security.* to the LSM there and
     # returns, so a guard placed after it never runs for security.selinux and a
@@ -280,6 +284,7 @@ verify_hookless() {
       /nm_inode_hidden_from_caller\(inode\)/            { if (a && !b) b=NR }
       END { exit !(a && b && c && a < b && b < c) }' "$d/fs/xattr.c" ||
         die "_hookless: the fs/xattr.c guard is missing or not between security_inode_getxattr() and the security.* branch -- a hidden app can still read security.selinux on a file it cannot open"
+    fi
     grep -qx 'CONFIG_NOMOUNT=y' "$(defconfig_path)" ||
         die "_hookless: CONFIG_NOMOUNT=y is not in $(defconfig_path)"
     assert_config CONFIG_NOMOUNT "the engine is behind CONFIG_NOMOUNT; without it fs/nomount.o is not built at all and every hookless hook is absent"
