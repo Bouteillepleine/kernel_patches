@@ -1,8 +1,8 @@
 diff --git a/kernel/Kbuild b/kernel/Kbuild
-index cb7f51ea..3b933eef 100644
+index 83dca39..f707344 100644
 --- a/kernel/Kbuild
 +++ b/kernel/Kbuild
-@@ -4,21 +4,7 @@ kernelsu-objs += feature/kernel_umount.o
+@@ -5,21 +5,7 @@ kernelsu-objs += feature/module_blacklist.o
  kernelsu-objs += feature/sulog.o
  kernelsu-objs += feature/sucompat.o
  
@@ -24,7 +24,7 @@ index cb7f51ea..3b933eef 100644
  kernelsu-objs += extras.o
  
  kernelsu-objs += infra/file_wrapper.o
-@@ -154,4 +143,14 @@ ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
+@@ -159,4 +145,14 @@ ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
  ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes -Wno-missing-declarations
  ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable
  
@@ -40,7 +40,7 @@ index cb7f51ea..3b933eef 100644
 +
  # Keep a new line here!! Because someone may append config
 diff --git a/kernel/Makefile b/kernel/Makefile
-index 14a40b61..f3485588 100644
+index 14a40b6..f348558 100644
 --- a/kernel/Makefile
 +++ b/kernel/Makefile
 @@ -33,14 +33,4 @@ format:
@@ -58,31 +58,11 @@ index 14a40b61..f3485588 100644
 -endif
 -
  # Keep a new line here!! Because someone may append config
-diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
-index 1b34903f..390a9146 100644
---- a/kernel/feature/selinux_hide.c
-+++ b/kernel/feature/selinux_hide.c
-@@ -36,13 +36,13 @@ int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid,
-                                                u32 *scontext_len);
- void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
-                                                  struct av_decision *avd);
--extern void security_dump_masked_av_fn(struct policydb *policydb,
-+extern __weak void security_dump_masked_av_fn(struct policydb *policydb,
- 				    struct context *scontext,
- 				    struct context *tcontext,
- 				    u16 tclass,
- 				    u32 permissions,
- 				    const char *reason);
--extern void context_struct_compute_av_fn(struct policydb *policydb,
-+extern __weak void context_struct_compute_av_fn(struct policydb *policydb,
- 				      struct context *scontext,
- 				      struct context *tcontext,
- 				      u16 tclass,
 diff --git a/kernel/runtime/boot_event.c b/kernel/runtime/boot_event.c
-index 23daaa66..4b694bf1 100644
+index 76ed4f3..6de8cb5 100644
 --- a/kernel/runtime/boot_event.c
 +++ b/kernel/runtime/boot_event.c
-@@ -74,5 +74,4 @@ void on_boot_completed(void)
+@@ -77,5 +77,4 @@ void on_boot_completed(void)
      pr_info("on_boot_completed!\n");
      track_throne(true);
      ksu_selinux_hide_drop_backup_if_unused();
