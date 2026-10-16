@@ -650,7 +650,19 @@ do_pathhide() {
     cp "$PH/pathhide.h" "$d/fs/pathhide.h"
     normalise "$d/fs/pathhide.c" "$d/fs/pathhide.h"
     normalise "$PH"/*.patch
-    apply_or_die "$PH/pathhide_${KERNEL_VER}_integration.patch"
+    # The maps/smaps guards sit in context that an AOSP GKI tree and an OPlus tree
+    # spell differently at the same version: 6.12.69 renamed vma_pages() to
+    # vma_data_pages() in show_map()/show_smap() and gave show_smaps_rollup() an
+    # extra local, so the OPlus-fitted patch misses three of its six hunks there.
+    # Probed, not keyed on KERNEL_VER, for the same reason the accounting variants
+    # are: both trees report 6.12.
+    if [ "$KERNEL_VER" = 6.12 ] && grep -q 'vma_data_pages' "$d/fs/proc/task_mmu.c"; then
+        apply_first_of pathhide pathhide_6.12_gki_integration.patch \
+            "$PH/pathhide_6.12_integration.patch" \
+            "$PH/pathhide_6.12_gki_integration.patch"
+    else
+        apply_or_die "$PH/pathhide_${KERNEL_VER}_integration.patch"
+    fi
     apply_or_die "$PH/pathhide_mapfiles_${KERNEL_VER}_integration.patch"
     # Dropping a vma's line from maps leaves the mapping itself in place, so the
     # gap stays readable through pagemap, mincore(2) and the accounting-derived
