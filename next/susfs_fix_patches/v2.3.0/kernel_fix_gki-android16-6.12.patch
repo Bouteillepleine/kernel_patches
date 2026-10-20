@@ -1,0 +1,60 @@
+diff --git a/fs/exec.c b/fs/exec.c
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -69,6 +69,9 @@
+ #include <linux/user_events.h>
+ #include <linux/rseq.h>
+ #include <linux/ksm.h>
++#ifdef CONFIG_KSU_SUSFS
++#include <linux/susfs_def.h>
++#endif
+ 
+ #include <linux/uaccess.h>
+ #include <asm/mmu_context.h>
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1346,6 +1346,13 @@
+ 	struct vm_area_struct *vma = v;
+ 	struct mem_size_stats mss = {};
+ 
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++	if (vma->vm_file) {
++		if (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))
++			return 0;
++	}
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
++
+ 	if (!vma_pages(vma))
+ 		goto show_pad;
+ 
+@@ -1405,6 +1412,9 @@
+ 
+ 	vma_start = vma->vm_start;
+ 	do {
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++		if (!(vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 		smap_gather_stats(vma, &mss, 0);
+ 		last_vma_end = vma->vm_end;
+ 
+@@ -1464,6 +1474,9 @@
+ 
+ 			/* Case 1 and 2 above */
+ 			if (vma->vm_start >= last_vma_end) {
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++				if (!(vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 				smap_gather_stats(vma, &mss, 0);
+ 				last_vma_end = vma->vm_end;
+ 				continue;
+@@ -1471,6 +1484,9 @@
+ 
+ 			/* Case 4 above */
+ 			if (vma->vm_end > last_vma_end) {
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++				if (!(vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 				smap_gather_stats(vma, &mss, last_vma_end);
+ 				last_vma_end = vma->vm_end;
+ 			}
