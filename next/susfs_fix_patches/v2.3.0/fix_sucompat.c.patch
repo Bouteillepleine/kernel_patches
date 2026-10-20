@@ -1,8 +1,7 @@
 diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
-index f8963882..e784aba5 100644
 --- a/kernel/feature/sucompat.c
 +++ b/kernel/feature/sucompat.c
-@@ -24,46 +24,55 @@
+@@ -24,28 +24,39 @@
  #include "klog.h" // IWYU pragma: keep
  #include "runtime/ksud.h"
  #include "feature/sucompat.h"
@@ -12,8 +11,8 @@ index f8963882..e784aba5 100644
  #include "supercall/supercall.h"
  #include "sulog/event.h"
 -#include "ksu.h"
--#include "util.h"
 +#include "uapi/sulog.h"
+ #include "util.h"
  
  #define SU_PATH "/system/bin/su"
  #define SH_PATH "/system/bin/sh"
@@ -28,55 +27,26 @@ index f8963882..e784aba5 100644
  static int su_compat_feature_get(u64 *value)
  {
 -	*value = ksu_su_compat_enabled ? 1 : 0;
--	return 0;
-+    if (static_key_enabled(&ksu_su_compat_enabled))
-+        *value = 1;
-+    else
-+        *value = 0;
-+    return 0;
++	if (static_key_enabled(&ksu_su_compat_enabled))
++		*value = 1;
++	else
++		*value = 0;
+ 	return 0;
  }
  
  static int su_compat_feature_set(u64 value)
  {
--	bool enable = value != 0;
+ 	bool enable = value != 0;
 -	ksu_su_compat_enabled = enable;
--	pr_info("su_compat: set to %d\n", enable);
--	return 0;
-+    bool enable = value != 0;
-+    if (enable)
-+        static_branch_enable(&ksu_su_compat_enabled);
-+    else
-+        static_branch_disable(&ksu_su_compat_enabled);
-+    pr_info("su_compat: set to %d\n", enable);
-+    return 0;
++
++	if (enable)
++		static_branch_enable(&ksu_su_compat_enabled);
++	else
++		static_branch_disable(&ksu_su_compat_enabled);
+ 	pr_info("su_compat: set to %d\n", enable);
+ 	return 0;
  }
- 
- static const struct ksu_feature_handler su_compat_handler = {
--	.feature_id = KSU_FEATURE_SU_COMPAT,
--	.name = "su_compat",
--	.get_handler = su_compat_feature_get,
--	.set_handler = su_compat_feature_set,
-+    .feature_id = KSU_FEATURE_SU_COMPAT,
-+    .name = "su_compat",
-+    .get_handler = su_compat_feature_get,
-+    .set_handler = su_compat_feature_set,
- };
- 
- static void __user *userspace_stack_buffer(const void *d, size_t len)
- {
--	// To avoid having to mmap a page in userspace, just write below the stack
--	// pointer.
--	char __user *p = (void __user *)current_user_stack_pointer() - len;
-+    // To avoid having to mmap a page in userspace, just write below the stack
-+    // pointer.
-+    char __user *p = (void __user *)current_user_stack_pointer() - len;
- 
--	return copy_to_user(p, d, len) ? NULL : p;
-+    return copy_to_user(p, d, len) ? NULL : p;
- }
- 
- static char __user *sh_user_path(void)
-@@ -75,220 +84,209 @@ static char __user *sh_user_path(void)
+@@ -59,220 +70,209 @@
  
  static char __user *ksud_user_path(void)
  {
@@ -91,69 +61,26 @@ index f8963882..e784aba5 100644
 +static const char __user *get_user_arg_ptr(struct user_arg_ptr argv, int nr)
  {
 -	return userspace_stack_buffer("", sizeof(""));
--}
 +    const char __user *native;
- 
--static const char su_path[] = SU_PATH;
++
 +#ifdef CONFIG_COMPAT
 +    if (unlikely(argv.is_compat)) {
 +        compat_uptr_t compat;
- 
--static bool is_ksud_exists()
--{
--	struct path path;
++
 +        if (get_user(compat, argv.ptr.compat + nr))
 +            return ERR_PTR(-EFAULT);
 +
 +        return compat_ptr(compat);
 +    }
 +#endif
- 
--	if (kern_path(KSUD_PATH, 0, &path) < 0) {
--		return false;
--	}
--	path_put(&path);
--	return true;
++
 +    if (get_user(native, argv.ptr.native + nr))
 +        return ERR_PTR(-EFAULT);
 +
 +    return native;
  }
  
--long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)
--{
--	const char __user **filename_user, *orig_filename;
--	long ret;
--	const struct cred *old_cred;
--
--	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
--		goto do_orig_facessat;
--	}
--
--	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
--
--	char path[sizeof(su_path) + 1];
--	memset(path, 0, sizeof(path));
--	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
--
--	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
--		old_cred = override_creds(ksu_cred);
--		if (is_ksud_exists()) {
--			ksu_compat_sulog('a');
--			pr_info("faccessat su->ksud!\n");
--			orig_filename = *filename_user;
--			*filename_user = ksud_user_path();
--			ret = ksu_syscall_table[orig_nr](regs);
--			revert_creds(old_cred);
--			*filename_user = orig_filename;
--			return ret;
--		} else {
--			revert_creds(old_cred);
--		}
--	}
--
--do_orig_facessat:
--	return ksu_syscall_table[orig_nr](regs);
+-static const char su_path[] = SU_PATH;
 +/*
 + * return 0 -> No further checks should be required afterwards
 + * return non-zero -> Further checks should be continued afterwards
@@ -208,46 +135,13 @@ index f8963882..e784aba5 100644
 +        pr_err("adb root failed: %d\n", ret);
 +
 +    return ret;
- }
- 
--long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)
++}
++
 +// the call from execve_handler_pre won't provided correct value for __never_use_argument, use them after fix execve_handler_pre, keeping them for consistence for manually patched code
 +int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 +                 void *argv_user, void *envp_user,
 +                 int *__never_use_flags)
- {
--	const char __user **filename_user, *orig_filename;
--	long ret;
--	const struct cred *old_cred;
--
--	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
--		goto do_orig_stat;
--	}
--
--	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
--
--	char path[sizeof(su_path) + 1];
--	memset(path, 0, sizeof(path));
--	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
--
--	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
--		old_cred = override_creds(ksu_cred);
--		if (is_ksud_exists()) {
--			ksu_compat_sulog('s');
--			pr_info("newfstatat su->ksud!\n");
--			orig_filename = *filename_user;
--			*filename_user = ksud_user_path();
--			ret = ksu_syscall_table[orig_nr](regs);
--			revert_creds(old_cred);
--			*filename_user = orig_filename;
--			return ret;
--		} else {
--			revert_creds(old_cred);
--		}
--	}
--
--do_orig_stat:
--	return ksu_syscall_table[orig_nr](regs);
++{
 +    struct filename *filename;
 +    struct ksu_sulog_pending_event *pending_sucompat = NULL;
 +    int ret;
@@ -258,7 +152,8 @@ index f8963882..e784aba5 100644
 +    filename = *filename_ptr;
 +    if (IS_ERR(filename))
 +        return -EINVAL;
-+
+ 
+-static bool is_ksud_exists()
 +    if (!ksu_handle_execveat_init(filename, (struct user_arg_ptr*)argv_user, (struct user_arg_ptr*)envp_user))
 +        return -EINVAL;
 +
@@ -294,15 +189,104 @@ index f8963882..e784aba5 100644
 +        return -EINVAL;
 +    }
 +    return 0;
- }
- 
--static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
--					      const char __user *const __user *argv_user, unsigned long envp,
--					      bool execveat, int orig_nr, struct pt_regs *regs)
++}
++
 +int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr,
 +                 void *argv_user, void *envp_user,
 +                 int *__never_use_flags, int *retval)
  {
+-	struct path path;
++    if (*retval >= 0) {
++        (void)ksu_install_su_fd();
++    }
++    return 0;
++}
++
++extern struct static_key_true is_first_zygote;
+ 
+-	if (kern_path(KSUD_PATH, 0, &path) < 0) {
+-		return false;
+-	}
+-	path_put(&path);
+-	return true;
+-}
+-
+-long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)
+-{
+-	const char __user **filename_user, *orig_filename;
+-	long ret;
+-	const struct cred *old_cred;
+-
+-	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
+-		goto do_orig_facessat;
+-	}
+-
+-	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
+-
+-	char path[sizeof(su_path) + 1];
+-	memset(path, 0, sizeof(path));
+-	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+-
+-	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
+-		old_cred = override_creds(ksu_cred);
+-		if (is_ksud_exists()) {
+-			ksu_compat_sulog('a');
+-			pr_info("faccessat su->ksud!\n");
+-			orig_filename = *filename_user;
+-			*filename_user = ksud_user_path();
+-			ret = ksu_syscall_table[orig_nr](regs);
+-			revert_creds(old_cred);
+-			*filename_user = orig_filename;
+-			return ret;
+-		} else {
+-			revert_creds(old_cred);
+-		}
+-	}
+-
+-do_orig_facessat:
+-	return ksu_syscall_table[orig_nr](regs);
+-}
+-
+-long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)
+-{
+-	const char __user **filename_user, *orig_filename;
+-	long ret;
+-	const struct cred *old_cred;
+-
+-	if (!ksu_is_allow_uid_for_current(current_uid().val)) {
+-		goto do_orig_stat;
+-	}
+-
+-	filename_user = (const char __user **)&PT_REGS_PARM2(regs);
+-
+-	char path[sizeof(su_path) + 1];
+-	memset(path, 0, sizeof(path));
+-	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+-
+-	if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
+-		old_cred = override_creds(ksu_cred);
+-		if (is_ksud_exists()) {
+-			ksu_compat_sulog('s');
+-			pr_info("newfstatat su->ksud!\n");
+-			orig_filename = *filename_user;
+-			*filename_user = ksud_user_path();
+-			ret = ksu_syscall_table[orig_nr](regs);
+-			revert_creds(old_cred);
+-			*filename_user = orig_filename;
+-			return ret;
+-		} else {
+-			revert_creds(old_cred);
+-		}
+-	}
+-
+-do_orig_stat:
+-	return ksu_syscall_table[orig_nr](regs);
+-}
+-
+-static long ksu_handle_execve_sucompat_common(const char __user **filename_user,
+-					      const char __user *const __user *argv_user, unsigned long envp,
+-					      bool execveat, int orig_nr, struct pt_regs *regs)
+-{
 -	const char __user *fn;
 -	struct ksu_sulog_pending_event *pending_sucompat = NULL;
 -	char path[sizeof(su_path) + 1];
@@ -395,15 +379,9 @@ index f8963882..e784aba5 100644
 -
 -do_orig_execve:
 -	return ksu_syscall_table[orig_nr](regs);
-+    if (*retval >= 0) {
-+        (void)ksu_install_su_fd();
-+    }
-+    return 0;
- }
- 
+-}
+-
 -long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, struct pt_regs *regs)
-+extern struct static_key_true is_first_zygote;
-+
 +int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
 +            void *envp, int *flags)
  {
