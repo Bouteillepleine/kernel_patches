@@ -92,7 +92,7 @@ index ddd1240..b509691 100644
  /*
   * Mutex protects:
   * 1) List of modules (also safely readable with preempt_disable),
-@@ -2301,13 +2356,15 @@ int __weak module_frob_arch_sections(Elf_Ehdr *hdr,
+@@ -2301,13 +2356,14 @@ int __weak module_frob_arch_sections(Elf_Ehdr *hdr,
  
  /* module_blacklist is a comma-separated list of module names */
  static char *module_blacklist;
@@ -101,7 +101,6 @@ index ddd1240..b509691 100644
  {
  	const char *p;
  	size_t len;
-+	int i;
  
  	if (!module_blacklist)
 -		return false;
