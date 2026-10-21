@@ -46,7 +46,7 @@ diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
  	pr_info("su_compat: set to %d\n", enable);
  	return 0;
  }
-@@ -59,220 +70,209 @@
+@@ -59,220 +70,188 @@
  
  static char __user *ksud_user_path(void)
  {
@@ -58,29 +58,8 @@ diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
  }
  
 -static char __user *empty_user_path(void)
-+static const char __user *get_user_arg_ptr(struct user_arg_ptr argv, int nr)
- {
+-{
 -	return userspace_stack_buffer("", sizeof(""));
-+    const char __user *native;
-+
-+#ifdef CONFIG_COMPAT
-+    if (unlikely(argv.is_compat)) {
-+        compat_uptr_t compat;
-+
-+        if (get_user(compat, argv.ptr.compat + nr))
-+            return ERR_PTR(-EFAULT);
-+
-+        return compat_ptr(compat);
-+    }
-+#endif
-+
-+    if (get_user(native, argv.ptr.native + nr))
-+        return ERR_PTR(-EFAULT);
-+
-+    return native;
- }
- 
--static const char su_path[] = SU_PATH;
 +/*
 + * return 0 -> No further checks should be required afterwards
 + * return non-zero -> Further checks should be continued afterwards
@@ -135,8 +114,9 @@ diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
 +        pr_err("adb root failed: %d\n", ret);
 +
 +    return ret;
-+}
-+
+ }
+ 
+-static const char su_path[] = SU_PATH;
 +// the call from execve_handler_pre won't provided correct value for __never_use_argument, use them after fix execve_handler_pre, keeping them for consistence for manually patched code
 +int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 +                 void *argv_user, void *envp_user,
@@ -152,8 +132,7 @@ diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
 +    filename = *filename_ptr;
 +    if (IS_ERR(filename))
 +        return -EINVAL;
- 
--static bool is_ksud_exists()
++
 +    if (!ksu_handle_execveat_init(filename, (struct user_arg_ptr*)argv_user, (struct user_arg_ptr*)envp_user))
 +        return -EINVAL;
 +
@@ -162,7 +141,8 @@ diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
 +
 +    if (likely(memcmp(filename->name, su_path, sizeof(su_path))))
 +        return -EINVAL;
-+
+ 
+-static bool is_ksud_exists()
 +    if (current_chrooted())
 +    {
 +        pr_err("ksu_handle_execveat_sucompat: su found but NOT allowed! Because current process is running in chrooted environment\n");
