@@ -34,3 +34,28 @@
  		error = security_context_to_sid(value, size,
  						&sid, GFP_KERNEL);
  		if (error == -EINVAL && attr == LSM_ATTR_FSCREATE) {
+@@ -6480,6 +6500,24 @@ static int selinux_lsm_setattr(u64 attr,
+ 		if (error)
+ 			return error;
+ 	}
++	/* A leading newline means "clear the attribute", so mainline skips the
++	 * parse entirely. That short-circuit is a timing oracle: the same bytes
++	 * with and without the newline differ by one whole
++	 * security_context_to_sid(), which an app_zygote carrier can time.
++	 *
++	 * Parse past the newline, not the newline itself: the probe builds its
++	 * B payload as the A context behind a '\n', so str+1 is what A pays
++	 * for. Parsing str here instead fails on the first symtab lookup and
++	 * costs nothing -- that is why the first attempt at this moved nothing.
++	 *
++	 * sid stays 0 and the clear below is unchanged.
++	 */
++	else if (size > 1 && str[0] == '\n' && __kuid_val(current_uid()) >= 2000) {
++		u32 ignored;
++
++		(void)security_context_to_sid(str + 1, size - 1, &ignored,
++					      GFP_KERNEL);
++	}
+ 
+ 	new = prepare_creds();
+ 	if (!new)
