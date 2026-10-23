@@ -163,24 +163,9 @@ static bool ghost_uid_hidden(u32 uid)
  */
 bool ghost_caller_hidden(void)
 {
-	u32 uid = from_kuid(&init_user_ns, current_uid());
-	bool engine, table, ret;
-
 	if (!nm_uid_blocked && !READ_ONCE(ghost_nuids))
 		return false;
-
-	/* TEMPORARY instrumentation: the denial in _hook did not fire for a
-	 * caller the hide list reports as live, and the two sources can
-	 * disagree because ghost_uid_hidden() prefers the engine and ignores
-	 * the table. Print both answers rather than guess which one is wrong.
-	 */
-	engine = nm_uid_blocked ? nm_uid_blocked(uid) : false;
-	table = ghost_uid_in_table(uid);
-	ret = ghost_uid_hidden(uid);
-	pr_info_ratelimited("ghost: caller uid=%u engine=%d(have=%d) table=%d nuids=%d -> %d\n",
-			    uid, engine, !!nm_uid_blocked, table,
-			    READ_ONCE(ghost_nuids), ret);
-	return ret;
+	return ghost_uid_hidden(from_kuid(&init_user_ns, current_uid()));
 }
 
 bool ghost_uid_task_hidden(u32 uid)
