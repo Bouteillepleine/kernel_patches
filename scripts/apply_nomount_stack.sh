@@ -143,6 +143,25 @@ apply_or_die() {
     fi
 }
 
+# apply_optional <patch> -- hardening that is allowed not to fit.
+#
+# The guards that close a detection oracle are anchored on code that moves
+# between kernel versions, and writing a variant per tree is only worth it where
+# the oracle is reachable. A tree the hunk does not fit still builds; it just
+# builds without that guard, and says so.
+apply_optional() {
+    local p="$1" root="${2:-$COMMON_KERNEL_FOLDER}"
+    [ -f "$p" ] || die "missing patch: $p"
+    if patch -p1 -F0 --forward --dry-run -d "$root" <"$p" >/dev/null 2>&1; then
+        patch -p1 -F0 --forward -d "$root" <"$p" >/dev/null
+        echo "  applied: $(basename "$p")"
+    elif patch -p1 -F0 --reverse --dry-run -d "$root" <"$p" >/dev/null 2>&1; then
+        echo "  already applied: $(basename "$p")"
+    else
+        echo "  skipped: $(basename "$p") does not fit $KERNEL_VER"
+    fi
+}
+
 # apply_first_of <family> <pinned-basename|-> <variant-path...>
 #
 # The variant is chosen BY NAME from the per-version table, not by taking the
@@ -792,19 +811,14 @@ do_ghost() {
     # -ESRCH for a concealed uid, which is what the kernel already answers for
     # a user that owns no task, so a concealed uid reads as idle rather than
     # special. Inert until userspace pushes a `c` list through ghost_ctl().
-    apply_or_die "$GH/ghost_getpriority.patch"
+    apply_optional "$GH/ghost_getpriority.patch"
     # The abstract-socket guard. A hidden @name answers -ECONNREFUSED, which is
     # what an app already gets when nothing is listening, so a service that is
     # spoofed as stopped cannot be caught still holding its control socket.
-    #
-    # 6.12 only: the hunk is anchored on unix_validate_addr() and the BPF connect
-    # hook either side of it, and those move on every older tree. The other
-    # versions need their own variants, so until they exist this is a no-op there
-    # rather than a dead build.
-    case "$KERNEL_VER" in
-    6.12) apply_or_die "$GH/ghost_unixsock.patch" ;;
-    *)    echo "  skipped: ghost_unixsock.patch (no variant for $KERNEL_VER)" ;;
-    esac
+    # Anchored on unix_validate_addr() and the BPF connect hook either side of
+    # it, which move on the older trees -- so it fits 6.12 and is skipped
+    # elsewhere until those have variants.
+    apply_optional "$GH/ghost_unixsock.patch"
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file
