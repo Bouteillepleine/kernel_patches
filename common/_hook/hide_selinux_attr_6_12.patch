@@ -17,7 +17,27 @@
  	rc = security_context_to_sid(value, size, &newsid,
  				     GFP_KERNEL);
  	if (rc == -EINVAL) {
-@@ -6462,6 +6472,16 @@ static int selinux_lsm_setattr(u64 attr,
+@@ -6452,6 +6462,19 @@ static int selinux_lsm_setattr(u64 attr,
+ 	}
+ 	if (error)
+ 		return error;
++	/* Deny attr/current outright for the callers userspace told us to hide
++	 * from, before any context is parsed. An app_zygote carrier is the only
++	 * app-domain context whose write reaches the parser at all -- from
++	 * untrusted_app it is already EACCES -- and reaching the parser is what
++	 * lets a probe time an invalid context against the same bytes behind a
++	 * newline. Both arms now fail at this instruction instead.
++	 */
++	if (attr == LSM_ATTR_CURRENT) {
++		extern bool ghost_caller_hidden(void) __attribute__((weak));
++
++		if (ghost_caller_hidden && ghost_caller_hidden())
++			return -EACCES;
++	}
+ 
+ 	/* Obtain a SID for the context, if one was specified. */
+ 	if (size && str[0] && str[0] != '\n') {
+@@ -6462,6 +6485,16 @@ static int selinux_lsm_setattr(u64 attr,
  			str[size-1] = 0;
  			size--;
  		}
