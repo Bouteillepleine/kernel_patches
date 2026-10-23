@@ -34,28 +34,25 @@
  		error = security_context_to_sid(value, size,
  						&sid, GFP_KERNEL);
  		if (error == -EINVAL && attr == LSM_ATTR_FSCREATE) {
-@@ -6480,6 +6500,27 @@ static int selinux_lsm_setattr(u64 attr,
+@@ -6480,6 +6500,24 @@ static int selinux_lsm_setattr(u64 attr,
  		if (error)
  			return error;
  	}
-+	/* Mirror of the branch above. A leading newline means "clear the
-+	 * attribute", so mainline skips both the hidden-label scan and the
-+	 * parse -- and an app_zygote carrier times exactly that gap by sending
-+	 * the same context with and without the newline. Do the same work on
-+	 * str+1 (what the other arm pays for) and throw it away; volatile so
-+	 * it cannot be optimised out. sid stays 0, the clear below is
-+	 * unchanged, and only app-uid writes starting with a newline pay this.
++	/* A leading newline means "clear the attribute", so mainline skips the
++	 * parse entirely. That short-circuit is a timing oracle: the same bytes
++	 * with and without the newline differ by one whole
++	 * security_context_to_sid(), which an app_zygote carrier can time.
++	 *
++	 * Parse past the newline, not the newline itself: the probe builds its
++	 * B payload as the A context behind a '\n', so str+1 is what A pays
++	 * for. Parsing str here instead fails on the first symtab lookup and
++	 * costs nothing -- that is why the first attempt at this moved nothing.
++	 *
++	 * sid stays 0 and the clear below is unchanged.
 +	 */
 +	else if (size > 1 && str[0] == '\n' && __kuid_val(current_uid()) >= 2000) {
-+		size_t hidden_len = strnlen(str + 1, size - 1);
-+		volatile bool scanned;
 +		u32 ignored;
 +
-+		scanned = strnstr(str + 1, ":ksu:", hidden_len) ||
-+			  strnstr(str + 1, ":ksu_file:", hidden_len) ||
-+			  strnstr(str + 1, ":lsposed_file:", hidden_len) ||
-+			  strnstr(str + 1, ":zygisk_file:", hidden_len);
-+		(void)scanned;
 +		(void)security_context_to_sid(str + 1, size - 1, &ignored,
 +					      GFP_KERNEL);
 +	}
