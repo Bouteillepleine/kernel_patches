@@ -793,6 +793,10 @@ do_ghost() {
     # a user that owns no task, so a concealed uid reads as idle rather than
     # special. Inert until userspace pushes a `c` list through ghost_ctl().
     apply_or_die "$GH/ghost_getpriority.patch"
+    # The abstract-socket guard. A hidden @name answers -ECONNREFUSED, which is
+    # what an app already gets when nothing is listening, so a service that is
+    # spoofed as stopped cannot be caught still holding its control socket.
+    apply_or_die "$GH/ghost_unixsock.patch"
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file

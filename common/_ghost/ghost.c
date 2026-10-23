@@ -237,6 +237,12 @@ static int ghost_rule_sane(const char *s)
 
 	if (len >= GH_RULE_LEN)
 		return -ENAMETOOLONG;
+	/* '@name' is an abstract socket, not a path: it has no slashes to count
+	 * and no parent to walk. It shares this table so that one list covers
+	 * both, and only ghost_abstract_hidden() ever looks it up.
+	 */
+	if (s[0] == '@')
+		return len >= 2 ? 0 : -EINVAL;
 	if (len < 6)
 		return -EINVAL;
 	if (s[0] != '/')
@@ -404,6 +410,32 @@ static int ghost_next_token(const char **pp, const char *end, char *out)
 		out[len] = '\0';
 		return len;
 	}
+}
+
+/* Is @name an abstract socket this caller must not reach?
+ *
+ * Answering -ECONNREFUSED for it is what an app already gets when the listener
+ * is not there, so a hidden socket is indistinguishable from an absent one
+ * rather than special. Shares the path table via an '@' prefix.
+ */
+bool ghost_abstract_hidden(const char *name, int len)
+{
+	char buf[GH_RULE_LEN];
+	bool hit;
+
+	if (!READ_ONCE(ghost_nrules) || len <= 0 || len + 2 > GH_RULE_LEN)
+		return false;
+	if (!nm_uid_blocked && !READ_ONCE(ghost_nuids))
+		return false;
+	if (!ghost_uid_hidden(from_kuid(&init_user_ns, current_uid())))
+		return false;
+
+	buf[0] = '@';
+	memcpy(buf + 1, name, len);
+	rcu_read_lock();
+	hit = ghost_path_rcu(buf, len + 1);
+	rcu_read_unlock();
+	return hit;
 }
 
 int ghost_ctl(const char *buf, size_t count)
