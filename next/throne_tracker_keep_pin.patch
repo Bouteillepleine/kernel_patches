@@ -1,0 +1,23 @@
+diff --git a/manager/throne_tracker.c b/manager/throne_tracker.c
+index d506c77a..d93bf1b4 100644
+--- a/manager/throne_tracker.c
++++ b/manager/throne_tracker.c
+@@ -342,6 +342,18 @@ void track_throne(bool prune_only)
+ 	}
+ 
+ 	if (manager_package_uid == KSU_INVALID_APPID) {
++		// The manager was not seen in this pass. Before acting on that, check
++		// whether its apk is still where we found it: a short or torn read of
++		// packages.list must not drop the pin and send us walking /data/app.
++		if (cached_manager_apk_path[0]) {
++			struct path p;
++
++			if (kern_path(cached_manager_apk_path, 0, &p) == 0) {
++				path_put(&p);
++				pr_info("manager apk still present, keep it!\n");
++				goto prune;
++			}
++		}
+ 		cached_manager_apk_path[0] = 0;
+ 		if (ksu_is_manager_appid_valid()) {
+ 			pr_info("manager is uninstalled, invalidate it!\n");
