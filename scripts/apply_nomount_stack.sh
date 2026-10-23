@@ -796,7 +796,15 @@ do_ghost() {
     # The abstract-socket guard. A hidden @name answers -ECONNREFUSED, which is
     # what an app already gets when nothing is listening, so a service that is
     # spoofed as stopped cannot be caught still holding its control socket.
-    apply_or_die "$GH/ghost_unixsock.patch"
+    #
+    # 6.12 only: the hunk is anchored on unix_validate_addr() and the BPF connect
+    # hook either side of it, and those move on every older tree. The other
+    # versions need their own variants, so until they exist this is a no-op there
+    # rather than a dead build.
+    case "$KERNEL_VER" in
+    6.12) apply_or_die "$GH/ghost_unixsock.patch" ;;
+    *)    echo "  skipped: ghost_unixsock.patch (no variant for $KERNEL_VER)" ;;
+    esac
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file
