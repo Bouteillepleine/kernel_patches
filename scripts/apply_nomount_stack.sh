@@ -788,6 +788,11 @@ do_ghost() {
     # chown is chmod's sibling in the mnt_want_write-answers-first family, and
     # do_fchownat() is byte-identical on all five, so it needs no variant table.
     apply_or_die "$GH/ghost_chown.patch"
+    # The task-visibility guard. getpriority(PRIO_USER)/setpriority answer
+    # -ESRCH for a concealed uid, which is what the kernel already answers for
+    # a user that owns no task, so a concealed uid reads as idle rather than
+    # special. Inert until userspace pushes a `c` list through ghost_ctl().
+    apply_or_die "$GH/ghost_getpriority.patch"
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file

