@@ -156,18 +156,6 @@ static bool ghost_uid_hidden(u32 uid)
  * same answer the kernel gives for a user that genuinely owns no task, so the
  * concealed uid is indistinguishable from an idle one rather than special.
  */
-/* Is the *calling* task one of the uids userspace told us to hide from?
- * Exported for the _hook family, which needs the same answer without a
- * target uid to test. Weakly referenced there, so a tree with _hook but
- * no _ghost still links.
- */
-bool ghost_caller_hidden(void)
-{
-	if (!nm_uid_blocked && !READ_ONCE(ghost_nuids))
-		return false;
-	return ghost_uid_hidden(from_kuid(&init_user_ns, current_uid()));
-}
-
 bool ghost_uid_task_hidden(u32 uid)
 {
 	if (!READ_ONCE(ghost_ncuids))
