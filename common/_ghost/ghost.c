@@ -230,14 +230,36 @@ bool ghost_hidden_path(const struct path *path)
 	return hit;
 }
 
-/* Same hidden-path table and uid gate as ghost_hidden_path(), but matched
- * against a mount's SOURCE ROOT (mountinfo field 4) rather than its visible
- * d_path. A hook framework's bind renders there as /adb/modules/<id>/... , a
- * string that is never a real lookup path, so a rule of "/adb/modules/" hides
- * the mount line without touching the mountpoint (/apex/.../dex2oat64) that the
- * binary still has to resolve. Used by the proc_namespace.c integration to drop
- * the one bind NoMount keeps by design from an Android 17 zygote_next isolated
- * reader, which shares init's namespace and so still sees it. */
+/* A module bind's SOURCE ROOT, matched in code rather than through the
+ * hidden-path table.
+ *
+ * The table cannot carry this one. `nomount ghost sync` runs from service.sh on
+ * every boot and REPROGRAMS the table from the Suite's injected-only rule
+ * targets; a module bind root is never one of them, so an entry added by hand is
+ * dropped on the next sync. Measured on an OP15: after `ghost sync` the entry
+ * was gone and a hide-listed reader went straight back to seeing the line. A
+ * table-only match is therefore inert from the first reboot onward, which is the
+ * failure mode this guard exists to prevent.
+ *
+ * These two spellings are a fixed signature, not a tunable path -- a bind out of
+ * the userdata f2fs renders as /adb/modules/... because that fs root maps to
+ * /data, and /data/adb/modules/ covers layouts that render it in full. Neither
+ * is ever a real lookup path, so matching them cannot over-hide. */
+static bool ghost_mount_root_is_module(const char *p)
+{
+	return strncmp(p, "/adb/modules/", 13) == 0 ||
+	       strncmp(p, "/data/adb/modules/", 18) == 0;
+}
+
+/* Same uid gate as ghost_hidden_path(), but matched against a mount's SOURCE
+ * ROOT (mountinfo field 4) rather than its visible d_path: d_path renders the
+ * mountpoint (/apex/.../dex2oat64), a path the binary still has to resolve, so
+ * matching that would over-hide. Drops the one bind NoMount keeps by design from
+ * an Android 17 zygote_next isolated reader, whose namespace is a copy of
+ * init's and so still carries it. The hidden-path table is still consulted, so a
+ * further root can be added at runtime without a kernel change -- but the guard
+ * no longer DEPENDS on it, and deliberately does not return early on an empty
+ * table. */
 bool ghost_hidden_mount(struct vfsmount *mnt)
 {
 	char (*bufp)[PATH_MAX];
@@ -245,8 +267,6 @@ bool ghost_hidden_mount(struct vfsmount *mnt)
 	bool hit = false;
 	u32 uid;
 
-	if (!READ_ONCE(ghost_nrules))
-		return false;
 	if (!nm_uid_blocked && !READ_ONCE(ghost_nuids))
 		return false;
 	if (!mnt || !mnt->mnt_root)
@@ -261,9 +281,12 @@ bool ghost_hidden_mount(struct vfsmount *mnt)
 	if (!IS_ERR(p)) {
 		size_t plen = strlen(p);
 
-		rcu_read_lock();
-		hit = ghost_path_rcu(p, plen);
-		rcu_read_unlock();
+		hit = ghost_mount_root_is_module(p);
+		if (!hit && READ_ONCE(ghost_nrules)) {
+			rcu_read_lock();
+			hit = ghost_path_rcu(p, plen);
+			rcu_read_unlock();
+		}
 	}
 	put_cpu_ptr(&ghost_pathbuf);
 
