@@ -36,7 +36,20 @@
  * still links and falls back to the table below -- the same arrangement the
  * engine already uses in the other direction for ghost_ctl().
  */
+#ifdef MODULE
+/* Out of tree the engine is in this same module, so the symbol is always
+ * there and the weak form only costs: clang cannot reach a possibly-zero
+ * address with adrp+add, so it emits R_AARCH64_ADR_GOT_PAGE, which
+ * arch/arm64/kernel/module.c does not apply - the .ko links and insmod then
+ * fails with "unsupported RELA relocation". Taking the address once keeps
+ * the "is it linked" tests below reading a pointer rather than a constant,
+ * and a pointer initialiser is a plain ABS64 the loader does apply. */
+extern bool nm_uid_blocked(uid_t uid);
+static bool (* const nm_uid_blocked_ptr)(uid_t uid) = nm_uid_blocked;
+#define nm_uid_blocked nm_uid_blocked_ptr
+#else
 extern bool nm_uid_blocked(uid_t uid) __attribute__((weak));
+#endif
 
 #define GH_RULE_LEN	192
 #define GH_MAX_UIDS	128
@@ -192,6 +205,40 @@ static bool ghost_path_rcu(const char *path, size_t plen)
 	return false;
 }
 
+/* Unicode default-ignorable code points, as UTF-8.
+ *
+ * Measured on OP15: a caller refused /sdcard/Android/data with EACCES retried
+ * the same component with one of these appended, and THAT open succeeded -
+ * Android's own check compares the name, the filesystem resolves it anyway. The
+ * character sits at the component boundary, so every spelling is a fresh string
+ * and no rule text can enumerate them. Refusing the class is what closes it:
+ * nothing on a real device needs a zero-width joiner in a path, so for a caller
+ * we already hide from, such a path is answered the way a missing one is.
+ */
+static const char * const ghost_ignorable[] = {
+	"\xc2\xad",		/* U+00AD soft hyphen */
+	"\xcd\x8f",		/* U+034F combining grapheme joiner */
+	"\xe1\xa0\x8e",		/* U+180E Mongolian vowel separator */
+	"\xe2\x80\x8b",		/* U+200B zero width space */
+	"\xe2\x80\x8c",		/* U+200C zero width non-joiner */
+	"\xe2\x80\x8d",		/* U+200D zero width joiner */
+	"\xe2\x81\xa0",		/* U+2060 word joiner */
+	"\xef\xbb\xbf",		/* U+FEFF zero width no-break space */
+};
+
+bool ghost_name_ignorable(const char *p)
+{
+	int i;
+
+	if (!p)
+		return false;
+
+	for (i = 0; i < (int)ARRAY_SIZE(ghost_ignorable); i++)
+		if (strstr(p, ghost_ignorable[i]))
+			return true;
+	return false;
+}
+
 bool ghost_hidden_path(const struct path *path)
 {
 	char (*bufp)[PATH_MAX];
@@ -199,8 +246,9 @@ bool ghost_hidden_path(const struct path *path)
 	bool hit;
 	u32 uid;
 
-	if (!READ_ONCE(ghost_nrules))
-		return false;
+	/* No early return on an empty rule table: the invisible-character class
+	 * check below is not expressed as a rule and must still run.
+	 */
 	/* An empty uid table means "no uid source" only when the engine is not
 	 * the source. Keeping the old combined test here would make every guard
 	 * dead code the moment userspace stops pushing a table it no longer
@@ -221,9 +269,13 @@ bool ghost_hidden_path(const struct path *path)
 	if (!IS_ERR(p)) {
 		size_t plen = strlen(p);
 
-		rcu_read_lock();
-		hit = ghost_path_rcu(p, plen);
-		rcu_read_unlock();
+		/* the class check first: it needs no rule to be programmed */
+		hit = ghost_name_ignorable(p);
+		if (!hit) {
+			rcu_read_lock();
+			hit = ghost_path_rcu(p, plen);
+			rcu_read_unlock();
+		}
 	}
 	put_cpu_ptr(&ghost_pathbuf);
 
