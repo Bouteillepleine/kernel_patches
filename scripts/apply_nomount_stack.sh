@@ -735,7 +735,13 @@ do_pathhide() {
     # conversion: pathhide_hidden_vm_pages() counts real PAGE_SIZE pages while
     # __page_size_count() DIV_ROUND_UPs into the emulated size, so converting
     # first and subtracting after rounds twice and can over-deduct a page.
-    if grep -q '__page_size_count(mm->total_vm)' "$d/fs/proc/task_mmu.c"; then
+    # 6.12.81 moved __page_size_count() INSIDE the resident sum, so it still
+    # matches the pgcompat test below while its second hunk no longer applies.
+    # Test the narrower shape first or the tree is pinned to a variant that
+    # cannot land, which is how OP15-6.12.81 failed at fuzz 0.
+    if grep -q '\*resident = \*shared + __page_size_count(' "$d/fs/proc/task_mmu.c"; then
+        REQ_ACCT=pathhide_accounting_pgsplit_integration.patch
+    elif grep -q '__page_size_count(mm->total_vm)' "$d/fs/proc/task_mmu.c"; then
         REQ_ACCT=pathhide_accounting_pgcompat_integration.patch
     elif grep -q 'get_mm_counter_sum(mm, MM_ANONPAGES)' "$d/fs/proc/task_mmu.c"; then
         REQ_ACCT=pathhide_accounting_6.6_integration.patch
@@ -750,6 +756,7 @@ do_pathhide() {
         "$PH/pathhide_mincore_6.12_integration.patch" \
         "$PH/pathhide_mincore_5.10_integration.patch"
     apply_first_of pathhide-accounting "$REQ_ACCT" \
+        "$PH/pathhide_accounting_pgsplit_integration.patch" \
         "$PH/pathhide_accounting_6.6_integration.patch" \
         "$PH/pathhide_accounting_pgcompat_integration.patch" \
         "$PH/pathhide_accounting_integration.patch"
