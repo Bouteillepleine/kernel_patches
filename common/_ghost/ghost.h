@@ -5,8 +5,10 @@
 #include <linux/types.h>
 
 struct path;
+struct vfsmount;
 
 bool ghost_hidden_path(const struct path *path);
+bool ghost_hidden_mount(struct vfsmount *mnt);
 
 bool ghost_abstract_hidden(const char *name, int len);
 bool ghost_uid_concealed(u32 uid);

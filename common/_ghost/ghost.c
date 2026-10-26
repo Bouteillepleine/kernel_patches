@@ -4,6 +4,7 @@
 #include <linux/fs.h>
 #include <linux/path.h>
 #include <linux/dcache.h>
+#include <linux/mount.h>
 #include <linux/cred.h>
 #include <linux/uidgid.h>
 #include <linux/user_namespace.h>
@@ -217,6 +218,46 @@ bool ghost_hidden_path(const struct path *path)
 	hit = false;
 	bufp = get_cpu_ptr(&ghost_pathbuf);
 	p = d_path(path, *bufp, PATH_MAX);
+	if (!IS_ERR(p)) {
+		size_t plen = strlen(p);
+
+		rcu_read_lock();
+		hit = ghost_path_rcu(p, plen);
+		rcu_read_unlock();
+	}
+	put_cpu_ptr(&ghost_pathbuf);
+
+	return hit;
+}
+
+/* Same hidden-path table and uid gate as ghost_hidden_path(), but matched
+ * against a mount's SOURCE ROOT (mountinfo field 4) rather than its visible
+ * d_path. A hook framework's bind renders there as /adb/modules/<id>/... , a
+ * string that is never a real lookup path, so a rule of "/adb/modules/" hides
+ * the mount line without touching the mountpoint (/apex/.../dex2oat64) that the
+ * binary still has to resolve. Used by the proc_namespace.c integration to drop
+ * the one bind NoMount keeps by design from an Android 17 zygote_next isolated
+ * reader, which shares init's namespace and so still sees it. */
+bool ghost_hidden_mount(struct vfsmount *mnt)
+{
+	char (*bufp)[PATH_MAX];
+	char *p;
+	bool hit = false;
+	u32 uid;
+
+	if (!READ_ONCE(ghost_nrules))
+		return false;
+	if (!nm_uid_blocked && !READ_ONCE(ghost_nuids))
+		return false;
+	if (!mnt || !mnt->mnt_root)
+		return false;
+
+	uid = from_kuid(&init_user_ns, current_uid());
+	if (!ghost_uid_hidden(uid))
+		return false;
+
+	bufp = get_cpu_ptr(&ghost_pathbuf);
+	p = dentry_path_raw(mnt->mnt_root, *bufp, PATH_MAX);
 	if (!IS_ERR(p)) {
 		size_t plen = strlen(p);
 

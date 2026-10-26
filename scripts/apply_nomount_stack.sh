@@ -819,6 +819,19 @@ do_ghost() {
     # it, which move on the older trees -- so it fits 6.12 and is skipped
     # elsewhere until those have variants.
     apply_optional "$GH/ghost_unixsock.patch"
+    # The mount-table guard. A hook framework's dex2oat/app_process bind is the
+    # one real mount the mountless posture keeps by design (absorb declines it:
+    # dropping it breaks dexopt), and it is rooted at /adb/modules/... . An app
+    # forked from the app zygote never sees it -- that namespace has it unmounted
+    # -- but the Android 17 zygote_next isolated path runs in a COPY of init's
+    # namespace, which still carries it, so one isolated read of
+    # /proc/self/mountinfo names the module that owns the bind. The guard matches
+    # the mount's SOURCE ROOT (mountinfo field 4) against the same hidden-path
+    # table, not its d_path: d_path renders the mountpoint (/apex/.../dex2oat64),
+    # a path the binary still has to resolve, so matching that would over-hide.
+    # Anchored on the three show_* bodies of 6.12 and skipped elsewhere until
+    # those have variants, the same way ghost_unixsock is.
+    apply_optional "$GH/ghost_mountinfo_6_12.patch"
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file
