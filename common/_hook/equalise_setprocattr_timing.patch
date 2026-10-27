@@ -1,0 +1,38 @@
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -249,6 +249,23 @@ static int __nocfi my_setprocattr(const
+     if (error)
+         return error;
+ 
++    if (!(size && str[0] && str[0] != '\n')) {
++        const char *probe = str;
++        size_t probe_size = size;
++        u32 probe_sid = 0, probe_tmp_sid = 0;
++        int probe_rc = 0;
++
++        if (probe_size && probe[probe_size - 1] == '\n')
++            probe_size--;
++        while (probe_size && *probe == '\n') {
++            probe++;
++            probe_size--;
++        }
++        if (probe_size)
++            security_context_to_sid_with_policy(backup_sepolicy, probe, probe_size, &probe_tmp_sid, SECSID_NULL,
++                                                GFP_KERNEL, &probe_sid, &probe_rc);
++    }
++
+     /* Obtain a SID for the context, if one was specified. */
+     if (size && str[0] && str[0] != '\n') {
+         if (str[size - 1] == '\n') {
+@@ -260,5 +277,9 @@ static int __nocfi my_setprocattr(const
+-        if (error2 || error)
+-            return error2 ?: error;
++        if (error2 || error) {
++            new = prepare_creds();
++            if (new)
++                abort_creds(new);
++            return error2 ?: error;
++        }
+     }
+ 
+     new = prepare_creds();

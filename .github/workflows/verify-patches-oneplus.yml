@@ -80,8 +80,11 @@ jobs:
           # Mirrors the builder's own selection (build-kernel/action.yml):
           #   audit_user always; selinuxfs_6_12/attr_6_12 on 6.12 else the base;
           #   quiet_audit on 6.6/6.12 else quiet_audit_legacy.
-          # fix_selinux_seqno.patch targets kernel/selinux/rules.c, a KernelSU
-          # file that does not exist in the common tree -- not verifiable here.
+          # fix_selinux_seqno.patch and equalise_setprocattr_timing.patch target
+          # kernel/selinux/rules.c and kernel/feature/selinux_hide.c, KernelSU
+          # files that do not exist in the common tree -- not verifiable here.
+          # Nothing else dry-runs them either: a KSU-tree patch is first exercised
+          # by a real builder run, which is what the NMS canary exists to trigger.
           #
           # _ghost is checked SEPARATELY below, because "every patch applies to
           # every tree" is the wrong assertion for it and would fail that

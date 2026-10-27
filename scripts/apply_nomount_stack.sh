@@ -322,6 +322,23 @@ awk_placement() {
     ' "$1"
 }
 
+# Walk KernelSU's selinux_hide.c and fail if the timing-equalisation probe lands
+# BEFORE the setprocattr hook's own PROCESS__SETCURRENT check. The probe parses
+# an attacker-supplied context against backup_sepolicy; after the check only a
+# domain actually allowed SETCURRENT reaches it, which on an Android tree is
+# app_zygote and not untrusted_app. Before it, EVERY app could time a
+# backup-policy parse -- a wider oracle than the one the patch closes. Same
+# shape as awk_placement(), and split out for the same reason: the single
+# quotes do not survive being inlined next to the rest of the checks.
+awk_probe_placement() {
+    awk '
+        /__nocfi [a-z_]*setprocattr\(/ { fn = 1; avc = 0 }
+        /PROCESS__SETCURRENT/           { if (fn) avc = 1 }
+        /probe_size/ { if (fn && !avc) { print "EARLY setprocattr probe" > "/dev/stderr"; bad = 1 } }
+        END { exit bad ? 1 : 0 }
+    ' "$1"
+}
+
 verify_hook() {
     local d="$COMMON_KERNEL_FOLDER"
     has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
@@ -397,6 +414,21 @@ verify_hook() {
         "_hook: fix_selinux_seqno did not land -- KSU still writes policyload=0 to /sys/fs/selinux/status"
     has "$KSU_FOLDER/kernel/selinux/rules.c" 'selnl_notify_policyload' \
         "_hook: selnl_notify_policyload was removed -- see README, gating it is a documented bootloop risk"
+
+    # equalise_setprocattr_timing.patch is also written against KernelSU's own
+    # tree. The file is named differently per fork but present in all three
+    # (KSUN, SukiSU-Ultra, BakaSU), and the function it patches is my_setprocattr
+    # on two of them and ksu_handle_selinux_setprocattr on the third -- hence the
+    # name-agnostic assertions below.
+    [ -f "$KSU_FOLDER/kernel/feature/selinux_hide.c" ] ||
+        die "_hook: $KSU_FOLDER/kernel/feature/selinux_hide.c does not exist, so equalise_setprocattr_timing cannot be verified. If this fork keeps the setprocattr hook elsewhere, the patch did not land and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other."
+    infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'probe_size' \
+        "_hook: the timing probe is not inside the setprocattr hook. Without it the newline-prefixed payload skips security_context_to_sid_with_policy() while the bare one pays for it, and the difference is measurable from app_zygote -- the DANGER Duck Detector reports as 'App Zygote attr/current timing'."
+    infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'abort_creds(new);
+            return error2 ?: error;' \
+        "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
+    awk_probe_placement "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
+        die "_hook: the timing probe sits BEFORE the setprocattr hook's PROCESS__SETCURRENT check, so every app can reach a backup-policy parse instead of only the domains allowed SETCURRENT. That is a wider oracle than the one this patch closes."
 
     assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
     echo "_hook: verified"
@@ -656,6 +688,7 @@ do_hook() {
     apply_first_of avc-audit "$REQ_AUDIT" \
         "$HOOK/quiet_selinux_audit.patch" "$HOOK/quiet_selinux_audit_legacy.patch"
     apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
+    apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
     verify_hook
     echo "::endgroup::"
 }
