@@ -457,6 +457,22 @@ verify_hook() {
     esac
     [ -n "$probe_range" ] ||
         die "_hook: the probe context '$probe_ctx' carries no MLS range. The detector's payload does, and the range parse is the larger half of what the live policy charges for it -- without one the probe is cheap and the asymmetry stays measurable."
+
+    # The probe runs more than once ON PURPOSE, and that is a tuning constant,
+    # not a correctness one -- so it is the kind of thing a later cleanup
+    # "simplifies" away without noticing. CLOCK_MONOTONIC_RAW on this SoC is the
+    # 19.2 MHz arch counter, i.e. ONE TICK IS 52ns, and every A-B figure the
+    # detector has ever printed here is an exact multiple of it: 157/156 = 3
+    # ticks unpatched, 104 = 2, 52 = 1. A single probe parse took the verdict
+    # sample from 3 ticks to 1 and then stopped moving, because anything smaller
+    # than a tick is invisible to the instrument. Two parses is what pushes the
+    # paired median to 0 or below, which is the only state the card treats as
+    # clean. Drop back to one and the asymmetry returns at a tick the detector
+    # can still see, with nothing else failing.
+    probe_loop=$(awk "/__nocfi .*setprocattr/,/^}/" "$KSU_FOLDER/kernel/feature/selinux_hide.c" 2>/dev/null |
+        grep -c 'probe_i < [2-9]') || true
+    [ "${probe_loop:-0}" -ge 1 ] ||
+        die "_hook: the timing probe parses the context fewer than twice. One parse only moves the paired median by a tick and leaves it positive, which is still 'Positive A-B timing asymmetry' to the detector. If you meant to retune this, change the count -- do not remove the loop."
     infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'abort_creds(new);
             return error2 ?: error;' \
         "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
