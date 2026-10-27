@@ -334,7 +334,7 @@ awk_probe_placement() {
     awk '
         /__nocfi [a-z_]*setprocattr\(/ { fn = 1; avc = 0 }
         /PROCESS__SETCURRENT/           { if (fn) avc = 1 }
-        /probe_size/ { if (fn && !avc) { print "EARLY setprocattr probe" > "/dev/stderr"; bad = 1 } }
+        /ksu_probe_ctx/ { if (fn && !avc) { print "EARLY setprocattr probe" > "/dev/stderr"; bad = 1 } }
         END { exit bad ? 1 : 0 }
     ' "$1"
 }
@@ -422,8 +422,41 @@ verify_hook() {
     # name-agnostic assertions below.
     [ -f "$KSU_FOLDER/kernel/feature/selinux_hide.c" ] ||
         die "_hook: $KSU_FOLDER/kernel/feature/selinux_hide.c does not exist, so equalise_setprocattr_timing cannot be verified. If this fork keeps the setprocattr hook elsewhere, the patch did not land and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other."
-    infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'probe_size' \
+    infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'ksu_probe_ctx' \
         "_hook: the timing probe is not inside the setprocattr hook. Without it the newline-prefixed payload skips security_context_to_sid_with_policy() while the bare one pays for it, and the difference is measurable from app_zygote -- the DANGER Duck Detector reports as 'App Zygote attr/current timing'."
+
+    # The probe exists to cost what the REAL parse costs, and that cost is not a
+    # property of the code -- it is a property of the string. Measured on an
+    # OP15 (CPH2745, 6.12.69): the detector's A payload is a hidden-type context
+    # with a valid MLS range, so it fails the BACKUP policy's type lookup and
+    # then parses all the way through the LIVE policy, range included. The first
+    # version of this probe re-parsed the caller's own bytes, which for a
+    # same-length newline-prefixed payload is A truncated by one character --
+    # 'u:r:ksu:s' instead of 'u:r:ksu:s0' -- so it died in mls_context_to_sid()
+    # and never paid for the range. Verified against the live policy from uid 0,
+    # where the >=2000 selinuxfs cloak is off: 'u:r:ksu:s0' validates,
+    # 'u:r:ksu:s' returns EINVAL. That one missing range parse was the whole
+    # residual: 157ns before the probe, still 104ns with the wrong probe string.
+    #
+    # So assert the SHAPE of the constant, not merely its presence:
+    #   * its type must be one the cloak actually hides, or the backup lookup
+    #     succeeds, the live parse is skipped, and the probe goes cheap again;
+    #   * it must carry an MLS range, or the range parse is never paid for.
+    # Both failures are silent -- the kernel builds, boots and hides exactly as
+    # well, and only a detector sees the difference.
+    probe_ctx=$(sed -n 's/.*static const char ksu_probe_ctx\[\] = "\([^"]*\)".*/\1/p' \
+        "$KSU_FOLDER/kernel/feature/selinux_hide.c" | head -n1)
+    [ -n "$probe_ctx" ] ||
+        die "_hook: could not read ksu_probe_ctx out of selinux_hide.c, so the probe string cannot be checked. It is the only thing that makes the two paths cost the same; an unchecked one is how the 104ns residual survived a green build."
+    probe_type=$(printf '%s' "$probe_ctx" | cut -d: -f3)
+    probe_range=$(printf '%s' "$probe_ctx" | cut -d: -f4)
+    needle="\":$probe_type:\""
+    case "$nfs" in
+    *"$needle"*) ;;
+    *) die "_hook: the probe context '$probe_ctx' uses type '$probe_type', which is NOT in the hidden-type list [$nfs]. The probe only costs what the real parse costs while its type is absent from the backup policy and present in the live one -- i.e. while it is a type this cloak hides. Rename the hidden domain without renaming this and the oracle comes straight back, silently." ;;
+    esac
+    [ -n "$probe_range" ] ||
+        die "_hook: the probe context '$probe_ctx' carries no MLS range. The detector's payload does, and the range parse is the larger half of what the live policy charges for it -- without one the probe is cheap and the asymmetry stays measurable."
     infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'abort_creds(new);
             return error2 ?: error;' \
         "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
