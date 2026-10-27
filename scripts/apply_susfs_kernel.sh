@@ -108,6 +108,20 @@ if grep -q '#ifndef KSU_NO_PREINIT' fs/exec.c && ! grep -q '^#define KSU_NO_PREI
     fi
 fi
 
+# The enable patch rewrites my_setprocattr()'s signature in the KSU tree and
+# drops __nocfi from it. NoMount's _hook family put its timing probe in that
+# function and its verifier locates the function by `__nocfi .*setprocattr`, so
+# without this the probe is still there and still correct while `verify` reports
+# it as missing. Restoring the qualifier is also right on its own terms: the
+# function is reached through a patched LSM slot, which is an indirect call.
+SH="$KSU_FOLDER/kernel/feature/selinux_hide.c"
+if [ -f "$SH" ] && grep -q 'ksu_probe_ctx' "$SH" && ! grep -q '__nocfi .*setprocattr' "$SH"; then
+    sed -i -E 's/^((static )?int )(my_setprocattr\(const char)/\1__nocfi \3/' "$SH"
+    grep -q '__nocfi .*my_setprocattr' "$SH" ||
+        die "could not restore __nocfi on my_setprocattr() in $SH"
+    note "restored __nocfi on my_setprocattr(); the enable patch had rewritten its signature"
+fi
+
 # ---- assertions ---------------------------------------------------------
 if grep -qE 'ksu_selinux_hide_enabled|fake_status|initialize_fake_status|my_sel_open_handle_status' security/selinux/selinuxfs.c; then
     die "susfs selinuxfs hunks reached security/selinux/selinuxfs.c, which the KSU side and _hook own"
