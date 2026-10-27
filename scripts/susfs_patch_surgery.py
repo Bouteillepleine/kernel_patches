@@ -177,13 +177,35 @@ def insert_rollup_bypass(tree):
               if re.match(r'^\t+smap_gather_stats\(vma, &mss, 0\);$', lines[i])), None)
     if g is None:
         return None
+    # A patch stack applied before susfs opens this block with its own
+    # declarations -- NoMount's _pathhide puts `extern bool pathhide_match_file`
+    # and a `bool ph_hidden = ...` at the top of the loop. Putting the guard
+    # above them turns both into declarations-after-statement, and the goto then
+    # jumps over an initialiser. Enter after the leading declarations instead.
+    DECL = (r'^(extern|static|const|bool|char|int|long|unsigned|short|float|double|'
+            r'struct|union|enum|void|u8|u16|u32|u64|s8|s16|s32|s64|size_t|ssize_t|'
+            r'loff_t|pgoff_t|gfp_t|pte_t|pmd_t|spinlock_t)\b')
+    ins, cont = h + 1, False
+    while ins < g:
+        body_line = lines[ins].strip()
+        if not body_line:
+            ins += 1
+        elif cont:
+            cont = not body_line.endswith(';')
+            ins += 1
+        elif re.match(DECL, body_line):
+            cont = not body_line.endswith(';')
+            ins += 1
+        else:
+            break
     label = [GUARD_MAP, 'bypass_orig_flow:', ENDIF_MAP]
     guard = [GUARD_MAP,
              '\t\tif (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))',
              '\t\t\tgoto bypass_orig_flow;',
              ENDIF_MAP]
+    # label first: it sits after `ins`, so inserting it now keeps that index valid
     lines = lines[:g + 1] + label + lines[g + 1:]
-    lines = lines[:h + 1] + guard + lines[h + 1:]
+    lines = lines[:ins] + guard + lines[ins:]
     write(path, s[:a] + '\n'.join(lines) + s[b:])
     return 'inserted at the show_smaps_rollup() loop head'
 
