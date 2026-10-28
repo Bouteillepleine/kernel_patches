@@ -455,6 +455,15 @@ verify_hook() {
     has "$KSU_FOLDER/kernel/selinux/rules.c" 'selnl_notify_policyload' \
         "_hook: selnl_notify_policyload was removed -- see README, gating it is a documented bootloop risk"
 
+    # Gated exactly as the apply is: only KernelSU-Next ships avc_spoof, so on
+    # SukiSU and BakaSU there is no file and nothing to assert. Where the file
+    # does exist the line must be gone, otherwise the kernel log narrates every
+    # spoofed denial.
+    if [ -f "$KSU_FOLDER/kernel/extras.c" ]; then
+        hasnt "$KSU_FOLDER/kernel/extras.c" 'replacing su_sid' \
+            "_hook: quiet_avc_spoof_log did not land -- avc_spoof still prints both SIDs to the kernel log on every spoofed denial, which dmesg_restrict=0 hands to any shell."
+    fi
+
     # equalise_setprocattr_timing.patch is also written against KernelSU's own
     # tree. The file is named differently per fork but present in all three
     # (KSUN, SukiSU-Ultra, BakaSU), and the function it patches is my_setprocattr
@@ -783,6 +792,20 @@ do_hook() {
     apply_or_die "$HOOK/mask_dirty_sepolicy_edges.patch"
     apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
     apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
+
+    # avc_spoof is KernelSU-Next's own. SukiSU-Ultra and BakaSU carry no
+    # kernel/extras.c and no slow_avc_audit hook at all, so there is nothing to
+    # quieten there. Probed on the tree, not on the fork name: a fork that gains
+    # the feature picks this up, and one that drops the line stops failing the
+    # build. Left in, avc_spoof prints a line naming both SIDs on every spoofed
+    # denial, which a dmesg_restrict=0 device hands to any shell -- a running
+    # commentary on the thing it exists to hide.
+    if [ -f "$KSU_FOLDER/kernel/extras.c" ] &&
+        grep -q 'replacing su_sid' "$KSU_FOLDER/kernel/extras.c"; then
+        apply_or_die "$HOOK/quiet_avc_spoof_log.patch" "$KSU_FOLDER"
+    else
+        echo "  skipped: quiet_avc_spoof_log.patch (this KSU has no avc_spoof log)"
+    fi
     verify_hook
     echo "::endgroup::"
 }

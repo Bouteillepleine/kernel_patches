@@ -1,0 +1,10 @@
+--- a/kernel/extras.c
++++ b/kernel/extras.c
+@@ -90,7 +90,6 @@
+ 	// if tsid is su, we just replace it
+ 	// unsure if its enough, but this is how it is aye?
+ 	if (*tsid == su_sid) {
+-		pr_info("avc_spoof/slow_avc_audit: replacing su_sid: %u with priv_app_sid: %u\n", su_sid, priv_app_sid);
+ 		*tsid = priv_app_sid;
+ 	}
+ 
