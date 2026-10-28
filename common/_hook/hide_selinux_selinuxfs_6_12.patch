@@ -1,6 +1,6 @@
 --- a/security/selinux/selinuxfs.c
 +++ b/security/selinux/selinuxfs.c
-@@ -608,6 +608,52 @@ static const struct file_operations sel_
+@@ -608,6 +608,62 @@ static const struct file_operations sel_
  	.llseek		= generic_file_llseek,
  };
  
@@ -19,20 +19,22 @@
 +}
 +
 +/* DirtySepolicy-style probes ask this interface about edges whose two ends
-+ * are both stock AOSP types, so sel_ctx_hidden() never sees them. Measured on
-+ * CPH2745: the one an app can reach is system_server:system_server:process
-+ * execmem, which ReZygisk's sepolicy.rule grants so LSPosed can hook
-+ * system_server. Duck Detector reads it back as "system_server can execmem"
-+ * and raises a DirtySepolicy anomaly, which is the whole finding.
++ * are both stock AOSP types, so sel_ctx_hidden() never sees them. Two are
++ * reachable from an app on this device, and Duck Detector names both:
 + *
-+ * This is the reporting interface, not the enforcement path: clearing the bit
-+ * changes what an app is told and nothing about what system_server may
-+ * actually do, so the capability LSPosed relies on is untouched. Removing the
-+ * rule instead would hide it from this probe too, at the cost of the
++ *   system_server:system_server:process execmem - ReZygisk's sepolicy.rule
++ *     grants it so LSPosed can hook system_server.
++ *   zygote:adb_data_file:dir search - "this should stay denied on stock
++ *     policy because zygote should not traverse adb data directories".
++ *
++ * This is the reporting interface, not the enforcement path: clearing a bit
++ * changes what an app is told and nothing about what the subject may actually
++ * do, so the capabilities the root stack relies on are untouched. Dropping the
++ * rules instead would hide them from this probe too, at the cost of the
 + * capability. The uid gate is the one sel_hidden_bytes() uses, so the system's
 + * own queries still get the true answer.
 + *
-+ * The match is exact rather than by type substring. If a future probe asks in
++ * Matches are exact rather than by type substring. If a future probe asks in
 + * another form the cloak simply does not apply, which leaves the finding
 + * visible - the safe direction. Matching loosely risks masking an edge a stock
 + * device really does allow, and an impossible answer is louder than a true one.
@@ -42,12 +44,20 @@
 +{
 +	if (__kuid_val(current_uid()) < 2000)
 +		return;
-+	if (tclass != SECCLASS_PROCESS)
++
++	if (tclass == SECCLASS_PROCESS &&
++	    !strcmp(scon, "u:r:system_server:s0") &&
++	    !strcmp(tcon, "u:r:system_server:s0")) {
++		avd->allowed &= ~PROCESS__EXECMEM;
 +		return;
-+	if (strcmp(scon, "u:r:system_server:s0") ||
-+	    strcmp(tcon, "u:r:system_server:s0"))
++	}
++
++	if (tclass == SECCLASS_DIR &&
++	    !strcmp(scon, "u:r:zygote:s0") &&
++	    !strcmp(tcon, "u:object_r:adb_data_file:s0")) {
++		avd->allowed &= ~DIR__SEARCH;
 +		return;
-+	avd->allowed &= ~PROCESS__EXECMEM;
++	}
 +}
 +
  static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
