@@ -61,7 +61,7 @@ index 18d6ada5..3248ad3e 100644
  #ifdef CONFIG_KSU_DEBUG
  	pr_alert("*************************************************************");
  	pr_alert("**     NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE    **");
-@@ -124,79 +95,40 @@ int __init kernelsu_init(void)
+@@ -124,79 +95,41 @@ int __init kernelsu_init(void)
  		return -ENOSYS;
  	}
  
@@ -101,6 +101,7 @@ index 18d6ada5..3248ad3e 100644
  
 -		ksu_syscall_hook_manager_init();
 +	ksu_setuid_hook_init();
++	ksu_avc_spoof_init();
  
 -		ksu_throne_tracker_init();
 -		ksu_observer_init();

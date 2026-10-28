@@ -69,7 +69,7 @@ index 9c1de34f..9eb7f333 100644
  	if (allow_shell) {
  		pr_alert("shell is allowed at init!");
  	}
-@@ -124,79 +97,40 @@ int __init kernelsu_init(void)
+@@ -124,79 +97,41 @@ int __init kernelsu_init(void)
  		return -ENOSYS;
  	}
  
@@ -109,6 +109,7 @@ index 9c1de34f..9eb7f333 100644
  
 -		ksu_syscall_hook_manager_init();
 +	ksu_setuid_hook_init();
++	ksu_avc_spoof_init();
  
 -		ksu_throne_tracker_init();
 -		ksu_observer_init();

@@ -45,7 +45,7 @@
  	if (allow_shell) {
  		pr_alert("shell is allowed at init!");
  	}
-@@ -112,77 +92,36 @@
+@@ -112,77 +92,37 @@
  		pr_err("prepare cred failed!\n");
  	}
  
@@ -83,6 +83,7 @@
  
 -		ksu_syscall_hook_manager_init();
 +    ksu_setuid_hook_init();
++    ksu_avc_spoof_init();
  
 -		ksu_throne_tracker_init();
 -		ksu_observer_init();
