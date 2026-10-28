@@ -57,12 +57,3 @@ diff --git a/kernel/Makefile b/kernel/Makefile
 -endif
 -
  # Keep a new line here!! Because someone may append config
-diff --git a/kernel/runtime/boot_event.c b/kernel/runtime/boot_event.c
---- a/kernel/runtime/boot_event.c
-+++ b/kernel/runtime/boot_event.c
-@@ -77,5 +77,4 @@
-     pr_info("on_boot_completed!\n");
-     track_throne(true);
-     ksu_selinux_hide_drop_backup_if_unused();
--    ksu_avc_spoof_late_init();
- }
