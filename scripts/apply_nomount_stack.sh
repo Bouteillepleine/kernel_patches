@@ -343,13 +343,46 @@ verify_hook() {
     local d="$COMMON_KERNEL_FOLDER"
     has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
     has "$d/security/selinux/selinuxfs.c" 'sel_hidden_bytes' "_hook: selinuxfs.c reply filter missing"
-    # The dirty-edge mask carries no type name of its own, so the hidden-type
-    # cross-check further down cannot see it, and the per-write-node loop only
-    # asserts sel_ctx_hidden(). Assert this call site directly: without it
-    # /sys/fs/selinux/access tells any app that system_server may execmem --
-    # the DirtySepolicy finding this closes -- and nothing else here would
-    # notice it had gone.
-    infn "$d/security/selinux/selinuxfs.c" '^static ssize_t sel_write_access' 'sel_mask_dirty_av'         "_hook: sel_write_access() no longer masks the dirty edges"
+    # The dirty-edge mask lives in security_compute_av_user() in ss/services.c,
+    # the only function that has the policy which answered the query. It carries
+    # no type name of its own, so the hidden-type cross-check further down cannot
+    # see it, and the per-write-node loop only asserts sel_ctx_hidden(). Assert
+    # it directly: without it /sys/fs/selinux/access tells any app that
+    # system_server may execmem on itself -- the DirtySepolicy anomaly this
+    # closes -- and nothing else here would notice it had gone.
+    local av_user av_user_code av_user_callers
+    av_user="$(awk '/^void security_compute_av_user/,/^}/' "$d/security/selinux/ss/services.c" 2>/dev/null || true)"
+    av_user_code="$(printf '%s\n' "$av_user" | grep -v '^[[:space:]]*\(/\*\|\*\)' || true)"
+    case "$av_user_code" in
+    *dirty_edges*) ;;
+    *) die "_hook: security_compute_av_user() no longer masks the dirty edges. /sys/fs/selinux/access is back to telling any app that system_server may execmem on itself, which is the DirtySepolicy anomaly this closes." ;;
+    esac
+
+    # The whole safety argument is that this mask cannot reach enforcement, and
+    # that rests on security_compute_av_user() having exactly ONE caller:
+    # sel_write_access(), the /sys/fs/selinux/access reporting node. Unlike
+    # security_compute_av() it neither unmaps the class nor calls map_decision(),
+    # so clearing a bit there changes only what a caller is told. A second caller
+    # turns the same code into a real denial, and nothing else here would catch
+    # that.
+    av_user_callers=$(grep -rl --include='*.c' 'security_compute_av_user(' "$d/security/selinux" 2>/dev/null | sed "s|^$d/security/selinux/||" | grep -v '^ss/services\.c$' | sort | tr '\n' ' ' || true)
+    [ "$av_user_callers" = "selinuxfs.c " ] ||
+        die "_hook: security_compute_av_user() is called from [$av_user_callers], not from selinuxfs.c alone. The dirty-edge mask is only safe while this function serves the reporting node and nothing else -- another caller makes it deny real accesses."
+
+    # Match by NAME, never by class index or a generated permission constant.
+    # The tclass reaching security_compute_av_user() is the POLICY class index,
+    # while SECCLASS_* are generated from classmap.h: on CPH2745 policy file=6
+    # against SECCLASS_FILE=7, because the policy has no process2 in third
+    # position. A SECCLASS_ comparison therefore masked process and dir by
+    # coincidence and silently never fired for file. avd->allowed carries policy
+    # permission bits for the same reason, so FILE__*/DIR__*/PROCESS__* are wrong
+    # here too. Both failures are invisible: it builds, boots, and hides two of
+    # the three edges. Comments are stripped above so the one explaining this
+    # trap does not trip it.
+    case "$av_user_code" in
+    *SECCLASS_* | *FILE__* | *DIR__* | *PROCESS__*)
+        die "_hook: security_compute_av_user() compares a kernel classmap.h constant against a POLICY index. Resolve the class, the two types and the permission by name through the policy that answered the query -- see the comment on the mask." ;;
+    esac
     has "$d/security/selinux/hooks.c" ':ksu:' "_hook: hooks.c attr guard missing"
     # Per function, not per file: a file-level ':ksu:' grep stayed green for as
     # long as 5.10/5.15/6.1 carried the setprocattr arm alone.
@@ -743,6 +776,11 @@ do_hook() {
         "$HOOK/hide_selinux_attr_6_12.patch" "$HOOK/hide_selinux_attr_6_6.patch"         "$HOOK/hide_selinux_attr_5_10.patch" "$HOOK/hide_selinux_attr.patch"
     apply_first_of avc-audit "$REQ_AUDIT" \
         "$HOOK/quiet_selinux_audit.patch" "$HOOK/quiet_selinux_audit_legacy.patch"
+    # One variant covers every version this family supports. It anchors on the
+    # tail of security_compute_av_user(), which is byte-identical from 5.10 to
+    # 6.12 -- only the function's signature differs across them, and that is not
+    # in the hunk.
+    apply_or_die "$HOOK/mask_dirty_sepolicy_edges.patch"
     apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
     apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
     verify_hook

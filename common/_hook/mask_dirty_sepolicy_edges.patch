@@ -1,0 +1,81 @@
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@ -1200,6 +1200,78 @@
+ 
+ 	context_struct_compute_av(policydb, scontext, tcontext, tclass, avd,
+ 				  NULL);
++
++	/* DirtySepolicy-style probes ask this interface about edges whose two
++	 * ends are both stock AOSP types, so sel_ctx_hidden() in selinuxfs.c
++	 * never sees them. Three are reachable from an app on CPH2745 and all
++	 * three are ours, granted by the sepolicy.rule files the module loader
++	 * and ReZygisk install - the first so LSPosed can hook system_server.
++	 * Duck Detector reads them back and raises a DirtySepolicy anomaly,
++	 * which is the whole finding.
++	 *
++	 * This is the reporting interface, not the enforcement path, and the
++	 * mask sits here rather than in sel_write_access() because this is the
++	 * only function that has the policy which answered the query. It has
++	 * exactly one caller, that same sel_write_access(), and unlike
++	 * security_compute_av() it neither unmaps the class nor calls
++	 * map_decision() - so clearing a bit changes what an app is told and
++	 * nothing about what any domain may actually do. The capability LSPosed
++	 * relies on is untouched. Dropping the rules instead would hide them
++	 * from this probe too, at the cost of the capability.
++	 *
++	 * Everything is matched by name against that policy. Comparing tclass
++	 * against SECCLASS_FILE and friends instead is a category error that
++	 * shipped once and looked like it worked: the tclass here is the POLICY
++	 * class index, while SECCLASS_* are generated from classmap.h, and on
++	 * this device policy file=6 against SECCLASS_FILE=7 because the policy
++	 * has no process2 in third position. process and dir happened to agree,
++	 * so two of the three masks fired and the file one silently never did.
++	 * avd->allowed carries policy permission bits for the same reason, so
++	 * the bit comes from the policy too, not a generated FILE__EXECUTE.
++	 *
++	 * A name this policy does not define leaves the mask a no-op, which
++	 * keeps the finding visible - the safe direction, because an impossible
++	 * answer is louder than a true one. The uid gate is the one
++	 * sel_hidden_bytes() uses, so the system's own queries still get the
++	 * real decision.
++	 */
++	if (__kuid_val(current_uid()) >= 2000 &&
++	    tclass <= policydb->p_classes.nprim &&
++	    scontext->type && scontext->type <= policydb->p_types.nprim &&
++	    tcontext->type && tcontext->type <= policydb->p_types.nprim) {
++		static const char *const dirty_edges[][4] = {
++			{ "system_server", "system_server", "process", "execmem" },
++			{ "zygote",        "adb_data_file", "dir",     "search"  },
++			{ "system_server", "apk_data_file", "file",    "execute" },
++		};
++		const char *cls, *stype, *ttype;
++		unsigned int i;
++
++		cls = sym_name(policydb, SYM_CLASSES, tclass - 1);
++		stype = sym_name(policydb, SYM_TYPES, scontext->type - 1);
++		ttype = sym_name(policydb, SYM_TYPES, tcontext->type - 1);
++
++		for (i = 0; i < ARRAY_SIZE(dirty_edges); i++) {
++			struct class_datum *cd;
++			struct perm_datum *pd;
++
++			if (strcmp(stype, dirty_edges[i][0]) ||
++			    strcmp(ttype, dirty_edges[i][1]) ||
++			    strcmp(cls, dirty_edges[i][2]))
++				continue;
++
++			cd = policydb->class_val_to_struct[tclass - 1];
++			if (!cd)
++				break;
++			pd = symtab_search(&cd->permissions, dirty_edges[i][3]);
++			if (!pd && cd->comdatum)
++				pd = symtab_search(&cd->comdatum->permissions,
++						   dirty_edges[i][3]);
++			if (pd && pd->value >= 1 && pd->value <= 32)
++				avd->allowed &= ~((u32)1 << (pd->value - 1));
++			break;
++		}
++	}
+  out:
+ 	rcu_read_unlock();
+ 	return;
