@@ -1,6 +1,6 @@
 --- a/security/selinux/selinuxfs.c
 +++ b/security/selinux/selinuxfs.c
-@@ -608,6 +608,62 @@ static const struct file_operations sel_
+@@ -608,6 +608,77 @@ static const struct file_operations sel_
  	.llseek		= generic_file_llseek,
  };
  
@@ -19,13 +19,17 @@
 +}
 +
 +/* DirtySepolicy-style probes ask this interface about edges whose two ends
-+ * are both stock AOSP types, so sel_ctx_hidden() never sees them. Two are
-+ * reachable from an app on this device, and Duck Detector names both:
++ * are both stock AOSP types, so sel_ctx_hidden() never sees them. Three are
++ * reachable from an app on this device. All three read DENIED on a kernel
++ * built without the root stack's module rules and ALLOWED with them, and Duck
++ * Detector lists exactly these three under "Trusted raw allows":
 + *
 + *   system_server:system_server:process execmem - ReZygisk's sepolicy.rule
 + *     grants it so LSPosed can hook system_server.
 + *   zygote:adb_data_file:dir search - "this should stay denied on stock
 + *     policy because zygote should not traverse adb data directories".
++ *   system_server:apk_data_file:file execute - what DirtySepolicy's own
++ *     heuristic reads as "found LSPosed".
 + *
 + * This is the reporting interface, not the enforcement path: clearing a bit
 + * changes what an app is told and nothing about what the subject may actually
@@ -38,6 +42,10 @@
 + * another form the cloak simply does not apply, which leaves the finding
 + * visible - the safe direction. Matching loosely risks masking an edge a stock
 + * device really does allow, and an impossible answer is louder than a true one.
++ * The five edges DD calls informational - rootfs:tmpfs associate, kernel:tmpfs
++ * fifo open, kernel:adb_data_file read, dex2oat:dex2oat_exec execute_no_trans
++ * and shell:su transition - are deliberately left alone: it says of each that
++ * "an allowed edge alone cannot identify its origin".
 + */
 +static void sel_mask_dirty_av(const char *scon, const char *tcon, u16 tclass,
 +				      struct av_decision *avd)
@@ -56,6 +64,13 @@
 +	    !strcmp(scon, "u:r:zygote:s0") &&
 +	    !strcmp(tcon, "u:object_r:adb_data_file:s0")) {
 +		avd->allowed &= ~DIR__SEARCH;
++		return;
++	}
++
++	if (tclass == SECCLASS_FILE &&
++	    !strcmp(scon, "u:r:system_server:s0") &&
++	    !strcmp(tcon, "u:object_r:apk_data_file:s0")) {
++		avd->allowed &= ~FILE__EXECUTE;
 +		return;
 +	}
 +}
