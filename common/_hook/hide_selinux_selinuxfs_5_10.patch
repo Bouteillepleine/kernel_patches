@@ -1,6 +1,6 @@
 --- a/security/selinux/selinuxfs.c
 +++ b/security/selinux/selinuxfs.c
-@@ -674,6 +674,20 @@ static const struct file_operations sel_
+@@ -674,6 +674,52 @@ static const struct file_operations sel_
  	.llseek		= generic_file_llseek,
  };
  
@@ -16,6 +16,38 @@
 +static bool sel_ctx_hidden(const char *ctx)
 +{
 +	return ctx && sel_hidden_bytes(ctx, strlen(ctx));
++}
++
++/* DirtySepolicy-style probes ask this interface about edges whose two ends
++ * are both stock AOSP types, so sel_ctx_hidden() never sees them. Measured on
++ * CPH2745: the one an app can reach is system_server:system_server:process
++ * execmem, which ReZygisk's sepolicy.rule grants so LSPosed can hook
++ * system_server. Duck Detector reads it back as "system_server can execmem"
++ * and raises a DirtySepolicy anomaly, which is the whole finding.
++ *
++ * This is the reporting interface, not the enforcement path: clearing the bit
++ * changes what an app is told and nothing about what system_server may
++ * actually do, so the capability LSPosed relies on is untouched. Removing the
++ * rule instead would hide it from this probe too, at the cost of the
++ * capability. The uid gate is the one sel_hidden_bytes() uses, so the system's
++ * own queries still get the true answer.
++ *
++ * The match is exact rather than by type substring. If a future probe asks in
++ * another form the cloak simply does not apply, which leaves the finding
++ * visible - the safe direction. Matching loosely risks masking an edge a stock
++ * device really does allow, and an impossible answer is louder than a true one.
++ */
++static void sel_mask_dirty_av(const char *scon, const char *tcon, u16 tclass,
++				      struct av_decision *avd)
++{
++	if (__kuid_val(current_uid()) < 2000)
++		return;
++	if (tclass != SECCLASS_PROCESS)
++		return;
++	if (strcmp(scon, "u:r:system_server:s0") ||
++	    strcmp(tcon, "u:r:system_server:s0"))
++		return;
++	avd->allowed &= ~PROCESS__EXECMEM;
 +}
 +
  static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
@@ -63,6 +95,14 @@
  	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
  	if (length)
  		goto out;
+@@ -960,5 +1000,7 @@ static ssize_t sel_write_access(struct f
+ 	security_compute_av_user(state, ssid, tsid, tclass, &avd);
+ 
++	sel_mask_dirty_av(scon, tcon, tclass, &avd);
++
+ 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
+ 			  "%x %x %x %x %u %x",
+ 			  avd.allowed, 0xffffffff,
 @@ -993,6 +1021,10 @@ static ssize_t sel_write_create(struct f
  	nargs = sscanf(buf, "%s %s %hu %s", scon, tcon, &tclass, namebuf);
  	if (nargs < 3 || nargs > 4)

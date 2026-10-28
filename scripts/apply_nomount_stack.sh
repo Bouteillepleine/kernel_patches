@@ -343,6 +343,13 @@ verify_hook() {
     local d="$COMMON_KERNEL_FOLDER"
     has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
     has "$d/security/selinux/selinuxfs.c" 'sel_hidden_bytes' "_hook: selinuxfs.c reply filter missing"
+    # The dirty-edge mask carries no type name of its own, so the hidden-type
+    # cross-check further down cannot see it, and the per-write-node loop only
+    # asserts sel_ctx_hidden(). Assert this call site directly: without it
+    # /sys/fs/selinux/access tells any app that system_server may execmem --
+    # the DirtySepolicy finding this closes -- and nothing else here would
+    # notice it had gone.
+    infn "$d/security/selinux/selinuxfs.c" '^static ssize_t sel_write_access' 'sel_mask_dirty_av'         "_hook: sel_write_access() no longer masks the dirty edges"
     has "$d/security/selinux/hooks.c" ':ksu:' "_hook: hooks.c attr guard missing"
     # Per function, not per file: a file-level ':ksu:' grep stayed green for as
     # long as 5.10/5.15/6.1 carried the setprocattr arm alone.
