@@ -10,7 +10,7 @@ index 18d6ada5..3248ad3e 100644
  
  #include "policy/allowlist.h"
  #include "policy/app_profile.h"
-@@ -18,19 +19,11 @@
+@@ -18,19 +19,12 @@
  #include "ksu.h"
  #include "infra/file_wrapper.h"
  #include "selinux/selinux.h"
@@ -28,6 +28,7 @@ index 18d6ada5..3248ad3e 100644
 -#endif
 -#endif
 +#include "hook/setuid_hook.h"
++#include "hook/syscall_hook_manager.h"
 +#include "feature/sucompat.h"
  
  // workaround for A12-5.10 kernel

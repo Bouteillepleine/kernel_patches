@@ -1,10 +1,11 @@
 --- a/kernel/core/init.c
 +++ b/kernel/core/init.c
-@@ -5,6 +5,7 @@
+@@ -5,6 +5,8 @@
  #include <linux/rcupdate.h>
  #include <linux/sched.h>
  #include <linux/workqueue.h>
 +#include <linux/susfs.h>
++#include "hook/syscall_hook_manager.h"
  
  #include "policy/allowlist.h"
  #include "policy/app_profile.h"

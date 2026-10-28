@@ -10,7 +10,7 @@ index 9c1de34f..9eb7f333 100644
  
  #include "policy/allowlist.h"
  #include "policy/app_profile.h"
-@@ -18,19 +19,12 @@
+@@ -18,19 +19,13 @@
  #include "ksu.h"
  #include "infra/file_wrapper.h"
  #include "selinux/selinux.h"
@@ -20,6 +20,7 @@ index 9c1de34f..9eb7f333 100644
  #include "feature/sulog.h"
 -#include "infra/symbol_resolver.h"
 +#include "hook/setuid_hook.h"
++#include "hook/syscall_hook_manager.h"
 +#include "feature/sucompat.h"
  
 -#if defined(__x86_64__)
