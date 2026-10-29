@@ -455,13 +455,20 @@ verify_hook() {
     has "$KSU_FOLDER/kernel/selinux/rules.c" 'selnl_notify_policyload' \
         "_hook: selnl_notify_policyload was removed -- see README, gating it is a documented bootloop risk"
 
-    # Gated exactly as the apply is: only KernelSU-Next ships avc_spoof, so on
-    # SukiSU and BakaSU there is no file and nothing to assert. Where the file
-    # does exist the line must be gone, otherwise the kernel log narrates every
-    # spoofed denial.
+    # Gated exactly as the apply is, once per implementation. A fork with neither
+    # file has nothing to assert; where a file exists its log line must be gone,
+    # otherwise the kernel narrates every spoofed denial. The SukiSU side also
+    # announces the resolved SIDs at init, so assert on the ksu one separately:
+    # it survives even if the per-denial line is dropped.
     if [ -f "$KSU_FOLDER/kernel/extras.c" ]; then
         hasnt "$KSU_FOLDER/kernel/extras.c" 'replacing su_sid' \
             "_hook: quiet_avc_spoof_log did not land -- avc_spoof still prints both SIDs to the kernel log on every spoofed denial, which dmesg_restrict=0 hands to any shell."
+    fi
+    if [ -f "$KSU_FOLDER/kernel/feature/avc_spoof.c" ]; then
+        hasnt "$KSU_FOLDER/kernel/feature/avc_spoof.c" 'replace tsid' \
+            "_hook: quiet_avc_spoof_log_sukisu did not land -- SukiSU avc_spoof still logs each spoofed tsid replacement, which dmesg_restrict=0 hands to any shell."
+        hasnt "$KSU_FOLDER/kernel/feature/avc_spoof.c" 'ksu SID: %u' \
+            "_hook: SukiSU avc_spoof still announces the resolved ksu SID at init, which names the very context the cloak exists to hide."
     fi
 
     # equalise_setprocattr_timing.patch is also written against KernelSU's own
@@ -793,18 +800,29 @@ do_hook() {
     apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
     apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
 
-    # avc_spoof is KernelSU-Next's own. SukiSU-Ultra and BakaSU carry no
-    # kernel/extras.c and no slow_avc_audit hook at all, so there is nothing to
-    # quieten there. Probed on the tree, not on the fork name: a fork that gains
-    # the feature picks this up, and one that drops the line stops failing the
-    # build. Left in, avc_spoof prints a line naming both SIDs on every spoofed
-    # denial, which a dmesg_restrict=0 device hands to any shell -- a running
-    # commentary on the thing it exists to hide.
+    # avc_spoof now exists in two shapes, so probe for each rather than assuming
+    # one fork owns it. KernelSU-Next keeps it in kernel/extras.c and logs
+    # 'replacing su_sid'. SukiSU-Ultra grew its own in kernel/feature/avc_spoof.c
+    # as of v4.2.1-r2, logging 'replace tsid' on every spoofed denial plus the
+    # resolved su/ksu/priv_app SIDs at init -- the ksu one being the worst of the
+    # three, since it names the context the cloak exists to hide. Probed on the
+    # tree, not on the fork name: a fork that gains the feature picks this up, and
+    # one that drops the line stops failing the build. Left in, either of these
+    # hands a dmesg_restrict=0 device's shell a running commentary on the thing
+    # avc_spoof exists to hide.
+    _avc_quieted=0
     if [ -f "$KSU_FOLDER/kernel/extras.c" ] &&
         grep -q 'replacing su_sid' "$KSU_FOLDER/kernel/extras.c"; then
         apply_or_die "$HOOK/quiet_avc_spoof_log.patch" "$KSU_FOLDER"
-    else
-        echo "  skipped: quiet_avc_spoof_log.patch (this KSU has no avc_spoof log)"
+        _avc_quieted=1
+    fi
+    if [ -f "$KSU_FOLDER/kernel/feature/avc_spoof.c" ] &&
+        grep -q 'replace tsid' "$KSU_FOLDER/kernel/feature/avc_spoof.c"; then
+        apply_or_die "$HOOK/quiet_avc_spoof_log_sukisu.patch" "$KSU_FOLDER"
+        _avc_quieted=1
+    fi
+    if [ "$_avc_quieted" != 1 ]; then
+        echo "  skipped: quiet_avc_spoof_log (this KSU has no avc_spoof log)"
     fi
     verify_hook
     echo "::endgroup::"

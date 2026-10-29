@@ -1,0 +1,33 @@
+--- a/kernel/feature/avc_spoof.c
++++ b/kernel/feature/avc_spoof.c
+@@ -52,7 +52,6 @@
+ #endif
+ 
+     if (*tsid == su_sid || *tsid == ksu_sid) {
+-        pr_info_ratelimited("avc_spoof: replace tsid %u with %u\n", *tsid, priv_app_sid);
+         *tsid = priv_app_sid;
+     }
+     return 0;
+@@ -99,14 +98,12 @@
+         pr_info("avc_spoof: su SID not found\n");
+         return ret;
+     }
+-    pr_info("avc_spoof: su SID: %u\n", su_sid);
+ 
+     ret = security_secctx_to_secid("u:r:ksu:s0", strlen("u:r:ksu:s0"), &ksu_sid);
+     if (ret) {
+         pr_info("avc_spoof: ksu SID not found\n");
+         return ret;
+     }
+-    pr_info("avc_spoof: ksu SID: %u\n", ksu_sid);
+ 
+     ret = security_secctx_to_secid("u:r:priv_app:s0:c512,c768",
+                                    strlen("u:r:priv_app:s0:c512,c768"),
+@@ -115,7 +112,6 @@
+         pr_info("avc_spoof: priv_app SID not found\n");
+         return ret;
+     }
+-    pr_info("avc_spoof: priv_app SID: %u\n", priv_app_sid);
+     return 0;
+ }
+ 
