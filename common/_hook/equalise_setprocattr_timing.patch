@@ -1,38 +1,23 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -249,6 +249,31 @@ static int __nocfi my_setprocattr(const
+@@ -249,6 +249,16 @@ static int __nocfi my_setprocattr(const
      if (error)
          return error;
  
 +    if (!(size && str[0] && str[0] != '\n')) {
-+        /*
-+         * Pay exactly what the taken branch pays: ONE parse of the same bytes.
-+         * A fixed probe repeated N times only balances against whatever the
-+         * parser cost when N was chosen -- SukiSU v4.3.0 collapsed the dual
-+         * walk into one and halved it, which flipped the A-B median positive.
-+         * The oracle feeds B as A with a leading newline, so str + 1 is A's
-+         * own payload: same length, same shape, same lookups, same failure
-+         * point. Self-cancelling whatever upstream does to the parser next.
-+         */
 +        static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
-+        const char *probe_ctx = ksu_probe_ctx;
-+        u32 probe_len = sizeof(ksu_probe_ctx) - 1;
 +        u32 probe_sid = 0, probe_tmp_sid = 0;
-+        int probe_rc = 0;
++        int probe_rc = 0, probe_i;
 +
-+        if (size > 1 && str[0] == '\n') {
-+            probe_ctx = str + 1;
-+            probe_len = size - 1;
-+        }
-+
-+        security_context_to_sid_with_policy(backup_sepolicy, probe_ctx, probe_len,
-+                                            &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
++        for (probe_i = 0; probe_i < 2; probe_i++)
++            security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
++                                                &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
 +    }
 +
      /* Obtain a SID for the context, if one was specified. */
      if (size && str[0] && str[0] != '\n') {
          if (str[size - 1] == '\n') {
-@@ -260,5 +285,9 @@ static int __nocfi my_setprocattr(const
+@@ -260,5 +270,9 @@ static int __nocfi my_setprocattr(const
 -        if (error2 || error)
 -            return error2 ?: error;
 +        if (error2 || error) {
