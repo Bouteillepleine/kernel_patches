@@ -256,26 +256,39 @@ ksu_seqno_form() { # ksu_seqno_form <rules.c>
     if grep -qF 'selinux_status_update_policyload' "$f"; then echo zero; else echo none; fi
 }
 
-# True while a SUSFS run is still going to rewrite KernelSU's rules.c, so the
-# seqno decision is not final yet.
+# Where the seqno decision records itself.
 #
 # susfs regenerates 10_enable_susfs_for_ksu.patch against official KernelSU and
-# REVERTS the generation tracking in that file: reset_avc_cache(u32 seqno) goes
-# back to reset_avc_cache(), the three calls go back to a literal 0, and BOTH
-# pol->latest_granting bumps are deleted. susfs is therefore the last writer of
-# rules.c on a SUSFS build, and it puts the policyload=0 tell back after _hook
-# has already run. Deciding at _hook time reads a tree that is about to change
-# under us -- measured 2026-11-01, when SukiSU adopting #3964 made susfs's own
-# hunks apply for the first time and the revert started taking effect.
+# REVERTS the generation tracking in kernel/selinux/rules.c: reset_avc_cache(u32
+# seqno) goes back to reset_avc_cache(), the calls go back to a literal 0, and
+# both pol->latest_granting bumps are deleted. susfs is therefore the last writer
+# of that file on a SUSFS build and puts the policyload=0 tell back after _hook
+# has run, so _hook defers the decision and the `seqno` step makes it afterwards.
 #
-# Probed on the tree, via the susfs_set_batch_sid() call susfs's own rules.c hunk
-# adds (present on all five gki-* branches), and never on a step name: a builder
-# that reorders its steps still gets the right answer, and one that does not run
-# susfs at all is unaffected.
-susfs_pending() {
-    [ "${SUSFS_ON:-}" = true ] || return 1
-    [ -n "${KSU_FOLDER:-}" ] || return 1
-    ! grep -qF 'susfs_set_batch_sid' "$KSU_FOLDER/kernel/selinux/rules.c" 2>/dev/null
+# This used to be INFERRED from the tree, by grepping rules.c for the
+# susfs_set_batch_sid() call susfs's own hunk adds. That was wrong, and measured
+# wrong on 2026-11-01 against KernelSU-Next: susfs's call-site hunks reject on
+# that fork's context, so the marker never appears, the probe concluded "susfs has
+# not run yet" AFTER it had run, and `verify` reported success with both
+# selinux_status_update_policyload() calls still live. A marker that a single
+# rejected hunk can delete is not evidence about the step that carried it.
+#
+# So the state is written down instead, and assert-config refuses to end a build
+# that is still 'deferred'. A forgotten seqno step is then an error rather than a
+# silent pass, which is the only property that made deferring safe in the first
+# place.
+seqno_stamp() { printf '%s/.nomount_seqno_state' "${COMMON_KERNEL_FOLDER:-}"; }
+
+seqno_state() {
+    local f
+    f="$(seqno_stamp)"
+    if [ -f "$f" ]; then cat "$f"; else echo none; fi
+}
+
+seqno_mark() { # seqno_mark deferred|decided
+    [ -n "${COMMON_KERNEL_FOLDER:-}" ] ||
+        die "seqno: COMMON_KERNEL_FOLDER is not set, so the '$1' state cannot be recorded -- and an unrecorded deferral is how the policyload=0 tell ships unasserted"
+    printf '%s\n' "$1" >"$(seqno_stamp)"
 }
 
 objy() { # objy <makefile> <object> <what>
@@ -505,8 +518,8 @@ verify_hook() {
     # still writes policyload=0. The post-SUSFS verify is unconditional, so a
     # builder that never runs the seqno step fails there rather than silently
     # shipping the tell.
-    if susfs_pending; then
-        echo "  _hook: fix_selinux_seqno deferred -- SUSFS has not rewritten rules.c yet"
+    if [ "$(seqno_state)" = deferred ]; then
+        echo "  _hook: fix_selinux_seqno deferred to the seqno step -- assert-config will not let the build end without it"
     else
         verify_seqno
     fi
@@ -847,7 +860,7 @@ verify_seqno() {
 }
 
 do_seqno() {
-    need BOUTEILLE_KERNEL_PATCHES_FOLDER KSU_FOLDER
+    need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER KSU_FOLDER
     echo "::group::Apply fix_selinux_seqno (after SUSFS)"
     local HOOK="$BOUTEILLE_KERNEL_PATCHES_FOLDER/common/_hook"
     normalise "$HOOK/fix_selinux_seqno.patch"
@@ -855,6 +868,7 @@ do_seqno() {
         die "seqno: $KSU_FOLDER/kernel/selinux/rules.c does not exist"
     seqno_apply "$HOOK"
     verify_seqno
+    seqno_mark decided
     echo "::endgroup::"
 }
 
@@ -908,7 +922,8 @@ do_hook() {
     # 6.12 -- only the function's signature differs across them, and that is not
     # in the hunk.
     apply_or_die "$HOOK/mask_dirty_sepolicy_edges.patch"
-    if susfs_pending; then
+    if [ "${SUSFS_ON:-}" = true ]; then
+        seqno_mark deferred
         echo "  deferred: fix_selinux_seqno (SUSFS rewrites rules.c; the seqno step owns it afterwards)"
     else
         seqno_apply "$HOOK"
@@ -1218,7 +1233,7 @@ hook)
     do_hook
     ;;
 seqno)
-    need BOUTEILLE_KERNEL_PATCHES_FOLDER KSU_FOLDER
+    need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER KSU_FOLDER
     do_seqno
     ;;
 # Read-only, and the reason the CI job that measures the patch's fit against every
@@ -1244,6 +1259,11 @@ verify)
     ;;
 assert-config)
     need COMMON_KERNEL_FOLDER
+    # Before the config assertions, because this one says the build is INCOMPLETE
+    # rather than misconfigured, and it is the last place anything checks.
+    if [ "$(seqno_state)" = deferred ]; then
+        die "the _hook step deferred fix_selinux_seqno to the post-SUSFS seqno step, and that step never ran: KernelSU still writes policyload=0 to /sys/fs/selinux/status and nothing asserted otherwise. Add 'apply_nomount_stack.sh seqno' after the SUSFS enable patch."
+    fi
     CONFIG_STRICT=1
     assert_config CONFIG_NOMOUNT "the engine is behind CONFIG_NOMOUNT; without it fs/nomount.o is not built at all"
     assert_config CONFIG_SECURITY_SELINUX "every _hook guard is compiled only under CONFIG_SECURITY_SELINUX"
