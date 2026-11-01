@@ -1,0 +1,4 @@
+# Python bytecode from scripts/ (susfs_patch_surgery.py, assert_guard_sites.py).
+# A `git add -A` sweeps these in otherwise -- it has happened.
+__pycache__/
+*.py[cod]

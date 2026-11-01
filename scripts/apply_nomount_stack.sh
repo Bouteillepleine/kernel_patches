@@ -848,6 +848,14 @@ verify_seqno() {
     local f="$KSU_FOLDER/kernel/selinux/rules.c"
     case "$(ksu_seqno_form "$f")" in
     upstream)
+        # The classifier reads the signature and the two bumps, so a hardcoded
+        # zero left ANYWHERE else in this file would pass unseen -- and that call
+        # writes policyload=0 to /sys/fs/selinux/status whatever the seqno
+        # plumbing around it says. Assert the tell's absence, not the shape.
+        hasnt "$f" 'selinux_status_update_policyload(0)' \
+            "_hook: this KSU threads the real policy generation, yet a hardcoded selinux_status_update_policyload(0) remains in rules.c -- that call still publishes policyload=0 to /sys/fs/selinux/status"
+        hasnt "$f" 'selinux_status_update_policyload(&selinux_state, 0)' \
+            "_hook: this KSU threads the real policy generation, yet a hardcoded selinux_status_update_policyload(&selinux_state, 0) remains in rules.c (pre-6.4 form) -- that call still publishes policyload=0"
         echo "  _hook: fix_selinux_seqno not needed -- this KSU writes the true policy generation"
         ;;
     *)
