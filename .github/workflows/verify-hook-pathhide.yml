@@ -629,10 +629,9 @@ jobs:
       CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
       # Every KSU fork the builder fleet ships, not just one.
       #
-      # This used to hardcode KernelSU-Next, which meant the fork that
-      # OnePlus-ReSukiSu_NMS actually builds (ReSukiSU) was never verified and
-      # SukiSU-Ultra never was either. Measured 2026-08-25, fix_selinux_seqno.patch
-      # against each fork's rules.c:
+      # This used to hardcode KernelSU-Next, which meant two of the three forks the
+      # fleet shipped were never verified. Measured 2026-08-25,
+      # fix_selinux_seqno.patch against each fork's rules.c:
       #     ReSukiSU/ReSukiSU@main            -F0 clean
       #     KernelSU-Next/KernelSU-Next@next  -F0 FAILS, applies at fuzz 1
       #     SukiSU-Ultra/SukiSU-Ultra@main    -F0 FAILS, applies at fuzz 1
@@ -641,17 +640,20 @@ jobs:
       # to have warned first. The apply step below records the fit per fork and
       # says "fuzz" out loud instead of letting it pass as clean.
       #
-      # Baka-SU/BakaSU added 2026-11-01: it is what OnePlus-ReSukiSu_NMS AND
-      # OnePlus-BakaSu_NMS actually build (both default to BAKASU hash=main), and
-      # it was the one shipped fork this job did not cover. ReSukiSU/ReSukiSU is
-      # kept for now even though no builder resolves it any more -- it is a real
-      # measurement of a real tree, just not one that ships.
-      # Measured on add: BakaSU@main is the pre-#3964 shape and takes the patch
-      # -F0 clean, 2 deletions, selnl_notify retained.
+      # Rebuilt 2026-11-01 to track what the builders RESOLVE, not what they were
+      # once pointed at:
+      #   + Baka-SU/BakaSU@main   OnePlus-ReSukiSu_NMS and OnePlus-BakaSu_NMS both
+      #                           default to BAKASU hash=main. It was the one
+      #                           shipped fork this job did not cover. Measured on
+      #                           add: pre-#3964 shape, -F0 clean, 2 deletions,
+      #                           selnl_notify retained.
+      #   - ReSukiSU/ReSukiSU     dropped: no builder resolves it any more, so a
+      #                           green row here said nothing about any shipped
+      #                           kernel while costing a clone per KMI. Its last
+      #                           measurement (2026-11-01) was -F0 clean.
       #
       # dir|owner/repo|ref  -- dir is where it is cloned inside $KDIR.
       KSU_FORKS: |
-        ReSukiSU|ReSukiSU/ReSukiSU|main
         BakaSU|Baka-SU/BakaSU|main
         KernelSU-Next|KernelSU-Next/KernelSU-Next|dev
         SukiSU-Ultra|SukiSU-Ultra/SukiSU-Ultra|main
