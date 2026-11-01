@@ -641,9 +641,18 @@ jobs:
       # to have warned first. The apply step below records the fit per fork and
       # says "fuzz" out loud instead of letting it pass as clean.
       #
+      # Baka-SU/BakaSU added 2026-11-01: it is what OnePlus-ReSukiSu_NMS AND
+      # OnePlus-BakaSu_NMS actually build (both default to BAKASU hash=main), and
+      # it was the one shipped fork this job did not cover. ReSukiSU/ReSukiSU is
+      # kept for now even though no builder resolves it any more -- it is a real
+      # measurement of a real tree, just not one that ships.
+      # Measured on add: BakaSU@main is the pre-#3964 shape and takes the patch
+      # -F0 clean, 2 deletions, selnl_notify retained.
+      #
       # dir|owner/repo|ref  -- dir is where it is cloned inside $KDIR.
       KSU_FORKS: |
         ReSukiSU|ReSukiSU/ReSukiSU|main
+        BakaSU|Baka-SU/BakaSU|main
         KernelSU-Next|KernelSU-Next/KernelSU-Next|dev
         SukiSU-Ultra|SukiSU-Ultra/SukiSU-Ultra|main
     strategy:
