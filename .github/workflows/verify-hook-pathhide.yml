@@ -773,6 +773,47 @@ jobs:
               printf '%s|%s@%s|MISSING|rules.c not at kernel/selinux/rules.c\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
               BAD=1; echo "::endgroup::"; continue
             fi
+            # Which shape the fork is in, asked of the same classifier the builders
+            # use -- not a second copy of the greps here.
+            #
+            # A fork that took tiann/KernelSU#3964 threads the real policy
+            # generation through reset_avc_cache() and bumps pol->latest_granting
+            # at both call sites. The policyload=0 tell is gone without us, this
+            # patch cannot apply there, and demanding that it does is how this job
+            # went red on 2026-11-01 for five KMIs at once.
+            #
+            # NOTE this says nothing about a SUSFS build. susfs regenerates its
+            # enable-patch against official KernelSU and REVERTS that tracking in
+            # rules.c, so on a SUSFS build the tree lands back in the `zero` shape
+            # and the patch is applied after susfs runs, by the stack script's
+            # `seqno` step. `notneeded` here means "this fork's own tree is clean",
+            # never "the cloak is inactive on builds from it".
+            form=$( bash "$GITHUB_WORKSPACE/scripts/apply_nomount_stack.sh" seqno-form "$dir" )
+            echo "shape: $form"
+            case "$form" in
+              upstream)
+                # Assert the thing that makes it unnecessary, rather than taking the
+                # word of a grep that could pass on a half-reverted tree.
+                if ( cd "$dir" && patch -p1 --dry-run < "$P/_hook/fix_selinux_seqno.patch" >/dev/null 2>&1 ); then
+                  echo "::error::$repo@$ref: classified upstream (#3964) yet fix_selinux_seqno.patch still applies - the classifier and the patch disagree, so one of them is wrong"
+                  printf '%s|%s@%s|SHAPE|upstream but patch still applies\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+                  BAD=1; echo "::endgroup::"; continue
+                fi
+                if ! grep -q selnl_notify_policyload "$dir/kernel/selinux/rules.c"; then
+                  echo "::error::$repo@$ref: selnl_notify_policyload absent (bootloop risk)"
+                  printf '%s|%s@%s|POSTCOND|selnl_notify_policyload absent\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+                  BAD=1; echo "::endgroup::"; continue
+                fi
+                echo "seqno: fork threads the real policy generation itself - patch not needed"
+                printf '%s|%s@%s|notneeded|#3964: generation threaded, both call sites bumped\n' "$dir" "$repo" "$ref" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+                echo "::endgroup::"; continue
+                ;;
+              split:*)
+                echo "::error::$repo@$ref: #3964 signature but pol->latest_granting bumped at ${form#split:} of 2 call sites - one of apply_kernelsu_rules()/handle_sepolicy() still writes a stale generation"
+                printf '%s|%s@%s|SPLIT|%s of 2 call sites bumped\n' "$dir" "$repo" "$ref" "${form#split:}" >> "$GITHUB_WORKSPACE/seqno-fit.txt"
+                BAD=1; echo "::endgroup::"; continue
+                ;;
+            esac
             # Fit, measured honestly. -F0 is what "clean" means: every context line
             # matched. Anything that needs the default fuzz has had context ignored
             # to place the hunk, and _pathhide/README.md already records that a

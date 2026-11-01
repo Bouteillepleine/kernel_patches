@@ -56,7 +56,8 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <all|hookless|record-version|hook|pathhide|ghost|assert-config>" >&2
+    echo "usage: $0 <all|hookless|record-version|hook|seqno|pathhide|ghost|assert-config>" >&2
+    echo "       $0 seqno-form <KernelSU tree>   (prints zero|upstream|split:N|none|missing)" >&2
     echo "       $0 verify [hookless] [hook] [pathhide] [ghost]   (default: all four)" >&2
     exit 2
 }
@@ -253,6 +254,28 @@ ksu_seqno_form() { # ksu_seqno_form <rules.c>
         return 0
     fi
     if grep -qF 'selinux_status_update_policyload' "$f"; then echo zero; else echo none; fi
+}
+
+# True while a SUSFS run is still going to rewrite KernelSU's rules.c, so the
+# seqno decision is not final yet.
+#
+# susfs regenerates 10_enable_susfs_for_ksu.patch against official KernelSU and
+# REVERTS the generation tracking in that file: reset_avc_cache(u32 seqno) goes
+# back to reset_avc_cache(), the three calls go back to a literal 0, and BOTH
+# pol->latest_granting bumps are deleted. susfs is therefore the last writer of
+# rules.c on a SUSFS build, and it puts the policyload=0 tell back after _hook
+# has already run. Deciding at _hook time reads a tree that is about to change
+# under us -- measured 2026-11-01, when SukiSU adopting #3964 made susfs's own
+# hunks apply for the first time and the revert started taking effect.
+#
+# Probed on the tree, via the susfs_set_batch_sid() call susfs's own rules.c hunk
+# adds (present on all five gki-* branches), and never on a step name: a builder
+# that reorders its steps still gets the right answer, and one that does not run
+# susfs at all is unaffected.
+susfs_pending() {
+    [ "${SUSFS_ON:-}" = true ] || return 1
+    [ -n "${KSU_FOLDER:-}" ] || return 1
+    ! grep -qF 'susfs_set_batch_sid' "$KSU_FOLDER/kernel/selinux/rules.c" 2>/dev/null
 }
 
 objy() { # objy <makefile> <object> <what>
@@ -477,22 +500,16 @@ verify_hook() {
         die "_hook: KSU_FOLDER is not set, so fix_selinux_seqno cannot be verified. Set it -- otherwise the policyload=0 tell goes unchecked and this function reports success anyway."
     [ -f "$KSU_FOLDER/kernel/selinux/rules.c" ] ||
         die "_hook: $KSU_FOLDER/kernel/selinux/rules.c does not exist. If this KernelSU fork keeps rules.c elsewhere, fix_selinux_seqno.patch did not land and /sys/fs/selinux/status still reports policyload=0."
-    # Two end states are acceptable and nothing else is: either the status update
-    # is gone (our patch landed) or #3964 threads the real generation and bumps it
-    # at both call sites (the fork closed it itself). Asserting only the first
-    # would fail every post-#3964 fork; asserting neither would let a tree through
-    # that still writes policyload=0.
-    case "$(ksu_seqno_form "$KSU_FOLDER/kernel/selinux/rules.c")" in
-    upstream)
-        echo "  _hook: fix_selinux_seqno not needed -- this KSU writes the true policy generation"
-        ;;
-    *)
-        hasnt "$KSU_FOLDER/kernel/selinux/rules.c" 'selinux_status_update_policyload' \
-            "_hook: fix_selinux_seqno did not land -- KSU still writes policyload=0 to /sys/fs/selinux/status"
-        ;;
-    esac
-    has "$KSU_FOLDER/kernel/selinux/rules.c" 'selnl_notify_policyload' \
-        "_hook: selnl_notify_policyload was removed -- see README, gating it is a documented bootloop risk"
+    # Deferred while SUSFS still has rules.c to rewrite -- asserting here would
+    # fail a correct build, and asserting nothing would let a tree through that
+    # still writes policyload=0. The post-SUSFS verify is unconditional, so a
+    # builder that never runs the seqno step fails there rather than silently
+    # shipping the tell.
+    if susfs_pending; then
+        echo "  _hook: fix_selinux_seqno deferred -- SUSFS has not rewritten rules.c yet"
+    else
+        verify_seqno
+    fi
 
     # Gated exactly as the apply is, once per implementation. A fork with neither
     # file has nothing to assert; where a file exists its log line must be gone,
@@ -786,6 +803,61 @@ do_record_version() {
     echo "NoMount version: ${NMVER:-unknown}"
 }
 
+# Apply, skip or refuse fix_selinux_seqno.patch on $KSU_FOLDER, by the shape the
+# tree is actually in.
+#
+# On a tree that carries tiann/KernelSU#3964 the patch is not redundant but
+# actively harmful: deleting the status update there leaves
+# selnl_notify_policyload(seqno) announcing generation N while the status page
+# stays at N-1, which is the very split this family exists to avoid. The old code
+# was safe to cut only because every call passed a literal 0, so nothing moved.
+seqno_apply() { # seqno_apply <_hook dir>
+    local HOOK="$1" f="$KSU_FOLDER/kernel/selinux/rules.c" form
+    form="$(ksu_seqno_form "$f")"
+    case "$form" in
+    upstream)
+        echo "  skipped: fix_selinux_seqno (this KSU threads the real policy generation itself)"
+        ;;
+    split:*)
+        die "fix_selinux_seqno: this KSU has reset_avc_cache(u32 seqno) but bumps pol->latest_granting at ${form#split:} of the 2 call sites, so one of apply_kernelsu_rules()/handle_sepolicy() still writes a stale generation to /sys/fs/selinux/status. Neither this patch nor skipping it is right -- fix the fork."
+        ;;
+    *)
+        apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
+        ;;
+    esac
+}
+
+# The post-condition, asserted wherever the decision has been made: the
+# policyload=0 tell is gone, by our deletion or by the fork's own fix, and
+# selnl_notify_policyload survived either way (gating it is a documented
+# bootloop risk -- see README).
+verify_seqno() {
+    local f="$KSU_FOLDER/kernel/selinux/rules.c"
+    case "$(ksu_seqno_form "$f")" in
+    upstream)
+        echo "  _hook: fix_selinux_seqno not needed -- this KSU writes the true policy generation"
+        ;;
+    *)
+        hasnt "$f" 'selinux_status_update_policyload' \
+            "_hook: fix_selinux_seqno did not land -- KSU still writes policyload=0 to /sys/fs/selinux/status"
+        ;;
+    esac
+    has "$f" 'selnl_notify_policyload' \
+        "_hook: selnl_notify_policyload was removed -- see README, gating it is a documented bootloop risk"
+}
+
+do_seqno() {
+    need BOUTEILLE_KERNEL_PATCHES_FOLDER KSU_FOLDER
+    echo "::group::Apply fix_selinux_seqno (after SUSFS)"
+    local HOOK="$BOUTEILLE_KERNEL_PATCHES_FOLDER/common/_hook"
+    normalise "$HOOK/fix_selinux_seqno.patch"
+    [ -f "$KSU_FOLDER/kernel/selinux/rules.c" ] ||
+        die "seqno: $KSU_FOLDER/kernel/selinux/rules.c does not exist"
+    seqno_apply "$HOOK"
+    verify_seqno
+    echo "::endgroup::"
+}
+
 do_hook() {
     need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER KSU_FOLDER
     echo "::group::Apply SELinux oracle (_hook) patches"
@@ -836,24 +908,11 @@ do_hook() {
     # 6.12 -- only the function's signature differs across them, and that is not
     # in the hunk.
     apply_or_die "$HOOK/mask_dirty_sepolicy_edges.patch"
-    # On a tree that carries tiann/KernelSU#3964 this patch is not redundant but
-    # actively harmful: deleting the status update there leaves
-    # selnl_notify_policyload(seqno) announcing generation N while the status page
-    # stays at N-1, which is the very split the family exists to avoid. The old
-    # code was safe to cut only because every call passed a literal 0, so nothing
-    # moved. Probed like the avc_spoof pair below -- forks took #3964 weeks apart
-    # and some have not taken it at all.
-    case "$(ksu_seqno_form "$KSU_FOLDER/kernel/selinux/rules.c")" in
-    upstream)
-        echo "  skipped: fix_selinux_seqno (this KSU threads the real policy generation itself)"
-        ;;
-    split:*)
-        die "fix_selinux_seqno: this KSU has reset_avc_cache(u32 seqno) but bumps pol->latest_granting at $(ksu_seqno_form "$KSU_FOLDER/kernel/selinux/rules.c" | cut -d: -f2) of the 2 call sites, so one of apply_kernelsu_rules()/handle_sepolicy() still writes a stale generation to /sys/fs/selinux/status. Neither this patch nor skipping it is right -- fix the fork."
-        ;;
-    *)
-        apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
-        ;;
-    esac
+    if susfs_pending; then
+        echo "  deferred: fix_selinux_seqno (SUSFS rewrites rules.c; the seqno step owns it afterwards)"
+    else
+        seqno_apply "$HOOK"
+    fi
     apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
 
     # avc_spoof now exists in two shapes, so probe for each rather than assuming
@@ -1157,6 +1216,16 @@ hook)
     need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER KSU_FOLDER
     resolve_kv
     do_hook
+    ;;
+seqno)
+    need BOUTEILLE_KERNEL_PATCHES_FOLDER KSU_FOLDER
+    do_seqno
+    ;;
+# Read-only, and the reason the CI job that measures the patch's fit against every
+# KSU fork does not carry its own copy of these greps: one classifier, one answer.
+seqno-form)
+    [ $# -ge 1 ] || die "seqno-form: pass the KernelSU tree root"
+    ksu_seqno_form "$1/kernel/selinux/rules.c"
     ;;
 pathhide)
     need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER
