@@ -228,6 +228,33 @@ hasnt() { # hasnt <file> <fixed-string>
     return 0
 }
 
+# Which shape KernelSU's own kernel/selinux/rules.c is in. The one _hook patch
+# that lives in the KSU tree rather than the kernel's turns on this, and the
+# answer differs per fork and per week, so read the tree and never the fork name.
+#
+#   zero     reset_avc_cache() passes a literal 0 to avc_ss_reset(),
+#            selnl_notify_policyload() and selinux_status_update_policyload().
+#            That 0 reaches /sys/fs/selinux/status as policyload=0, which is the
+#            tell fix_selinux_seqno.patch removes by dropping the status update.
+#   upstream tiann/KernelSU#3964 (SukiSU 85d05cf 2026-10-31, KernelSU-Next@dev):
+#            reset_avc_cache(u32 seqno) threads the real generation through all
+#            three, and BOTH call sites bump pol->latest_granting first. The tell
+#            is gone without us, and better -- the status page now carries the
+#            true next generation rather than nothing at all.
+#   split:N  the #3964 signature with N != 2 call sites bumped. Not a shape to
+#            patch around: the unbumped path still writes a stale generation, and
+#            which of apply_kernelsu_rules()/handle_sepolicy() is short matters.
+ksu_seqno_form() { # ksu_seqno_form <rules.c>
+    local f="$1" n
+    [ -f "$f" ] || { echo missing; return 0; }
+    if grep -qF 'reset_avc_cache(u32 seqno)' "$f"; then
+        n="$(grep -cF 'latest_granting = old_pol->latest_granting + 1' "$f")"
+        if [ "$n" = 2 ]; then echo upstream; else echo "split:$n"; fi
+        return 0
+    fi
+    if grep -qF 'selinux_status_update_policyload' "$f"; then echo zero; else echo none; fi
+}
+
 objy() { # objy <makefile> <object> <what>
     # Anchored, and the '.' is escaped: `make fs/proc/ghost.o` builds an object
     # that is not in obj-y at all, so "it compiled" proves nothing about whether
@@ -450,8 +477,20 @@ verify_hook() {
         die "_hook: KSU_FOLDER is not set, so fix_selinux_seqno cannot be verified. Set it -- otherwise the policyload=0 tell goes unchecked and this function reports success anyway."
     [ -f "$KSU_FOLDER/kernel/selinux/rules.c" ] ||
         die "_hook: $KSU_FOLDER/kernel/selinux/rules.c does not exist. If this KernelSU fork keeps rules.c elsewhere, fix_selinux_seqno.patch did not land and /sys/fs/selinux/status still reports policyload=0."
-    hasnt "$KSU_FOLDER/kernel/selinux/rules.c" 'selinux_status_update_policyload' \
-        "_hook: fix_selinux_seqno did not land -- KSU still writes policyload=0 to /sys/fs/selinux/status"
+    # Two end states are acceptable and nothing else is: either the status update
+    # is gone (our patch landed) or #3964 threads the real generation and bumps it
+    # at both call sites (the fork closed it itself). Asserting only the first
+    # would fail every post-#3964 fork; asserting neither would let a tree through
+    # that still writes policyload=0.
+    case "$(ksu_seqno_form "$KSU_FOLDER/kernel/selinux/rules.c")" in
+    upstream)
+        echo "  _hook: fix_selinux_seqno not needed -- this KSU writes the true policy generation"
+        ;;
+    *)
+        hasnt "$KSU_FOLDER/kernel/selinux/rules.c" 'selinux_status_update_policyload' \
+            "_hook: fix_selinux_seqno did not land -- KSU still writes policyload=0 to /sys/fs/selinux/status"
+        ;;
+    esac
     has "$KSU_FOLDER/kernel/selinux/rules.c" 'selnl_notify_policyload' \
         "_hook: selnl_notify_policyload was removed -- see README, gating it is a documented bootloop risk"
 
@@ -797,7 +836,24 @@ do_hook() {
     # 6.12 -- only the function's signature differs across them, and that is not
     # in the hunk.
     apply_or_die "$HOOK/mask_dirty_sepolicy_edges.patch"
-    apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
+    # On a tree that carries tiann/KernelSU#3964 this patch is not redundant but
+    # actively harmful: deleting the status update there leaves
+    # selnl_notify_policyload(seqno) announcing generation N while the status page
+    # stays at N-1, which is the very split the family exists to avoid. The old
+    # code was safe to cut only because every call passed a literal 0, so nothing
+    # moved. Probed like the avc_spoof pair below -- forks took #3964 weeks apart
+    # and some have not taken it at all.
+    case "$(ksu_seqno_form "$KSU_FOLDER/kernel/selinux/rules.c")" in
+    upstream)
+        echo "  skipped: fix_selinux_seqno (this KSU threads the real policy generation itself)"
+        ;;
+    split:*)
+        die "fix_selinux_seqno: this KSU has reset_avc_cache(u32 seqno) but bumps pol->latest_granting at $(ksu_seqno_form "$KSU_FOLDER/kernel/selinux/rules.c" | cut -d: -f2) of the 2 call sites, so one of apply_kernelsu_rules()/handle_sepolicy() still writes a stale generation to /sys/fs/selinux/status. Neither this patch nor skipping it is right -- fix the fork."
+        ;;
+    *)
+        apply_or_die "$HOOK/fix_selinux_seqno.patch" "$KSU_FOLDER"
+        ;;
+    esac
     apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
 
     # avc_spoof now exists in two shapes, so probe for each rather than assuming
