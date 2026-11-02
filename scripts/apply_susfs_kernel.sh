@@ -24,6 +24,14 @@
 # A reject the surgery cannot resolve is a HARD FAILURE. Half-applied hiding
 # compiles, boots, and lies about what it hides.
 #
+# A hunk that is MISSING from the patch rejects nothing and so passes every
+# check above. susfs regenerated the android16-6.12 patch against a mainline
+# rollup loop and lost its Case 4 sus_map guard that way; the build stayed
+# green and /proc/<pid>/smaps_rollup kept counting a hidden mapping on the
+# contended path. Those are REPAIRS in susfs_patch_surgery.py: unconditional,
+# printed as "repaired:", and each decides for itself whether this tree wants
+# it, so it stands down again when upstream ships the hunk.
+#
 # WHICH REJECTS ARE EXPECTED is recorded here, per KMI, and a reject that is
 # NOT on the list fails the build with the hunk printed. Without that the
 # surgery runs on hunks nobody has looked at, and an upstream susfs change

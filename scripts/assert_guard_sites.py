@@ -34,6 +34,7 @@ SITES = [
     ('fs/proc/task_mmu.c', 'show_map_vma', 'susfs_sus_kstat_spoof_show_map_vma'),
     ('fs/proc/task_mmu.c', 'show_smap', 'SUSFS_IS_INODE_SUS_MAP'),
     ('fs/proc/task_mmu.c', 'show_smaps_rollup', 'bypass_orig_flow'),
+    ('fs/proc/task_mmu.c', 'show_smaps_rollup', '!(SUSFS_IS_INODE_SUS_MAP('),
     ('fs/proc/base.c', 'proc_map_files_readdir', 'SUSFS_IS_INODE_SUS_MAP'),
     ('fs/namei.c', 'do_o_path', 'susfs_open_redirect_spoof_do_sys_openat'),
     ('fs/stat.c', 'vfs_statx', 'ksu_handle_stat'),

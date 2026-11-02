@@ -307,6 +307,66 @@ def insert_rollup_bypass(tree):
     return 'inserted after the declarations at the show_smaps_rollup() loop head'
 
 
+def guard_rollup_case4(tree):
+    """Guard the Case 4 gather in show_smaps_rollup() against sus_map.
+
+    susfs guards show_smaps_rollup() in two places: the loop head, handled by
+    insert_rollup_bypass(), and the Case 4 re-gather taken when the mmap lock
+    was contended and the vma grew past last_vma_end. Without the second one a
+    hidden mapping's pages still reach the rollup totals on the contended path,
+    while /proc/<pid>/smaps hides it -- a discrepancy an oracle can read.
+
+    This one is NOT reject-driven, because on android16-6.12 the hunk is not in
+    the patch at all to be rejected: susfs regenerated that patch against a
+    mainline-shaped rollup loop (`smap_gather_stats(priv, vma, &mss)`) and the
+    Case 4 hunk was dropped in the process. gki-android15-6.6 and
+    gki-android14-6.1 still carry it, so there it applies or rejects normally
+    and this is a no-op -- which is also what happens the day 6.12 gets it back.
+    """
+    path = tree + '/fs/proc/task_mmu.c'
+    s = read(path)
+    span = function_span(s, 'show_smaps_rollup')
+    if not span:
+        return None
+    a, b = span
+    lines = s[a:b].split('\n')
+    # No bypass label means susfs put no sus_map guard in this function at all
+    # -- SUS_MAP is off, or the hunks never arrived -- and a lone Case 4 guard
+    # would be a change susfs did not ask for.
+    if not any('bypass_orig_flow' in l for l in lines):
+        return None
+    # The negated form is what Case 4 uses; the loop-head guard is positive, so
+    # this does not mistake one for the other.
+    if any('!(SUSFS_IS_INODE_SUS_MAP(' in l for l in lines):
+        return 'already present'
+    hits = [i for i, l in enumerate(lines)
+            if re.match(r'^[ \t]+smap_gather_stats\(vma, &mss, last_vma_end\);$', l)]
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    ind = indent_of(lines[i])
+    # Only the braced shape, which is 6.6/6.12: `if (vma->vm_end > last_vma_end)
+    # {` with the gather and the last_vma_end update inside. 6.1 writes the if
+    # braceless and susfs adds the braces inside its own #ifdef; that tree gets
+    # the guard from the patch, so a braceless variant here would be code that
+    # never runs. Say so instead of guessing.
+    body = [lines[i]]
+    if i + 1 < len(lines) and lines[i + 1] == ind + 'last_vma_end = vma->vm_end;':
+        body.append(lines[i + 1])
+    if not lines[i - 1].rstrip().endswith('{') or len(body) != 2:
+        print('::warning::susfs surgery: show_smaps_rollup() Case 4 has an '
+              'unexpected shape, leaving it unguarded')
+        return None
+    block = [GUARD_MAP,
+             ind + 'if (!vma->vm_file || !(SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))) {'] \
+            + ['\t' + l for l in body] \
+            + [ind + '}',
+               '#else'] + body + [ENDIF_MAP]
+    lines = lines[:i] + block + lines[i + len(body):]
+    write(path, s[:a] + '\n'.join(lines) + s[b:])
+    return 'guarded the Case 4 gather in show_smaps_rollup()'
+
+
 def insert_top_declarations(tree, path, hunk):
     runs = added_runs(hunk)
     if not runs or has_deletions(hunk):
@@ -340,9 +400,17 @@ RULES = [
     ('fs/proc/task_mmu.c', 'SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;', insert_show_smap_guard),
     ('fs/proc/task_mmu.c', 'goto bypass_orig_flow;', insert_rollup_bypass),
     ('fs/proc/task_mmu.c', 'bypass_orig_flow:', insert_rollup_bypass),
+    ('fs/proc/task_mmu.c', '!(SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))', guard_rollup_case4),
     ('fs/proc/base.c', 'SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\tcontinue;',
      insert_map_files_readdir_skip),
 ]
+
+# Placements no reject can trigger, because the hunk is missing from the patch
+# rather than misplaced in it. They run on every build, after the rejects, and
+# each one decides for itself whether this tree wants it -- so a repair retires
+# itself the moment susfs ships the hunk again, and the RULES entry above takes
+# over if that hunk then rejects.
+REPAIRS = [guard_rollup_case4]
 
 WINDOW = 80
 
@@ -537,8 +605,16 @@ def main():
             done.append('%s hunk #%d -> [%s] %s' % (path, idx, how, note))
         sec[2] = keep
 
+    repaired = []
+    for fn in REPAIRS:
+        note = fn(tree)
+        if note is not None and note != 'already present':
+            repaired.append(note)
+
     for line in done:
         print('   reconciled: ' + line)
+    for line in repaired:
+        print('   repaired: ' + line)
     for line in failed:
         print('   UNRESOLVED: ' + line)
 
