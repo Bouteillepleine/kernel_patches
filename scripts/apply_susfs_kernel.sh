@@ -203,6 +203,10 @@ do_prepare() { # do_prepare <patch-to-reconcile>
 
     if ! patch -p1 -F0 --forward --dry-run < "$patch" >/dev/null 2>&1; then
         echo "::error::apply_susfs_kernel: the patch still rejects after reconciliation"
+        echo "The hunk numbers below are positions in the RECONCILED patch, not in"
+        echo "$(basename "$SRC_PATCH"): reconciliation drops hunks and that renumbers"
+        echo "the rest, so #N here is the Nth surviving hunk of that file. Count @@"
+        echo "headers in the original to find it."
         patch -p1 -F0 --forward --dry-run < "$patch" 2>&1 | grep -E '^(checking file|Hunk .*FAILED)' || true
         exit 1
     fi

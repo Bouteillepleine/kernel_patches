@@ -95,6 +95,20 @@ def has_deletions(hunk):
     return any(l.startswith('-') and l[1:].strip() for l in body_lines(hunk))
 
 
+def patch_supplies(sections, path, marker):
+    """True when a hunk still in the patch adds marker to path.
+
+    Read off the patch, never off the tree: this runs before the patch is
+    applied, so a hunk that is about to add marker has left no trace in the tree
+    yet. A hunk that survived the reject pass is going to apply, so anything
+    inserting the same lines now would leave it with nothing to apply.
+    """
+    for sec in sections:
+        if sec[1] == path and any(marker in added(h) for h in sec[2]):
+            return True
+    return False
+
+
 def read(path):
     return io.open(path, encoding='utf-8').read()
 
@@ -410,7 +424,19 @@ RULES = [
 # each one decides for itself whether this tree wants it -- so a repair retires
 # itself the moment susfs ships the hunk again, and the RULES entry above takes
 # over if that hunk then rejects.
-REPAIRS = [guard_rollup_case4]
+#
+# Carrying the marker is what makes "the moment susfs ships the hunk again"
+# detectable here rather than one dry-run too late. A repair whose hunk is still
+# in the patch must not run: that hunk applies afterwards. Letting each repair
+# decide from the tree alone failed every android15-6.6 leg of run 41484771860 --
+# the Case 4 hunk applies cleanly there, so no reject dropped it, and the repair
+# inserted the guard underneath it and left the hunk with nothing to apply. 6.12
+# was unaffected only because susfs regenerated that patch without the hunk.
+REPAIRS = [
+    ('fs/proc/task_mmu.c',
+     '!(SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))',
+     guard_rollup_case4),
+]
 
 WINDOW = 80
 
@@ -606,7 +632,9 @@ def main():
         sec[2] = keep
 
     repaired = []
-    for fn in REPAIRS:
+    for path, marker, fn in REPAIRS:
+        if patch_supplies(sections, path, marker):
+            continue
         note = fn(tree)
         if note is not None and note != 'already present':
             repaired.append(note)
