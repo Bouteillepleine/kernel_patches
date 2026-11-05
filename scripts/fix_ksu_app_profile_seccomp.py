@@ -1,40 +1,64 @@
 #!/usr/bin/env python3
-"""Keep an app's seccomp filter intact when app_profile grants it root.
+"""Keep an app's seccomp filter intact when KSU grants it root.
 
 usage: fix_ksu_app_profile_seccomp.py <ksu-dir>
 
-WHY THIS EXISTS. kernel/policy/app_profile.c calls disable_seccomp() straight
-after commit_creds(). That helper sets current->seccomp.mode = 0 and releases
-the filter outright, so every app that takes root through a profile reports
+MUST RUN AFTER the SUSFS enable patch and its fix set. SUSFS rewrites both files
+this touches, so running before it makes app_profile.c reject against
+10_enable_susfs_for_ksu.patch, which has no fix_app_profile.c.patch by design.
+
+WHY THIS EXISTS. An app granted root ends up with
 
     Seccomp:        0
 
-in /proc/self/status while all its siblings report 2. Android installs a filter
+in /proc/self/status while every sibling app reports 2. Android installs a filter
 on every app during zygote specialisation and offers no legitimate route back to
-mode 0, so that single field is a permissionless self-detection oracle --
-measured on an OP15 (CPH2747): 3 of 116 app processes at 0, and those 3 were
-exactly the root-using ones.
+mode 0, so that one field is a permissionless self-detection oracle -- measured on
+an OP15 (CPH2747): 3 of 116 app processes at 0, and those 3 were exactly the
+root-using ones.
 
-kernel/hook/setuid_hook.c already does the right thing on its own path: keep the
-filter and whitelist only the syscall su needs, through ksu_seccomp_allow_cache().
-This rewrites the app_profile call site to that same pattern, copied rather than
-invented, and drops the orphaned helper.
+WHO BREAKS IT. Upstream KernelSU-Next is fine: kernel/hook/setuid_hook.c keeps the
+filter and whitelists only the syscall su needs, via ksu_seccomp_allow_cache().
+The SUSFS enable patch *reverts* that -- it strips those calls, un-statics
+disable_seccomp() in kernel/policy/app_profile.c, declares it extern in
+setuid_hook.c, and plants five calls across the two files. Its only protection is
 
-Idempotent and self-retiring: a tree whose app_profile.c already calls
-ksu_seccomp_allow_cache() is left untouched, so this no-ops the day upstream
-fixes the ordering itself.
+    if (likely(test_thread_flag(TIF_SECCOMP)))
+        disable_seccomp();
+
+which is no protection at all: TIF_SECCOMP is set precisely *because* a filter
+exists, so the guard passes and the teardown proceeds. It merely skips a pointless
+call on unfiltered tasks.
+
+WHAT THIS DOES. Restores KSUN's own approach at all five sites, then removes the
+helper and its extern so nothing can reach it again. The replacement block is
+copied from upstream setuid_hook.c, not invented.
+
+Idempotent and self-retiring: a tree with no disable_seccomp() left is untouched,
+so this no-ops the day SUSFS stops reverting the fix.
 """
 import io
 import os
 import re
 import sys
 
-GUARD = """{i}if (current->seccomp.mode == SECCOMP_MODE_FILTER &&
+FILES = ("kernel/hook/setuid_hook.c", "kernel/policy/app_profile.c")
+INCLUDE = '#include "infra/seccomp_cache.h"\n'
+
+BLOCK = """{i}if (current->seccomp.mode == SECCOMP_MODE_FILTER &&
 {i}    current->seccomp.filter) {{
 {i}    spin_lock_irq(&current->sighand->siglock);
 {i}    ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
 {i}    spin_unlock_irq(&current->sighand->siglock);
 {i}}}"""
+
+# SUSFS's useless guard, which the replacement block supersedes.
+GUARDED = re.compile(
+    r"^([ \t]*)if \(likely\(test_thread_flag\(TIF_SECCOMP\)\)\)\n"
+    r"[ \t]*disable_seccomp\(\);[ \t]*$", re.M)
+BARE = re.compile(r"^([ \t]*)disable_seccomp\(\);[ \t]*$", re.M)
+EXTERN = re.compile(r"^extern void disable_seccomp\(void\);\n", re.M)
+DEFN = re.compile(r"^(?:static )?void disable_seccomp\(void\)\s*\n\{", re.M)
 
 
 def die(msg):
@@ -42,14 +66,14 @@ def die(msg):
     raise SystemExit(1)
 
 
-def drop_helper(text):
-    """Remove `static void disable_seccomp(void) { ... }` by brace matching."""
-    m = re.search(r"^static void disable_seccomp\(void\)\s*\n\{", text, re.M)
+def drop_defn(text):
+    """Remove the disable_seccomp() body by brace matching; static or not."""
+    m = DEFN.search(text)
     if not m:
         return text, False
-    i = text.index("{", m.start())
     depth = 0
-    for j in range(i, len(text)):
+    start = text.index("{", m.start())
+    for j in range(start, len(text)):
         if text[j] == "{":
             depth += 1
         elif text[j] == "}":
@@ -62,47 +86,56 @@ def drop_helper(text):
     die("could not brace-match the disable_seccomp() body")
 
 
+def ensure_include(text, path):
+    if INCLUDE in text:
+        return text
+    for anchor in ('#include "infra/symbol_resolver.h"\n',
+                   '#include "infra/ksu_hook.h"\n'):
+        if anchor in text:
+            return text.replace(anchor, anchor + INCLUDE, 1)
+    m = re.search(r"^#include [^\n]*\n", text, re.M)
+    if not m:
+        die("no #include to anchor seccomp_cache.h after, in %s" % path)
+    return text[:m.end()] + INCLUDE + text[m.end():]
+
+
 def main():
     if len(sys.argv) != 2:
         die("usage: fix_ksu_app_profile_seccomp.py <ksu-dir>")
-    target = os.path.join(sys.argv[1], "kernel/policy/app_profile.c")
-    if not os.path.isfile(target):
-        print("   app_profile.c not present, nothing to do")
+    root = sys.argv[1]
+
+    present = [p for p in FILES if os.path.isfile(os.path.join(root, p))]
+    if not present:
+        print("   no KSU seccomp call sites present, nothing to do")
         return
 
-    s = io.open(target, encoding="utf-8", newline="").read()
+    total = 0
+    for rel in present:
+        path = os.path.join(root, rel)
+        s = io.open(path, encoding="utf-8", newline="").read()
 
-    if "ksu_seccomp_allow_cache" in s:
-        print("   app_profile.c already preserves the filter, nothing to do")
-        return
+        n = len(BARE.findall(s))   # every site has a disable_seccomp(); line
+        if n == 0:
+            print("   %s: no disable_seccomp() call, nothing to do" % rel)
+            continue
 
-    calls = re.findall(r"^([ \t]*)disable_seccomp\(\);[ \t]*$", s, re.M)
-    if not calls:
-        print("   app_profile.c does not call disable_seccomp(), nothing to do")
-        return
-    if len(calls) != 1:
-        die("expected one disable_seccomp() call, found %d" % len(calls))
+        s = GUARDED.sub(lambda m: BLOCK.format(i=m.group(1)), s)
+        s = BARE.sub(lambda m: BLOCK.format(i=m.group(1)), s)
+        s = EXTERN.sub("", s)
+        s, _ = drop_defn(s)
+        s = ensure_include(s, rel)
 
-    s = re.sub(r"^([ \t]*)disable_seccomp\(\);[ \t]*$",
-               lambda m: GUARD.format(i=m.group(1)), s, count=1, flags=re.M)
+        if re.search(r"\bdisable_seccomp\b", s):
+            die("disable_seccomp still referenced in %s after the rewrite" % rel)
+        if "ksu_seccomp_allow_cache" not in s:
+            die("the rewrite did not land in %s" % rel)
 
-    inc = '#include "infra/seccomp_cache.h"\n'
-    if inc not in s:
-        anchor = '#include "infra/symbol_resolver.h"\n'
-        if anchor not in s:
-            die("no infra/ include to anchor seccomp_cache.h after")
-        s = s.replace(anchor, anchor + inc, 1)
+        io.open(path, "w", encoding="utf-8", newline="").write(s)
+        print("   %s: %d call site(s) now preserve the filter" % (rel, n))
+        total += n
 
-    s, dropped = drop_helper(s)
-
-    if re.search(r"\bdisable_seccomp\b", s):
-        die("disable_seccomp still referenced after the rewrite")
-    if "ksu_seccomp_allow_cache" not in s:
-        die("the rewrite did not land")
-
-    io.open(target, "w", encoding="utf-8", newline="").write(s)
-    print("   app_profile.c: filter preserved via ksu_seccomp_allow_cache"
-          + (", helper removed" if dropped else ""))
+    if total:
+        print("   seccomp filters preserved at %d site(s)" % total)
 
 
 if __name__ == "__main__":
