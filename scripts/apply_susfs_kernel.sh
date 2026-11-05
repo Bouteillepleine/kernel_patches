@@ -12,9 +12,8 @@
 # rejected hunk by the content it ADDS rather than by its @@ line numbers.
 #
 # The alternative -- a hand-written kernel_fix variant per tree shape -- works
-# but needs a new file for every sublevel and every manifest family. The
-# variants still in next/susfs_fix_patches/*/kernel_fix_* predate this and are
-# superseded by it.
+# but needs a new file for every sublevel and every manifest family. Those
+# kernel_fix_* variants were superseded by this and have been deleted.
 #
 # security/selinux/selinuxfs.c is dropped outright: the KSU side and NoMount's
 # _hook family already own the hiding there, and letting susfs in as well means
