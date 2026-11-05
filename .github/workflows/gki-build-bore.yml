@@ -67,6 +67,35 @@ jobs:
           if [ "$K" = "6.12" ]; then
             sed -i -E 's/^([[:space:]]*)u64 slice = normalized_sysctl_sched_base_slice;/\1u64 slice = sysctl_sched_base_slice;/' common/kernel/sched/fair.c || true
           fi
+          # 5.10: the dequeue_task_fair BORE block was removed from bore_5.10.patch.
+          # OnePlus 5.10 trees put an OPLUS_SCHED_TUNE block where the patch expects a
+          # blank line, so patch -F3 applied the hunk with fuzz 3 into the function
+          # declarator (0 rejects, silent). Re-insert on a unique anchor instead, here
+          # too so the pristine-GKI check matches shipped behaviour.
+          if [ "$K" = "5.10" ]; then
+            FAIRC=common/kernel/sched/fair.c
+            n=$(grep -c 'util_est_dequeue(&rq->cfs, p);' "$FAIRC")
+            [ "$n" = "1" ] || { echo "::error::dequeue anchor not unique ($n)"; exit 1; }
+            if ! awk '/util_est_dequeue\(&rq->cfs, p\);/{getline; if ($0 ~ /^#ifdef CONFIG_SCHED_BORE/) f=1} END{exit !f}' "$FAIRC"; then
+              awk '
+              /util_est_dequeue\(&rq->cfs, p\);/ && !ins {
+                print
+                print "#ifdef CONFIG_SCHED_BORE"
+                print "\tif (task_sleep) {"
+                print "\t\tcfs_rq = cfs_rq_of(se);"
+                print "\t\tif (cfs_rq->curr == se)"
+                print "\t\t\tupdate_curr(cfs_rq);"
+                print "\t\trestart_burst(se);"
+                print "\t}"
+                print "#endif // CONFIG_SCHED_BORE"
+                ins=1; next
+              }
+              {print}' "$FAIRC" > "$FAIRC.new" && mv "$FAIRC.new" "$FAIRC"
+              awk '/util_est_dequeue\(&rq->cfs, p\);/{getline; if ($0 ~ /^#ifdef CONFIG_SCHED_BORE/) f=1} END{exit !f}' "$FAIRC" \
+                || { echo "::error::dequeue_task_fair BORE block did not land"; exit 1; }
+              echo "  dequeue_task_fair BORE block inserted (5.10)"
+            fi
+          fi
           DEF=common/arch/arm64/configs/gki_defconfig
           echo 'CONFIG_SCHED_BORE=y' >> "$DEF"
           # SCHED_BORE is `default y`, so savedefconfig canonicalization drops it and
