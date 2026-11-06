@@ -52,15 +52,16 @@ jobs:
           SUSFS_BRANCH: ${{ github.event.inputs.susfs_branch || 'gki-android16-6.12' }}
         run: |
           set -euo pipefail
-          git clone --depth 1 -b dev https://github.com/KernelSU-Next/KernelSU-Next.git ksu
-          git clone --depth 1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs
-          echo "KSU_SHA=$(git -C ksu rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          # into RUNNER_TEMP: this repo has its own ksu/ directory at the root
+          git clone --depth 1 -b dev https://github.com/KernelSU-Next/KernelSU-Next.git "$RUNNER_TEMP/ksu"
+          git clone --depth 1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git "$RUNNER_TEMP/susfs"
+          echo "KSU_SHA=$(git -C "$RUNNER_TEMP/ksu" rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Apply the enable patch, then the fix set, exactly as the builder does
         run: |
           set -euo pipefail
-          SUSFS_KP="$PWD/susfs/kernel_patches"
-          FIX_BASE="$PWD/next/susfs_fix_patches"
+          SUSFS_KP="$RUNNER_TEMP/susfs/kernel_patches"
+          FIX_BASE="$GITHUB_WORKSPACE/next/susfs_fix_patches"
 
           SUSVER="$(grep '#define SUSFS_VERSION' "$SUSFS_KP/include/linux/susfs.h" | awk -F'"' '{print $2}')"
           [ -n "$SUSVER" ] || { echo "::error::could not read SUSFS_VERSION"; exit 1; }
@@ -68,7 +69,7 @@ jobs:
           echo "KernelSU-Next @ $KSU_SHA   SUSFS $SUSVER   fix set: next/susfs_fix_patches/$SUSVER"
           [ -d "$FIXDIR" ] || { echo "::error::no fix set for SUSFS $SUSVER (present: $(ls "$FIX_BASE" | tr '\n' ' '))"; exit 1; }
 
-          cd ksu
+          cd "$RUNNER_TEMP/ksu"
           patch -p1 --forward < "$SUSFS_KP/KernelSU/10_enable_susfs_for_ksu.patch" || true
 
           rejects="$(find ./kernel -maxdepth 2 -name '*.rej' | sort)"
@@ -100,7 +101,7 @@ jobs:
       - name: Assert the reconciliation's post-conditions
         run: |
           set -euo pipefail
-          f=ksu/kernel/selinux/rules.c
+          f="$RUNNER_TEMP/ksu/kernel/selinux/rules.c"
           n="$(grep -c 'susfs_set_batch_sid();' "$f")"
           [ "$n" = 1 ] || { echo "::error::susfs_set_batch_sid() appears $n time(s) in rules.c, want 1 -- without it susfs_{zygote,ksu,init,priv_app}_sid stay 0 after every policy load and susfs_is_current_*_domain() answers for sid 0"; exit 1; }
           s="$(grep -c 'reset_avc_cache(pol->latest_granting);' "$f")"
