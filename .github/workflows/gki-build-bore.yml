@@ -59,8 +59,8 @@ jobs:
           curl -fsSL "$RAW/bore_${K}.patch" -o /tmp/bore.patch
           # fuzz-tolerant apply (synced GKI may be a newer sublevel than the patch
           # was generated against); matches the OnePlus builder's apply method.
-          # -F0: fuzz relocates rather than rejects; see the builder's BORE step.
-          ( cd common && patch -p1 --ignore-whitespace -F0 < /tmp/bore.patch )
+          # -F3: -F0 rejects legitimate context drift once other patches land first.
+          ( cd common && patch -p1 --ignore-whitespace -F3 < /tmp/bore.patch )
           # set_protect_slice(): moved out of the patch to a sed because OnePlus
           # vendor trees perturb its surrounding context per-SoC (sm8850/canoe
           # rejected the hunk). Apply the same transform here so the pristine-GKI
