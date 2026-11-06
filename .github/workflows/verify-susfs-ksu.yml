@@ -1,0 +1,108 @@
+name: 🧪 verify SUSFS reconciliation on the KSU forks
+
+# The KernelSU forks live at moving refs, so this class of breakage arrives with
+# nothing of ours pushed. verify-hook-pathhide.yml deliberately says nothing
+# about a SUSFS build (see its note at the fix_selinux_seqno step), so until this
+# existed the first thing to notice was a builder matrix: on 2026-11-06
+# tiann/KernelSU#3969 reached SukiSU-Ultra@main and KernelSU-Next@dev at 07:25Z
+# and every one of 81 targets failed at 09:49Z.
+
+on:
+  schedule:
+    - cron: '47 6 * * *'
+  push:
+    branches: [main, ci/verify-patches]
+    paths:
+      - 'next/susfs_fix_patches/**'
+      - 'scripts/ksu_fork_shapes.tsv'
+      - 'scripts/verify_ksu_fork_shapes.py'
+      - '.github/workflows/verify-susfs-ksu.yml'
+  pull_request:
+    paths:
+      - 'next/susfs_fix_patches/**'
+      - 'scripts/ksu_fork_shapes.tsv'
+      - 'scripts/verify_ksu_fork_shapes.py'
+  workflow_dispatch:
+    inputs:
+      susfs_branch:
+        description: 'susfs4ksu branch to take the KSU-side enable patch from (it is byte-identical on every gki-* branch)'
+        required: false
+        default: 'gki-android16-6.12'
+
+concurrency:
+  group: verify-susfs-ksu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shapes:
+    name: rules.c shape vs what our reconciliations assume
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/verify_ksu_fork_shapes.py
+
+  ksun-fixset:
+    name: KernelSU-Next enable patch + fix set reconcile cleanly
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch KernelSU-Next and susfs4ksu
+        env:
+          SUSFS_BRANCH: ${{ github.event.inputs.susfs_branch || 'gki-android16-6.12' }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 -b dev https://github.com/KernelSU-Next/KernelSU-Next.git ksu
+          git clone --depth 1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          echo "KSU_SHA=$(git -C ksu rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Apply the enable patch, then the fix set, exactly as the builder does
+        run: |
+          set -euo pipefail
+          SUSFS_KP="$PWD/susfs/kernel_patches"
+          FIX_BASE="$PWD/next/susfs_fix_patches"
+
+          SUSVER="$(grep '#define SUSFS_VERSION' "$SUSFS_KP/include/linux/susfs.h" | awk -F'"' '{print $2}')"
+          [ -n "$SUSVER" ] || { echo "::error::could not read SUSFS_VERSION"; exit 1; }
+          FIXDIR="$FIX_BASE/$SUSVER"
+          echo "KernelSU-Next @ $KSU_SHA   SUSFS $SUSVER   fix set: next/susfs_fix_patches/$SUSVER"
+          [ -d "$FIXDIR" ] || { echo "::error::no fix set for SUSFS $SUSVER (present: $(ls "$FIX_BASE" | tr '\n' ' '))"; exit 1; }
+
+          cd ksu
+          patch -p1 --forward < "$SUSFS_KP/KernelSU/10_enable_susfs_for_ksu.patch" || true
+
+          rejects="$(find ./kernel -maxdepth 2 -name '*.rej' | sort)"
+          if [ -z "$rejects" ]; then
+            echo "-- the enable patch applied cleanly; no fix patches needed"
+          else
+            echo "-- rejected by the enable patch:"; echo "$rejects" | sed 's/^/     /'
+          fi
+          for rej in $rejects; do
+            base="$(basename "$rej" .rej)"
+            fix="$FIXDIR/fix_$base.patch"
+            if [ ! -f "$fix" ]; then
+              echo "::error::$base was rejected and fix_$base.patch is not in the $SUSVER fix set."
+              echo "::error::That is what the builders apply, so every target would fail here."
+              cat "$rej"
+              exit 1
+            fi
+            echo "-- fix_$base.patch"
+            patch -p1 --forward -F0 < "$fix"
+            rm -f "$rej"
+          done
+
+          if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
+            echo "::error::.rej files remain after the fix set:"
+            find . -name '*.rej' -exec echo "=== {} ===" \; -exec cat {} \;
+            exit 1
+          fi
+
+      - name: Assert the reconciliation's post-conditions
+        run: |
+          set -euo pipefail
+          f=ksu/kernel/selinux/rules.c
+          n="$(grep -c 'susfs_set_batch_sid();' "$f")"
+          [ "$n" = 1 ] || { echo "::error::susfs_set_batch_sid() appears $n time(s) in rules.c, want 1 -- without it susfs_{zygote,ksu,init,priv_app}_sid stay 0 after every policy load and susfs_is_current_*_domain() answers for sid 0"; exit 1; }
+          s="$(grep -c 'reset_avc_cache(pol->latest_granting);' "$f")"
+          [ "$s" = 2 ] || { echo "::error::reset_avc_cache(pol->latest_granting) appears $s time(s), want 2 -- the fork's real policy generation is no longer threaded, so /sys/fs/selinux/status would publish a stale or zero policyload"; exit 1; }
+          echo "rules.c reconciled: 1 susfs_set_batch_sid() call, 2 seqno-threaded reset_avc_cache() sites"

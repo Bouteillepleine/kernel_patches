@@ -1,0 +1,22 @@
+# The shape of kernel/selinux/rules.c in each KernelSU fork, as our SUSFS
+# reconciliations require it. Recorded on 2026-11-06, after the forks took
+# tiann/KernelSU#3969.
+#
+# anchor       occurrences of "reset_avc_cache(pol->latest_granting);" directly
+#              followed by "out_unlock:" -- the insertion point both
+#              next/susfs_fix_patches/*/fix_rules.c.patch and the SukiSu
+#              builder's rules.c recovery use for susfs_set_batch_sid().
+# bumps        occurrences of "latest_granting = old_pol->latest_granting + 1";
+#              2 = the fork threads the real policy generation (#3964), so
+#              apply_nomount_stack.sh classifies it 'upstream' and SKIPS
+#              fix_selinux_seqno. 0 = the legacy seqno-less form.
+# seqno_calls  reset_avc_cache(pol->latest_granting) call sites.
+# legacy_calls seqno-less reset_avc_cache() call sites.
+#
+# A mismatch is upstream drift, not a bug here: it means a reconciliation may
+# no longer apply. Re-fit the affected patch, THEN update the row.
+#
+# fork	repo	ref	anchor	bumps	seqno_calls	legacy_calls
+KernelSU-Next	KernelSU-Next/KernelSU-Next	dev	1	2	2	0
+SukiSU-Ultra	SukiSU-Ultra/SukiSU-Ultra	main	1	2	2	0
+BakaSU	Baka-SU/BakaSU	main	0	0	0	4
