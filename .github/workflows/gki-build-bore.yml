@@ -59,7 +59,8 @@ jobs:
           curl -fsSL "$RAW/bore_${K}.patch" -o /tmp/bore.patch
           # fuzz-tolerant apply (synced GKI may be a newer sublevel than the patch
           # was generated against); matches the OnePlus builder's apply method.
-          ( cd common && patch -p1 --ignore-whitespace -F3 < /tmp/bore.patch )
+          # -F0: fuzz relocates rather than rejects; see the builder's BORE step.
+          ( cd common && patch -p1 --ignore-whitespace -F0 < /tmp/bore.patch )
           # set_protect_slice(): moved out of the patch to a sed because OnePlus
           # vendor trees perturb its surrounding context per-SoC (sm8850/canoe
           # rejected the hunk). Apply the same transform here so the pristine-GKI
@@ -72,7 +73,7 @@ jobs:
           # blank line, so patch -F3 applied the hunk with fuzz 3 into the function
           # declarator (0 rejects, silent). Re-insert on a unique anchor instead, here
           # too so the pristine-GKI check matches shipped behaviour.
-          if [ "$K" = "5.10" ]; then
+          case "$K" in 6.6|6.1|5.15|5.10)
             FAIRC=common/kernel/sched/fair.c
             n=$(grep -c 'util_est_dequeue(&rq->cfs, p);' "$FAIRC")
             [ "$n" = "1" ] || { echo "::error::dequeue anchor not unique ($n)"; exit 1; }
@@ -93,9 +94,25 @@ jobs:
               {print}' "$FAIRC" > "$FAIRC.new" && mv "$FAIRC.new" "$FAIRC"
               awk '/util_est_dequeue\(&rq->cfs, p\);/{getline; if ($0 ~ /^#ifdef CONFIG_SCHED_BORE/) f=1} END{exit !f}' "$FAIRC" \
                 || { echo "::error::dequeue_task_fair BORE block did not land"; exit 1; }
-              echo "  dequeue_task_fair BORE block inserted (5.10)"
+              echo "  dequeue_task_fair BORE block inserted"
             fi
-          fi
+            ;;
+          esac
+          # 6.12/6.6: sched_bore_init() also pulled out of the patch.
+          case "$K" in 6.12|6.6)
+            COREC=common/kernel/sched/core.c
+            n=$(grep -c '^[[:space:]]*wait_bit_init();' "$COREC")
+            [ "$n" = "1" ] || { echo "::error::wait_bit_init() anchor not unique ($n)"; exit 1; }
+            if ! grep -q 'sched_bore_init();' "$COREC"; then
+              awk '
+                /^[[:space:]]*wait_bit_init\(\);/ && !ins {
+                  print "#ifdef CONFIG_SCHED_BORE"; print "\tsched_bore_init();"
+                  print "#endif // CONFIG_SCHED_BORE"; print ""; ins=1 }
+                {print}' "$COREC" > "$COREC.new" && mv "$COREC.new" "$COREC"
+              echo "  sched_bore_init() inserted"
+            fi
+            ;;
+          esac
           DEF=common/arch/arm64/configs/gki_defconfig
           echo 'CONFIG_SCHED_BORE=y' >> "$DEF"
           # SCHED_BORE is `default y`, so savedefconfig canonicalization drops it and

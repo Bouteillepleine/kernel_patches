@@ -485,21 +485,6 @@ index d39dece..49be2c5 100644
  	update_min_vruntime(cfs_rq);
  
  	if (entity_is_task(curr)) {
-@@ -6257,6 +6405,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
- 	bool was_sched_idle = sched_idle_rq(rq);
- 
- 	util_est_dequeue(&rq->cfs, p);
-+#ifdef CONFIG_SCHED_BORE
-+	if (task_sleep) {
-+		cfs_rq = cfs_rq_of(se);
-+		if (cfs_rq->curr == se)
-+			update_curr(cfs_rq);
-+		restart_burst(se);
-+	}
-+#endif // CONFIG_SCHED_BORE
- 
- 	for_each_sched_entity(se) {
- 		cfs_rq = cfs_rq_of(se);
 @@ -8070,24 +8226,31 @@ static void yield_task_fair(struct rq *rq)
  	/*
  	 * Are we the only task in the tree?
