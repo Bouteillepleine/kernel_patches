@@ -18,9 +18,9 @@ name: 🧪 verify SUSFS reconciliation on the KSU forks
 
 on:
   schedule:
-    # `shapes` is three HTTP fetches and a regex, so it runs every 3h: a daily
-    # check leaves a 24h blind window, and 2026-11-06 landed in it (upstream
-    # moved at 07:25Z, two hours after the 05:24Z drift check).
+    # `shapes` is a handful of HTTP fetches, a regex and a diff, so it runs every
+    # 3h: a daily check leaves a 24h blind window, and 2026-11-06 landed in it
+    # (upstream moved at 07:25Z, two hours after the 05:24Z drift check).
     - cron: '7 */3 * * *'
     # `ksun-fixset` clones KernelSU-Next and susfs4ksu, so it stays daily.
     - cron: '47 6 * * *'
@@ -30,12 +30,16 @@ on:
       - 'next/susfs_fix_patches/**'
       - 'scripts/ksu_fork_shapes.tsv'
       - 'scripts/verify_ksu_fork_shapes.py'
+      - 'scripts/susfs_enable_rules_c.expected'
+      - 'scripts/verify_susfs_enable_patch.py'
       - '.github/workflows/verify-susfs-ksu.yml'
   pull_request:
     paths:
       - 'next/susfs_fix_patches/**'
       - 'scripts/ksu_fork_shapes.tsv'
       - 'scripts/verify_ksu_fork_shapes.py'
+      - 'scripts/susfs_enable_rules_c.expected'
+      - 'scripts/verify_susfs_enable_patch.py'
   workflow_dispatch:
     inputs:
       susfs_branch:
@@ -53,7 +57,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: python3 scripts/verify_ksu_fork_shapes.py
+
+      - name: KernelSU forks still have the shape we patch
+        run: python3 scripts/verify_ksu_fork_shapes.py
+
+      # The forks are not the only moving input. On 2026-11-06 the forks held
+      # still and susfs4ksu moved instead: 48b83803 absorbed tiann/KernelSU#3969
+      # into the enable patch itself at ~16:18Z, so it started doing work
+      # fix_rules.c.patch was already doing, two hunks collided, and all 81
+      # KernelSU-Next targets failed. The step above passed 19 minutes earlier.
+      - name: susfs4ksu's enable patch still rewrites rules.c the same way
+        if: always()
+        run: python3 scripts/verify_susfs_enable_patch.py
 
   ksun-fixset:
     name: KernelSU-Next enable patch + fix set reconcile cleanly
