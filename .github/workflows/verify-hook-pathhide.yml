@@ -50,6 +50,12 @@ name: 🕵️ verify _hook/_pathhide/_ghost (OnePlus trees, AOSP fallback)
 # verify-patches-oneplus.yml, so a change to either patch set is checked both
 # ways -- dry-run against the whole fleet, and compiled on one tree per version.
 on:
+  # The fork trees this gate fetches live at moving refs, so drift lands here
+  # with nothing pushed: tiann/KernelSU#3969 reached SukiSU-Ultra@main and
+  # KernelSU-Next@dev on 2026-11-06 and broke two patches with no commit of
+  # ours involved. A daily run catches that for one job instead of a matrix.
+  schedule:
+    - cron: '17 6 * * *'
   push:
     branches: [main, ci/verify-patches]
     paths:
