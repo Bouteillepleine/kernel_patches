@@ -18,6 +18,11 @@ name: 🧪 verify SUSFS reconciliation on the KSU forks
 
 on:
   schedule:
+    # `shapes` is three HTTP fetches and a regex, so it runs every 3h: a daily
+    # check leaves a 24h blind window, and 2026-11-06 landed in it (upstream
+    # moved at 07:25Z, two hours after the 05:24Z drift check).
+    - cron: '7 */3 * * *'
+    # `ksun-fixset` clones KernelSU-Next and susfs4ksu, so it stays daily.
     - cron: '47 6 * * *'
   push:
     branches: [main, ci/verify-patches]
@@ -53,6 +58,8 @@ jobs:
   ksun-fixset:
     name: KernelSU-Next enable patch + fix set reconcile cleanly
     runs-on: ubuntu-24.04
+    # every trigger except the 3-hourly shapes-only cron
+    if: github.event_name != 'schedule' || github.event.schedule == '47 6 * * *'
     steps:
       - uses: actions/checkout@v4
 
