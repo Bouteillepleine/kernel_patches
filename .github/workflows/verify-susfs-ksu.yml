@@ -118,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           f="$RUNNER_TEMP/ksu/kernel/selinux/rules.c"
-          n="$(grep -c 'susfs_set_batch_sid();' "$f")"
+          n="$(grep -c 'susfs_set_batch_sid();' "$f" || true)"
           [ "$n" = 1 ] || { echo "::error::susfs_set_batch_sid() appears $n time(s) in rules.c, want 1 -- without it susfs_{zygote,ksu,init,priv_app}_sid stay 0 after every policy load and susfs_is_current_*_domain() answers for sid 0"; exit 1; }
           # The bumps MUST be gone. susfs's enable patch rewrites reset_avc_cache()
           # itself to a K&R no-arg definition that hardcodes selinux_status_update_policyload(0),
@@ -127,6 +127,8 @@ jobs:
           # measured on an OP15 (CPH2747, 6.12.69) 2026-11-06 as status.policyload=1 vs
           # access.avd.seqno=5, which DuckDetector reports as an app_zygote seqno split.
           # Deleting them keeps both counters frozen and coherent, which measured Clean.
-          b="$(grep -c 'latest_granting = old_pol->latest_granting + 1' "$f")"
+          # grep -c exits 1 on zero matches, which under set -e would abort this step
+          # exactly when the assertion is SATISFIED. || true keeps the check meaningful.
+          b="$(grep -c 'latest_granting = old_pol->latest_granting + 1' "$f" || true)"
           [ "$b" = 0 ] || { echo "::error::pol->latest_granting is still bumped $b time(s) in rules.c; susfs discards the seqno at the reset_avc_cache() definition, so the bumps desynchronise access.avd.seqno from status.policyload and open an app_zygote seqno split"; exit 1; }
           echo "rules.c reconciled: 1 susfs_set_batch_sid() call, 0 latest_granting bumps"
