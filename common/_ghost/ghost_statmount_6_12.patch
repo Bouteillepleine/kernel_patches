@@ -9,36 +9,25 @@
  	/* Has the namespace already been emptied? */
  	if (mnt_ns_id && RB_EMPTY_ROOT(&ns->mounts))
  		return -ENOENT;
-@@ -5182,6 +5184,12 @@
- 	if (!s->mnt)
+@@ -5181,3 +5181,3 @@
+ 	s->mnt = lookup_mnt_in_ns(mnt_id, ns);
+-	if (!s->mnt)
++	if (!s->mnt || ghost_hidden_mount(s->mnt))
  		return -ENOENT;
- 
-+	/* The same answer as a mount id that does not exist, so a caller cannot tell
-+	 * a hidden mount from an absent one. do_listmount() below never offers the id
-+	 * in the first place; this is the backstop for one that was guessed or kept. */
-+	if (ghost_hidden_mount(s->mnt))
-+		return -ENOENT;
-+
- 	err = grab_requested_root(ns, &root);
- 	if (err)
- 		return err;
-@@ -5390,6 +5398,8 @@
+@@ -5390,4 +5398,6 @@
  	struct mount *r, *first;
  	ssize_t ret;
- 
-+	extern bool ghost_hidden_mount(struct vfsmount *mnt);
 +
- 	rwsem_assert_held(&namespace_sem);
++	extern bool ghost_hidden_mount(struct vfsmount *mnt);
  
- 	ret = grab_requested_root(ns, &root);
-@@ -5432,6 +5442,12 @@
+ 	rwsem_assert_held(&namespace_sem);
+@@ -5432,6 +5442,11 @@
  	for (ret = 0, r = first; r && nr_mnt_ids; r = listmnt_next(r, reverse)) {
  		if (r->mnt_id_unique == mnt_parent_id)
  			continue;
-+		/* Dropped before the id is emitted, so statmount is never asked about
-+		 * it. The three show handlers in fs/proc_namespace.c skip the same
-+		 * mount with SEQ_SKIP; these two syscalls read the rbtree directly and
-+		 * reach none of them. */
++		/* Dropped before the id is emitted, so statmount is never asked about it.
++		 * The three show handlers in fs/proc_namespace.c skip the same mount with
++		 * SEQ_SKIP; these two syscalls read the rbtree directly and reach none. */
 +		if (ghost_hidden_mount(&r->mnt))
 +			continue;
  		if (!is_path_reachable(r, r->mnt.mnt_root, &orig))

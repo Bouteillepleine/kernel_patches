@@ -707,6 +707,18 @@ verify_ghost() {
     # requires it rather than forbidding it.)
     hasnt "$d/fs/proc/ghost.c" 'proc_create' \
         "_ghost: ghost.c owns a /proc node -- a file whose job is concealing files must not own a name no stock kernel has"
+    # statmount(2)/listmount(2) exist from 6.8 and reach none of the three
+    # fs/proc_namespace.c show handlers the mountinfo guard patches. apply_optional is
+    # non-fatal by design, so when 6.12.58 moved `root` into struct kstatmount and the
+    # patch anchored on the grab_requested_root() line that changed with it, the patch
+    # skipped and three OnePlus targets built green with no guard at all. Assert it
+    # wherever the syscalls exist, and stay quiet on the trees that predate them.
+    if grep -q '^static int do_statmount' "$d/fs/namespace.c" 2>/dev/null; then
+        infn "$d/fs/namespace.c" '^static int do_statmount' 'ghost_hidden_mount(s->mnt))' \
+            "_ghost: the statmount(2) guard is not inside do_statmount() -- a hide-listed uid reads the module bind's root and mountpoint from one syscall, and mountinfo already denies it, so the two views disagree"
+        infn "$d/fs/namespace.c" '^static ssize_t do_listmount' 'ghost_hidden_mount(&r->mnt))' \
+            "_ghost: the listmount(2) guard is not inside do_listmount() -- the hidden mount's id is still emitted, and statmount then answers for an id the caller was handed"
+    fi
     echo "_ghost: verified (no CONFIG symbol by design -- see README)"
 }
 
