@@ -1145,6 +1145,16 @@ do_ghost() {
     # Anchored on the three show_* bodies of 6.12 and skipped elsewhere until
     # those have variants, the same way ghost_unixsock is.
     apply_optional "$GH/ghost_mountinfo_6_12.patch"
+    # The same mount, through the syscalls that reach none of those three handlers.
+    # statmount(2)/listmount(2) are 6.8 and newer and walk the namespace rbtree in
+    # kernel code, so the SEQ_SKIP guard above is simply not on their path. Measured
+    # on CPH2747 6.12.69 as a hide-listed uid: mountinfo showed no module bind while
+    # statmount handed over root=/adb/modules/zygisk_lsposed/bin/dex2oat64 -- the two
+    # views disagreeing for one caller, which is a stronger tell than the leak was.
+    # do_listmount() drops the mount before its id is emitted and do_statmount()
+    # answers -ENOENT, the same as for an id that never existed. Optional because
+    # nothing below 6.8 has the syscalls for the anchors to fit.
+    apply_optional "$GH/ghost_statmount_6_12.patch"
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file
