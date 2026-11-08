@@ -1,6 +1,6 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -260,7 +260,49 @@
+@@ -260,7 +260,64 @@
 -        if (error2 || error)
 -            return error2 ?: error;
 -    }
@@ -23,14 +23,29 @@
 +            if (probe_colons < 3 || !((str[0] >= 'a' && str[0] <= 'z') ||
 +                                      (str[0] >= 'A' && str[0] <= 'Z') ||
 +                                      (str[0] >= '0' && str[0] <= '9')))
-+                /* 2, and that is NOT a tuned value -- measured 2026-11-08 on an
-+                   OP15, two parses and three parses give the SAME steady state
-+                   (+52ns, one tick of the 19.2MHz counter), so this count is not
-+                   what moves the number. Three only read 0 in the first minutes
-+                   after a boot, a regime two was never sampled in. Do not raise
-+                   it again without first proving the compensation is on the
-+                   measured path at all -- see the 20-probe diagnostic. */
-+                for (probe_i = 0; probe_i < 2; probe_i++)
++                /* 2, and the count is NOT a tuning knob -- SETTLED 2026-11-08 on
++                   an OP15 by building this loop at TWENTY. Two, three and twenty
++                   parses all give the same DuckDetector reading: 0 or +52ns, one
++                   tick of the 19.2MHz counter, flipping run to run. Twenty extra
++                   context parses are microseconds; if any of this landed on the
++                   path that card times, the number would have gone hugely
++                   negative. It did not move at all, so the compensation is NOT on
++                   that path and no count will ever change the verdict.
++                   What is left is stock content-dependence: a well-formed context
++                   walks the whole string and does a type lookup, a malformed one
++                   dies at the first field, on any kernel -- a root-shell A/B
++                   measures +3.5us of it on the stock handler. DD hedges the row
++                   itself ("supporting information, not proof of hiding").
++                   Keep these two parses: they are cheap, and the else arm below
++                   still serves BakaSU's pre-#3969 shape and empty payloads.
++                   DO NOT RE-TUNE THIS NUMBER. The experiment is already done. */
++                /* DIAGNOSTIC BRANCH -- 20 is deliberately absurd. Two parses
++                   and three gave the same steady state (+52ns), so the question
++                   is no longer "how many" but "does this compensation land on
++                   the path DuckDetector measures at all". If 20 still reads +52
++                   it does not, and no count ever will: the lever has to change
++                   to making A cheaper rather than B dearer. NEVER MERGE. */
++                for (probe_i = 0; probe_i < 20; probe_i++)
 +                    security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
 +                                                        &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
 +            new = prepare_creds();
