@@ -1,16 +1,39 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -260,7 +260,19 @@
+@@ -260,7 +260,42 @@
 -        if (error2 || error)
 -            return error2 ?: error;
 -    }
 +        if (error2 || error) {
++            /* KernelSU#3969 dropped `&& str[0] != '\n'` from the condition above,
++               so a malformed value now reaches this parse too and dies in it
++               early, while a well-formed one pays for the live type and range
++               lookup. That difference is the detector's A-B. Charge it back
++               here, keyed on a shape test of OUR own rather than on upstream's
++               condition -- anchoring on theirs is what let this block invert
++               silently once already, patch still applying at fuzz 0. */
++            static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
++            u32 probe_sid = 0, probe_tmp_sid = 0;
++            int probe_rc = 0, probe_i, probe_colons = 0;
++            size_t probe_n;
++
++            for (probe_n = 0; probe_n < size; probe_n++)
++                if (str[probe_n] == ':')
++                    probe_colons++;
++            if (probe_colons < 3 || !((str[0] >= 'a' && str[0] <= 'z') ||
++                                      (str[0] >= 'A' && str[0] <= 'Z') ||
++                                      (str[0] >= '0' && str[0] <= '9')))
++                for (probe_i = 0; probe_i < 2; probe_i++)
++                    security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
++                                                        &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
 +            new = prepare_creds();
 +            if (new)
 +                abort_creds(new);
 +            return error2 ?: error;
 +        }
 +    } else {
++        /* still reached on a fork that kept the pre-#3969 condition, and by an
++           empty value on either shape */
 +        static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
 +        u32 probe_sid = 0, probe_tmp_sid = 0;
 +        int probe_rc = 0, probe_i;

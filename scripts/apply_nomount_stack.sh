@@ -402,6 +402,24 @@ awk_probe_placement() {
     ' "$1"
 }
 
+# The compensation has to sit on the arm the detector's payloads actually reach.
+# KernelSU#3969 dropped `&& str[0] != '\n'` from the condition above it, which
+# moved the newline-prefixed payload out of the `else` and into the parse --
+# leaving the probes on a branch nothing reaches. The patch still applied at
+# fuzz 0 and every other assertion here still passed; only DuckDetector saw it,
+# and only when its app_zygote preload happened to land on a slow core (entry
+# CPU 3 on the OP15: +104ns there, 0 or below on 5/6/7). So assert WHERE the
+# probe is, not merely that it exists.
+awk_probe_failure_arm() {
+    awk '
+        /__nocfi [a-z_]*setprocattr\(/ { fn = 1; arm = 0 }
+        /if \(error2 \|\| error\)/    { if (fn) arm = 1 }
+        /^[ \t]*\} else \{/           { arm = 0 }
+        /ksu_probe_ctx/ { if (fn && arm) seen = 1 }
+        END { exit seen ? 0 : 1 }
+    ' "$1"
+}
+
 verify_hook() {
     local d="$COMMON_KERNEL_FOLDER"
     has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
@@ -598,6 +616,9 @@ verify_hook() {
         grep -c 'probe_i < [2-9]') || true
     [ "${probe_loop:-0}" -ge 1 ] ||
         die "_hook: the timing probe parses the context fewer than twice. One parse only moves the paired median by a tick and leaves it positive, which is still 'Positive A-B timing asymmetry' to the detector. If you meant to retune this, change the count -- do not remove the loop."
+    awk_probe_failure_arm "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
+        die "_hook: the timing probe is only on the else arm of the setprocattr hook. Whatever upstream's condition is now, the newline-prefixed payload reaches the parse and dies in it early while the well-formed one pays for the live type and range lookup -- and nothing charges that back. That is 'Positive A-B timing asymmetry', i.e. a DANGER SELinux card, on any core slow enough to resolve 52ns."
+
     infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'abort_creds(new);
             return error2 ?: error;' \
         "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
