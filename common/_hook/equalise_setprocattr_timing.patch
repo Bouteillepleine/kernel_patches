@@ -1,6 +1,6 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -260,7 +260,51 @@
+@@ -260,7 +260,49 @@
 -        if (error2 || error)
 -            return error2 ?: error;
 -    }
@@ -23,16 +23,14 @@
 +            if (probe_colons < 3 || !((str[0] >= 'a' && str[0] <= 'z') ||
 +                                      (str[0] >= 'A' && str[0] <= 'Z') ||
 +                                      (str[0] >= '0' && str[0] <= '9')))
-+                /* 4, measured on an OP15 2026-11-08, one step at a time: dead
-+                   code on this arm read +104ns (2 ticks of the 19.2MHz counter),
-+                   two parses +52, three parses BIMODAL -- 0 on four scans and
-+                   +52 on the next two, same boot, same kernel, CPU 2 giving both.
-+                   A paired median that lands on 0 or 52 at random is a true gap
-+                   just UNDER one tick, so three only reaches the clean side by
-+                   luck. Four puts it under zero and keeps it there. Do not go
-+                   further: the card is clean at <= 0 ("Zero A-B timing baseline"
-+                   grades CLEAR), and a large negative is its own signature. */
-+                for (probe_i = 0; probe_i < 4; probe_i++)
++                /* 2, and that is NOT a tuned value -- measured 2026-11-08 on an
++                   OP15, two parses and three parses give the SAME steady state
++                   (+52ns, one tick of the 19.2MHz counter), so this count is not
++                   what moves the number. Three only read 0 in the first minutes
++                   after a boot, a regime two was never sampled in. Do not raise
++                   it again without first proving the compensation is on the
++                   measured path at all -- see the 20-probe diagnostic. */
++                for (probe_i = 0; probe_i < 2; probe_i++)
 +                    security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
 +                                                        &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
 +            new = prepare_creds();
