@@ -1,0 +1,23 @@
+# Completes the one rules.c hunk of SUSFS' own 10_enable_susfs_for_ksu.patch that
+# cannot apply to KernelSU-Next. Since susfs4ksu 48b83803 ("KernelSU: Sync with
+# upstream", 2026-11-06) that patch handles tiann/KernelSU#3969 itself, but its
+# handle_sepolicy() hunk is cut against tiann's tree, which has no
+# ksu_policydb_fixup_len() call there -- so it rejects on KSUN and nowhere else.
+diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+--- a/kernel/selinux/rules.c
++++ b/kernel/selinux/rules.c
+@@ -543,13 +543,9 @@
+     // Return value ignored: the policy is published either way.
+     ksu_policydb_fixup_len(db, "handle_sepolicy");
+-    pol->latest_granting = old_pol->latest_granting + 1;
+-    if (!ksu_advance_original_types(db, &old_pol->policydb, old_pol->latest_granting, pol->latest_granting))
+-        pr_warn("failed to carry original type metadata, use backup lookups\n");
+-
+     rcu_assign_pointer(selinux_state.policy, pol);
+     synchronize_rcu();
+     ksu_destroy_sepolicy(old_pol);
+ 
+-    reset_avc_cache(pol->latest_granting);
++    reset_avc_cache();
+     ret = success_cmd_count;
+     goto out_unlock;

@@ -1,0 +1,12 @@
+diff --git a/kernel/preinit/preinit.c b/kernel/preinit/preinit.c
+--- a/kernel/preinit/preinit.c
++++ b/kernel/preinit/preinit.c
+@@ -127,7 +127,7 @@
+     len = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+     if (kern_path(fd_path, LOOKUP_FOLLOW, &path)) {
+         pr_err("preinit: %s not reachable, booting without preinit\n", fd_path);
+-        close_fd(fd);
++        ksu_close_fd(fd);
+         return -EINVAL;
+     }
+     path_put(&path);
