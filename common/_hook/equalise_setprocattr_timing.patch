@@ -1,6 +1,6 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -260,7 +260,48 @@
+@@ -260,7 +260,51 @@
 -        if (error2 || error)
 -            return error2 ?: error;
 -    }
@@ -23,13 +23,16 @@
 +            if (probe_colons < 3 || !((str[0] >= 'a' && str[0] <= 'z') ||
 +                                      (str[0] >= 'A' && str[0] <= 'Z') ||
 +                                      (str[0] >= '0' && str[0] <= '9')))
-+                /* 3, not 2: measured on an OP15 2026-11-08. Dead code on this
-+                   arm read +104ns (2 ticks of the 19.2MHz counter); two parses
-+                   here took it to +52 on CPUs 1/2/3 alike, still "Positive A-B
-+                   timing asymmetry". The card is clean at <= 0 -- "Zero A-B
-+                   timing baseline" grades CLEAR -- so aim for the tick, not
-+                   past it: a large negative is its own signature. */
-+                for (probe_i = 0; probe_i < 3; probe_i++)
++                /* 4, measured on an OP15 2026-11-08, one step at a time: dead
++                   code on this arm read +104ns (2 ticks of the 19.2MHz counter),
++                   two parses +52, three parses BIMODAL -- 0 on four scans and
++                   +52 on the next two, same boot, same kernel, CPU 2 giving both.
++                   A paired median that lands on 0 or 52 at random is a true gap
++                   just UNDER one tick, so three only reaches the clean side by
++                   luck. Four puts it under zero and keeps it there. Do not go
++                   further: the card is clean at <= 0 ("Zero A-B timing baseline"
++                   grades CLEAR), and a large negative is its own signature. */
++                for (probe_i = 0; probe_i < 4; probe_i++)
 +                    security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
 +                                                        &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
 +            new = prepare_creds();
