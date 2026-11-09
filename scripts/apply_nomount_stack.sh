@@ -420,6 +420,25 @@ awk_probe_failure_arm() {
     ' "$1"
 }
 
+# The abort_creds pair has to sit immediately before the parse-failure return, so
+# that the arm which skips the parse is not the only one paying for a cred
+# allocation. Asserted on the two lines being ADJACENT, with indentation stripped:
+# KernelSU#3981 moved the dual parse one block deeper, and the literal needle this
+# replaces pinned the old column count -- a shape change red-lined every target
+# while the patch itself had applied correctly.
+awk_abort_creds_arm() {
+    awk '
+        /__nocfi [a-z_]*setprocattr\(/ { fn = 1 }
+        fn && /^}/                     { fn = 0 }
+        fn {
+            gsub(/^[ \t]+/, "")
+            if (prev == "abort_creds(new);" && $0 == "return error2 ?: error;") ok = 1
+            prev = $0
+        }
+        END { exit ok ? 0 : 1 }
+    ' "$1"
+}
+
 verify_hook() {
     local d="$COMMON_KERNEL_FOLDER"
     has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
@@ -619,9 +638,8 @@ verify_hook() {
     awk_probe_failure_arm "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
         die "_hook: the timing probe is only on the else arm of the setprocattr hook. Whatever upstream's condition is now, the newline-prefixed payload reaches the parse and dies in it early while the well-formed one pays for the live type and range lookup -- and nothing charges that back. That is 'Positive A-B timing asymmetry', i.e. a DANGER SELinux card, on any core slow enough to resolve 52ns."
 
-    infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'abort_creds(new);
-            return error2 ?: error;' \
-        "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
+    awk_abort_creds_arm "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
+        die "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
     awk_probe_placement "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
         die "_hook: the timing probe sits BEFORE the setprocattr hook's PROCESS__SETCURRENT check, so every app can reach a backup-policy parse instead of only the domains allowed SETCURRENT. That is a wider oracle than the one this patch closes."
 
