@@ -992,7 +992,18 @@ do_hook() {
     else
         seqno_apply "$HOOK"
     fi
-    apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
+    # KernelSU#3981 split the parse into a live attempt plus an -EAGAIN fallback,
+    # so the dual parse this probe compensates for moved one block deeper and the
+    # old anchor stopped fitting. Both variants carry the same probes on the same
+    # arms; they differ only in the shape they are cut against. Probed on the tree
+    # rather than on the fork name, so SukiSU-Ultra and BakaSU keep the pre-#3981
+    # one until they take the same change, and a KSUN pinned to an older hash
+    # still builds.
+    if grep -q 'security_context_to_sid_live' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
+        apply_or_die "$HOOK/equalise_setprocattr_timing_live.patch" "$KSU_FOLDER"
+    else
+        apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
+    fi
 
     # avc_spoof now exists in two shapes, so probe for each rather than assuming
     # one fork owns it. KernelSU-Next keeps it in kernel/extras.c and logs

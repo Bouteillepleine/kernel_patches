@@ -1,0 +1,76 @@
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -259,15 +259,72 @@
+         error = security_context_to_sid_live(value, size, &sid);
+         if (error == -EAGAIN) {
+             // stale type mark, use the dual parse
+             error2 = security_context_to_sid_with_policy(backup_sepolicy, value, size, &tmp_sid, SECSID_NULL,
+                                                          GFP_KERNEL, &sid, &error);
+-            if (error2 || error)
++            if (error2 || error) {
++                /* Fork coverage, not the main arm. KernelSU#3981 RESTORED the
++                   `str[0] != '\n'` guard that #3969 had dropped, so on mainline a
++                   newline payload no longer reaches any parse and falls to the
++                   else arm below -- which is where the compensation that matters
++                   now sits, as it did before #3969. This arm still pays on a fork
++                   that kept #3969's condition (BakaSU) or drops the guard again,
++                   and it is keyed on a shape test of OUR own rather than on
++                   upstream's condition: anchoring on theirs is what let this block
++                   invert silently once already, patch still applying at fuzz 0,
++                   and #3981 is the fourth move of that condition. */
++                static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
++                u32 probe_sid = 0, probe_tmp_sid = 0;
++                int probe_rc = 0, probe_i, probe_colons = 0;
++                size_t probe_n;
++
++                for (probe_n = 0; probe_n < size; probe_n++)
++                    if (str[probe_n] == ':')
++                        probe_colons++;
++                if (probe_colons < 3 || !((str[0] >= 'a' && str[0] <= 'z') ||
++                                          (str[0] >= 'A' && str[0] <= 'Z') ||
++                                          (str[0] >= '0' && str[0] <= '9')))
++                    /* 2, and the count is NOT a tuning knob -- SETTLED 2026-11-08
++                       on an OP15 by building this loop at TWENTY. Two, three and
++                       twenty parses all give the same DuckDetector reading: 0 or
++                       +52ns, one tick of the 19.2MHz counter, flipping run to run.
++                       Twenty extra context parses are microseconds; if any of this
++                       landed on the path that card times, the number would have
++                       gone hugely negative. It did not move at all, so the
++                       compensation is NOT on that path and no count will ever
++                       change the verdict.
++                       What is left is stock content-dependence: a well-formed
++                       context walks the whole string and does a type lookup, a
++                       malformed one dies at the first field, on any kernel -- a
++                       root-shell A/B measures +3.5us of it on the stock handler.
++                       DD hedges the row itself ("supporting information, not
++                       proof of hiding").
++                       DO NOT RE-TUNE THIS NUMBER. The experiment is already
++                       done. */
++                    for (probe_i = 0; probe_i < 2; probe_i++)
++                        security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx,
++                                                            sizeof(ksu_probe_ctx) - 1, &probe_tmp_sid, SECSID_NULL,
++                                                            GFP_KERNEL, &probe_sid, &probe_rc);
++                new = prepare_creds();
++                if (new)
++                    abort_creds(new);
+                 return error2 ?: error;
++            }
+         } else if (error) {
+             return error;
+         }
++    } else {
++        /* #3981's restored guard routes every newline-prefixed payload here, plus
++           an empty one on either shape. This is the cheap arm the detector times
++           against the dual parse above, so it is the one that has to pay. */
++        static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
++        u32 probe_sid = 0, probe_tmp_sid = 0;
++        int probe_rc = 0, probe_i;
++
++        for (probe_i = 0; probe_i < 2; probe_i++)
++            security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
++                                                &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
+     }
+ 
+     new = prepare_creds();
+     if (!new)
+         return -ENOMEM;
