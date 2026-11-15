@@ -291,6 +291,44 @@ seqno_mark() { # seqno_mark deferred|decided
     printf '%s\n' "$1" >"$(seqno_stamp)"
 }
 
+# The KernelSU-side setprocattr probe is deferred on SUSFS builds the same way
+# fix_selinux_seqno is, and for a sharper reason. SUSFS reduces selinux_hide.c to
+# a shell, deleting the very function this probe lives in -- do_postsusfs's own
+# comment has said so since 9b0b13f. Applying it first does not merely get
+# overwritten: its ~57 lines land INSIDE the span the reduction deletes, so that
+# hunk rejects, the reduction never happens, and the callers of helpers the later
+# hunks do delete are left behind. That is a kernel that cannot link (vmlinux:
+# undefined security_context_to_sid_with_policy / _live, 2026-11-15). Defer, let
+# SUSFS have its say about the file, then put the probe where the hook ended up.
+setprocattr_stamp() { printf '%s/.nomount_setprocattr_state' "${COMMON_KERNEL_FOLDER:-}"; }
+
+setprocattr_state() {
+    local f
+    f="$(setprocattr_stamp)"
+    if [ -f "$f" ]; then cat "$f"; else echo none; fi
+}
+
+setprocattr_mark() { # setprocattr_mark deferred|decided
+    [ -n "${COMMON_KERNEL_FOLDER:-}" ] ||
+        die "setprocattr: COMMON_KERNEL_FOLDER is not set, so the '$1' state cannot be recorded -- and an unrecorded deferral is how the attr/current timing tell ships unasserted"
+    printf '%s\n' "$1" >"$(setprocattr_stamp)"
+}
+
+# KernelSU#3981 split the parse into a live attempt plus an -EAGAIN fallback, so
+# the dual parse this probe compensates for moved one block deeper and the old
+# anchor stopped fitting. Both variants carry the same probes on the same arms;
+# they differ only in the shape they are cut against. Probed on the tree rather
+# than on the fork name, so SukiSU and BakaSU keep the pre-#3981 one until they
+# take the same change, and a KSUN pinned to an older hash still builds.
+setprocattr_apply() { # setprocattr_apply <hook dir>
+    need KSU_FOLDER
+    if grep -q 'security_context_to_sid_live' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
+        apply_or_die "$1/equalise_setprocattr_timing_live.patch" "$KSU_FOLDER"
+    else
+        apply_or_die "$1/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
+    fi
+}
+
 objy() { # objy <makefile> <object> <what>
     # Anchored, and the '.' is escaped: `make fs/proc/ghost.o` builds an object
     # that is not in obj-y at all, so "it compiled" proves nothing about whether
@@ -641,6 +679,16 @@ verify_hook() {
     if [ "$have_ksu" = 0 ]; then
         assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
         echo "_hook: verified (setprocattr timing equalised kernel-side only; KernelSU's hook is gone from this tree)"
+        return 0
+    fi
+
+    # Deferred means SUSFS has not reduced selinux_hide.c yet, so KernelSU's hook
+    # is still standing but is NOT the one this build will ship a probe in. The
+    # post-SUSFS verify is the one that has to be satisfied, and assert-config
+    # refuses to end a build that never got there.
+    if [ "$(setprocattr_state)" = deferred ]; then
+        assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
+        echo "_hook: verified (setprocattr timing deferred to the postsusfs step)"
         return 0
     fi
 
@@ -1030,9 +1078,17 @@ do_postsusfs() {
         normalise "$HOOK/equalise_setprocattr_timing_susfs.patch"
         apply_or_die "$HOOK/equalise_setprocattr_timing_susfs.patch"
         echo "postsusfs: equalised the susfs kernel-side setprocattr arms"
+    elif [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
+        grep -qE '__nocfi [a-z_]*setprocattr\(' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
+        # This SUSFS does not move the hook kernel-side, and its reduction left
+        # KernelSU's one standing. The probe belongs there -- applied now, on the
+        # shape SUSFS actually produced, rather than on a guess made before it ran.
+        setprocattr_apply "$HOOK"
+        echo "postsusfs: equalised the KernelSU-side setprocattr arms"
     else
-        echo "postsusfs: no susfs_selinux_lsm_setattr in this tree; the KernelSU-side probe still owns setprocattr timing"
+        die "postsusfs: after SUSFS neither security/selinux/hooks.c nor KernelSU's selinux_hide.c carries a setprocattr hook, so nothing can equalise the attr/current timing -- and the _hook step deferred the probe on the promise that this step would place it. The DANGER Duck Detector reports this as 'App Zygote attr/current timing'."
     fi
+    setprocattr_mark decided
     echo "::endgroup::"
 }
 
@@ -1092,17 +1148,12 @@ do_hook() {
     else
         seqno_apply "$HOOK"
     fi
-    # KernelSU#3981 split the parse into a live attempt plus an -EAGAIN fallback,
-    # so the dual parse this probe compensates for moved one block deeper and the
-    # old anchor stopped fitting. Both variants carry the same probes on the same
-    # arms; they differ only in the shape they are cut against. Probed on the tree
-    # rather than on the fork name, so SukiSU-Ultra and BakaSU keep the pre-#3981
-    # one until they take the same change, and a KSUN pinned to an older hash
-    # still builds.
-    if grep -q 'security_context_to_sid_live' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
-        apply_or_die "$HOOK/equalise_setprocattr_timing_live.patch" "$KSU_FOLDER"
+    if [ "${SUSFS_ON:-}" = true ]; then
+        setprocattr_mark deferred
+        echo "  deferred: equalise_setprocattr_timing (SUSFS reduces selinux_hide.c; the postsusfs step owns it afterwards)"
     else
-        apply_or_die "$HOOK/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
+        setprocattr_apply "$HOOK"
+        setprocattr_mark decided
     fi
 
     # avc_spoof now exists in two shapes, so probe for each rather than assuming
@@ -1490,6 +1541,9 @@ assert-config)
     # rather than misconfigured, and it is the last place anything checks.
     if [ "$(seqno_state)" = deferred ]; then
         die "the _hook step deferred fix_selinux_seqno to the post-SUSFS seqno step, and that step never ran: KernelSU still writes policyload=0 to /sys/fs/selinux/status and nothing asserted otherwise. Add 'apply_nomount_stack.sh seqno' after the SUSFS enable patch."
+    fi
+    if [ "$(setprocattr_state)" = deferred ]; then
+        die "the _hook step deferred equalise_setprocattr_timing to the post-SUSFS postsusfs step, and that step never ran: nothing equalises the two attr/current arms and the timing asymmetry ships unasserted. Add 'apply_nomount_stack.sh postsusfs' after the SUSFS enable patch."
     fi
     CONFIG_STRICT=1
     assert_config CONFIG_NOMOUNT "the engine is behind CONFIG_NOMOUNT; without it fs/nomount.o is not built at all"
