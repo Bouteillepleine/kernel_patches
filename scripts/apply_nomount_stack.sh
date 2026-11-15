@@ -617,16 +617,30 @@ verify_hook() {
     # (KSUN, SukiSU-Ultra, BakaSU), and the function it patches is my_setprocattr
     # on two of them and ksu_handle_selinux_setprocattr on the third -- hence the
     # name-agnostic assertions below.
-    # Exactly one of the two hooks has to carry the equalisation. susfs 9b0b13f
-    # moved setprocattr into security/selinux/hooks.c and reduced selinux_hide.c
-    # to a shell, so on such a tree the KernelSU-side assertions below have no
-    # function to find; on an older susfs the kernel-side one does not exist.
-    # Neither arm carrying a probe is the state that silently ships the DANGER
-    # row, which is why this is an if/else and not a pair of soft checks.
-    if grep -q 'susfs_selinux_lsm_setattr' "$d/security/selinux/hooks.c" 2>/dev/null; then
-        verify_hook_probe_susfs "$d/security/selinux/hooks.c" "$nfs"
+    # There are two places the setprocattr hook can live and they are NOT
+    # exclusive. susfs has carried a kernel-side copy (susfs_selinux_lsm_setattr
+    # in security/selinux/hooks.c) since a3d321a, 2026-11-07; what 9b0b13f added
+    # was the setxattr pair and the reduction of selinux_hide.c to a shell. So a
+    # current tree usually has BOTH, and an earlier version of this check tested
+    # the kernel-side one and returned, silently skipping every KernelSU-side
+    # assertion below -- the probe-string shape, the abort_creds adjacency and the
+    # placement check -- on a hook that was still present and still patched.
+    # Check each one that exists, and require at least one: neither carrying a
+    # probe is the state that ships the DANGER row.
+    local have_ksu=0 have_susfs=0
+    grep -q 'susfs_selinux_lsm_setattr' "$d/security/selinux/hooks.c" 2>/dev/null && have_susfs=1
+    if [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
+        grep -qE '__nocfi [a-z_]*setprocattr\(' "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c"; then
+        have_ksu=1
+    fi
+    [ "$have_ksu" = 1 ] || [ "$have_susfs" = 1 ] ||
+        die "_hook: neither KernelSU's selinux_hide.c nor security/selinux/hooks.c carries a setprocattr hook this build can equalise. One of them has to, or writing /proc/self/attr/current still times a policy parse on one payload shape and not the other -- the DANGER Duck Detector reports as 'App Zygote attr/current timing'."
+
+    [ "$have_susfs" = 0 ] || verify_hook_probe_susfs "$d/security/selinux/hooks.c" "$nfs"
+
+    if [ "$have_ksu" = 0 ]; then
         assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
-        echo "_hook: verified (setprocattr timing equalised kernel-side)"
+        echo "_hook: verified (setprocattr timing equalised kernel-side only; KernelSU's hook is gone from this tree)"
         return 0
     fi
 
