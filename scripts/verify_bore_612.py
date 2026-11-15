@@ -23,7 +23,7 @@ SITES = [
     ("kernel/fork.c",            "sched_bore_free(tsk);",                    ["free_task"]),
     ("kernel/exit.c",            "list_del_rcu(&p->sibling);",               ["__unhash_process"]),
     ("kernel/sched/core.c",      "sched_bore_init();",                       ["sched_init"]),
-    ("kernel/sched/fair.c",      "update_curr_bore(",                        ["update_curr"]),
+    ("kernel/sched/fair.c",      "update_curr_bore(task_of(curr), delta_exec)", ["update_curr"]),
     ("kernel/sched/fair.c",      "bore_futex_waiting(task_of(curr))",        ["__pick_eevdf", "pick_eevdf"]),
     ("kernel/sched/fair.c",      "bore_futex_waiting(task_of(se))",          ["place_entity"]),
     ("kernel/sched/fair.c",      "u64 slice = sysctl_sched_base_slice;",     ["set_protect_slice"]),
@@ -100,6 +100,22 @@ for rel in sorted({s[0] for s in SITES} | {"kernel/sched/sched.h", "kernel/sched
             problems.append(f"{rel}: {ident!r} is declared only in a "
                             "!CONFIG_SCHED_BORE branch but referenced from live code")
 
+# ---- comment integrity: an insert that landed inside /* */ gives 0 rejects and
+# a compile error about prose. The enclosing-function check cannot see it.
+for rel in sorted({s[0] for s in SITES}):
+    fp = root / rel
+    if not fp.is_file(): continue
+    txt, i, inc = fp.read_text(encoding="utf-8", errors="replace"), 0, False
+    while i < len(txt) - 1:
+        two = txt[i:i+2]
+        if not inc and two == "//":
+            j = txt.find("\n", i); i = len(txt) if j < 0 else j; continue
+        if not inc and two == "/*": inc = True; i += 2; continue
+        if inc and two == "*/": inc = False; i += 2; continue
+        i += 1
+    if inc:
+        problems.append(f"{rel}: ends inside an unterminated block comment - "
+                        "an insert almost certainly landed inside /* */")
 print(f"verify: {checked} hook sites confirmed")
 if problems:
     print(f"verify: {len(problems)} PROBLEM(S)")

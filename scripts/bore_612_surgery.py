@@ -32,6 +32,19 @@ GUARD_RE = re.compile(
     r"\n\tif \((?:sched_feat\(RUN_TO_PARITY\) && curr|curr && protect)"
     r" && protect_slice\(curr\)\)\n\t\treturn curr;\n")
 
+def in_block_comment(text):
+    """True if the text ends inside an unterminated /* */ - the signature of an
+    insert that landed inside a comment."""
+    i, inc = 0, False
+    while i < len(text) - 1:
+        two = text[i:i+2]
+        if not inc and two == "//":
+            j = text.find("\n", i); i = len(text) if j < 0 else j; continue
+        if not inc and two == "/*": inc = True; i += 2; continue
+        if inc and two == "*/": inc = False; i += 2; continue
+        i += 1
+    return inc
+
 def fail(msg):
     sys.stderr.write(f"bore-surgery: ERROR: {msg}\n"); sys.exit(1)
 
@@ -71,6 +84,25 @@ def pick_guard(text):
     head = m.group(0).split("\n")[1].rstrip()      # the `if (...)` line itself
     return text[:m.start()] + "\n" + head + GUARD_BODY + text[m.end():], "applied"
 
+UPDATE_CURR_ANCHOR = "\tif (entity_is_task(curr)) {\n"
+
+def update_curr_hook(text):
+    """Upstream places update_curr_bore() beside `update_curr_task(p, delta_exec)`,
+    which only 2 of the 11 OnePlus 6.12 trees have. On the other 9 that context is
+    absent and `patch -F3` drops the block INTO the fair_server block comment that
+    follows - 0 rejects, then 'use of undeclared identifier behalf'. Anchored
+    insert instead, using task_of(curr) so it needs no local p."""
+    if "update_curr_bore(task_of(curr), delta_exec);" in text:
+        return text, "already applied"
+    if text.count(UPDATE_CURR_ANCHOR) != 1:
+        fail(f"update_curr hook: {text.count(UPDATE_CURR_ANCHOR)} entity_is_task(curr) "
+             "anchors in fair.c, expected exactly 1")
+    block = (UPDATE_CURR_ANCHOR +
+             "#ifdef CONFIG_SCHED_BORE\n"
+             "\t\tupdate_curr_bore(task_of(curr), delta_exec);\n"
+             "#endif /* CONFIG_SCHED_BORE */\n")
+    return text.replace(UPDATE_CURR_ANCHOR, block, 1), "applied"
+
 def dormant(text):
     """sched_bore=0 alone is NOT enough: every hot path gates on the static key,
     which is DEFINE_STATIC_KEY_TRUE and only flipped by a sysctl write."""
@@ -99,9 +131,13 @@ def main():
     t = FAIR.read_text(encoding="utf-8")
     t, s1 = protect_slice(t)
     t, s2 = pick_guard(t)
+    t, s4 = update_curr_hook(t)
+    if in_block_comment(t):
+        fail("fair.c ends inside a block comment after surgery - an insert landed wrong")
     FAIR.write_text(t, encoding="utf-8")
     print(f"bore-surgery: set_protect_slice: {s1}")
     print(f"bore-surgery: pick-eevdf guard:  {s2}")
+    print(f"bore-surgery: update_curr hook:  {s4}")
 
     if a.dormant:
         b = BORE.read_text(encoding="utf-8")
