@@ -278,10 +278,10 @@ index 012d8c7..4335239 100644
  obj-$(CONFIG_SCHED_RT_INVARIANT_TEST) += test_ksched_football.o
 diff --git a/kernel/sched/bore.c b/kernel/sched/bore.c
 new file mode 100644
-index 0000000..4817edf
+index 0000000..b255ebe
 --- /dev/null
 +++ b/kernel/sched/bore.c
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,586 @@
 +/*
 + *  Burst-Oriented Response Enhancer (BORE) CPU Scheduler
 + *  Copyright (C) 2021-2025 Masahito Suzuki <firelzrd@gmail.com>
@@ -702,6 +702,12 @@ index 0000000..4817edf
 +
 +	if (sched_credit_cap_us)
 +		static_branch_enable(&sched_credit_key);
++
++	/* Hot paths gate on the key, not the variable, so a sched_bore=0 build
++	 * must disable it here or BORE stays live with the knob reading 0.
++	 * jump_label_init() runs before sched_init(), so this is safe. */
++	if (!sched_bore)
++		static_branch_disable(&sched_bore_key);
 +}
 +
 +static void readjust_all_task_weights(void) {
