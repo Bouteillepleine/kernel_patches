@@ -1,0 +1,491 @@
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -25,482 +25,22 @@
+ #include <ss/services.h>
+ #include <ss/mls.h>
+ #include <ss/conditional.h>
+ #include "avc.h"
+ #include "klog.h" // IWYU pragma: keep
+-#include "linux/kallsyms.h"
+ #include "objsec.h"
+-#include "hook/patch_memory.h"
+ #include "ksu.h"
+ #include "policy/feature.h"
+-#include "hook/lsm_hook.h"
+ 
+ static DEFINE_MUTEX(selinux_hide_mutex);
+-static bool ksu_selinux_hide_enabled __read_mostly = false;
+-static bool ksu_selinux_hide_running __read_mostly = false;
+-static bool ksu_selinux_hide_keep_backup __read_mostly = false;
++bool ksu_selinux_hide_enabled __read_mostly = false;
++bool ksu_selinux_hide_running __read_mostly = false;
+ 
+-enum sel_inos {
+-    SEL_ROOT_INO = 2,
+-    SEL_LOAD, /* load policy */
+-    SEL_ENFORCE, /* get or set enforcing status */
+-    SEL_CONTEXT, /* validate context */
+-    SEL_ACCESS, /* compute access decision */
+-    SEL_CREATE, /* compute create labeling decision */
+-    SEL_RELABEL, /* compute relabeling decision */
+-    SEL_USER, /* compute reachable user contexts */
+-    SEL_POLICYVERS, /* return policy version for this kernel */
+-    SEL_COMMIT_BOOLS, /* commit new boolean values */
+-    SEL_MLS, /* return if MLS policy is enabled */
+-    SEL_DISABLE, /* disable SELinux until next reboot */
+-    SEL_MEMBER, /* compute polyinstantiation membership decision */
+-    SEL_CHECKREQPROT, /* check requested protection, not kernel-applied one */
+-    SEL_COMPAT_NET, /* whether to use old compat network packet controls */
+-    SEL_REJECT_UNKNOWN, /* export unknown reject handling to userspace */
+-    SEL_DENY_UNKNOWN, /* export unknown deny handling to userspace */
+-    SEL_STATUS, /* export current status using mmap() */
+-    SEL_POLICY, /* allow userspace to read the in kernel policy */
+-    SEL_VALIDATE_TRANS, /* compute validatetrans decision */
+-    SEL_INO_NEXT, /* The next inode number to use */
+-};
++DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
++struct page *fake_status = NULL;
+ 
+-typedef ssize_t (*write_op_fn)(struct file *, char *, size_t);
+-
+-static write_op_fn *selinux_write_op;
+-
+-static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+-                                               u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);
+-static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+-                                               u32 *scontext_len);
+-static int security_context_to_sid_live(const char *scontext, u32 scontext_len, u32 *sid);
+-static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
+-                                                 struct av_decision *avd);
+-static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
+-                                          u16 tclass, u32 permissions, const char *reason) = NULL;
+-static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
+-                                            struct context *tcontext, u16 tclass, struct av_decision *avd,
+-                                            struct extended_perms *xperms) = NULL;
+-
+-static write_op_fn *context_write, *access_write;
+-static write_op_fn orig_context_write, orig_access_write;
+-
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+-#define ksu_avc_has_perm_compat(...) avc_has_perm(__VA_ARGS__)
+-#define ksu_security_bounded_transition_compat(...) security_bounded_transition(__VA_ARGS__)
+-#define ksu_security_validate_transition_compat(...) security_validate_transition(__VA_ARGS__)
+-#else
+-#define ksu_avc_has_perm_compat(...) avc_has_perm(&selinux_state, __VA_ARGS__)
+-#define ksu_security_bounded_transition_compat(...) security_bounded_transition(&selinux_state, __VA_ARGS__)
+-#define ksu_security_validate_transition_compat(...) security_validate_transition(&selinux_state, __VA_ARGS__)
+-#endif
+-
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+-#define ksu_task_security_struct task_security_struct
+-#else
+-#define ksu_task_security_struct cred_security_struct
+-#endif
+-
+-static ssize_t my_write_context(struct file *file, char *buf, size_t size)
+-{
+-    // apply to all app uids
+-    if (likely(current_uid().val < 10000)) {
+-        return orig_context_write(file, buf, size);
+-    }
+-    char *canon = NULL;
+-    u32 sid, len;
+-    ssize_t length;
+-
+-    length =
+-        ksu_avc_has_perm_compat(current_sid(), SECINITSID_SECURITY, SECCLASS_SECURITY, SECURITY__CHECK_CONTEXT, NULL);
+-    if (length)
+-        goto out;
+-    length = security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+-    if (length) {
+-        goto out;
+-    }
+-
+-    length = security_sid_to_context_with_policy(backup_sepolicy, sid, &canon, &len);
+-    if (length)
+-        goto out;
+-
+-    length = -ERANGE;
+-    if (len > SIMPLE_TRANSACTION_LIMIT) {
+-        pr_err("SELinux: %s:  context size (%u) exceeds "
+-               "payload max\n",
+-               __func__, len);
+-        goto out;
+-    }
+-
+-    memcpy(buf, canon, len);
+-    length = len;
+-out:
+-    kfree(canon);
+-    return length;
+-}
+-
+-static ssize_t my_write_access(struct file *file, char *buf, size_t size)
+-{
+-    // apply to all app uids
+-    if (likely(current_uid().val < 10000)) {
+-        return orig_access_write(file, buf, size);
+-    }
+-    char *scon = NULL, *tcon = NULL;
+-    u32 ssid, tsid, sconlen, tconlen;
+-    u16 tclass;
+-    struct av_decision avd;
+-    ssize_t length;
+-
+-    length = ksu_avc_has_perm_compat(current_sid(), SECINITSID_SECURITY, SECCLASS_SECURITY, SECURITY__COMPUTE_AV, NULL);
+-    if (length)
+-        goto out;
+-
+-    length = -ENOMEM;
+-    scon = kzalloc(size + 1, GFP_KERNEL);
+-    if (!scon)
+-        goto out;
+-
+-    length = -ENOMEM;
+-    tcon = kzalloc(size + 1, GFP_KERNEL);
+-    if (!tcon)
+-        goto out;
+-
+-    length = -EINVAL;
+-    if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
+-        goto out;
+-
+-    sconlen = strlen(scon);
+-    tconlen = strlen(tcon);
+-
+-    length =
+-        security_context_to_sid_with_policy(backup_sepolicy, scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+-    if (length) {
+-        goto out;
+-    }
+-
+-    length =
+-        security_context_to_sid_with_policy(backup_sepolicy, tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL);
+-    if (length) {
+-        goto out;
+-    }
+-
+-    security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);
+-
+-    // stock reads 1; a loader load_policy may have bumped the backup before we load
+-    avd.seqno = 1;
+-    length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", avd.allowed, 0xffffffff, avd.auditallow,
+-                       avd.auditdeny, avd.seqno, avd.flags);
+-out:
+-    kfree(tcon);
+-    kfree(scon);
+-    return length;
+-}
+-
+-static int my_setprocattr(const char *name, void *value, size_t size);
+-struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
+-
+-/*
+- * get the security ID of a set of credentials
+- */
+-static inline u32 cred_sid(const struct cred *cred)
+-{
+-    const struct ksu_task_security_struct *tsec;
+-
+-    tsec = selinux_cred(cred);
+-    return tsec->sid;
+-}
+-
+-/*
+- * get the objective security ID of a task
+- */
+-static inline u32 task_sid_obj(const struct task_struct *task)
+-{
+-    u32 sid;
+-
+-    rcu_read_lock();
+-    sid = cred_sid(__task_cred(task));
+-    rcu_read_unlock();
+-    return sid;
+-}
+-
+-static u32 ptrace_parent_sid(void)
+-{
+-    u32 sid = 0;
+-    struct task_struct *tracer;
+-
+-    rcu_read_lock();
+-    tracer = ptrace_parent(current);
+-    if (tracer)
+-        sid = task_sid_obj(tracer);
+-    rcu_read_unlock();
+-
+-    return sid;
+-}
+-
+-typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
+-static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+-{
+-    if (likely(current_uid().val < 10000)) {
+-        goto call_orig;
+-    }
+-
+-    if (strcmp(name, "current")) {
+-        goto call_orig;
+-    }
+-
+-    struct ksu_task_security_struct *tsec;
+-    struct cred *new;
+-    u32 mysid = current_sid(), sid = 0, tmp_sid, ptsid;
+-    int error, error2;
+-    char *str = value;
+-
+-    error = ksu_avc_has_perm_compat(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
+-    if (error)
+-        return error;
+-
+-    /* Obtain a SID for the context, if one was specified. */
+-    if (size && str[0] && str[0] != '\n') {
+-        if (str[size - 1] == '\n') {
+-            str[size - 1] = 0;
+-            size--;
+-        }
+-        error = security_context_to_sid_live(value, size, &sid);
+-        if (error == -EAGAIN) {
+-            // stale type mark, use the dual parse
+-            error2 = security_context_to_sid_with_policy(backup_sepolicy, value, size, &tmp_sid, SECSID_NULL,
+-                                                         GFP_KERNEL, &sid, &error);
+-            if (error2 || error) {
+-                /* Fork coverage, not the main arm. KernelSU#3981 RESTORED the
+-                   `str[0] != '\n'` guard that #3969 had dropped, so on mainline a
+-                   newline payload no longer reaches any parse and falls to the
+-                   else arm below -- which is where the compensation that matters
+-                   now sits, as it did before #3969. This arm still pays on a fork
+-                   that kept #3969's condition (BakaSU) or drops the guard again,
+-                   and it is keyed on a shape test of OUR own rather than on
+-                   upstream's condition: anchoring on theirs is what let this block
+-                   invert silently once already, patch still applying at fuzz 0,
+-                   and #3981 is the fourth move of that condition. */
+-                static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
+-                u32 probe_sid = 0, probe_tmp_sid = 0;
+-                int probe_rc = 0, probe_i, probe_colons = 0;
+-                size_t probe_n;
+-
+-                for (probe_n = 0; probe_n < size; probe_n++)
+-                    if (str[probe_n] == ':')
+-                        probe_colons++;
+-                if (probe_colons < 3 || !((str[0] >= 'a' && str[0] <= 'z') ||
+-                                          (str[0] >= 'A' && str[0] <= 'Z') ||
+-                                          (str[0] >= '0' && str[0] <= '9')))
+-                    /* 2, and the count is NOT a tuning knob -- SETTLED 2026-11-08
+-                       on an OP15 by building this loop at TWENTY. Two, three and
+-                       twenty parses all give the same DuckDetector reading: 0 or
+-                       +52ns, one tick of the 19.2MHz counter, flipping run to run.
+-                       Twenty extra context parses are microseconds; if any of this
+-                       landed on the path that card times, the number would have
+-                       gone hugely negative. It did not move at all, so the
+-                       compensation is NOT on that path and no count will ever
+-                       change the verdict.
+-                       What is left is stock content-dependence: a well-formed
+-                       context walks the whole string and does a type lookup, a
+-                       malformed one dies at the first field, on any kernel -- a
+-                       root-shell A/B measures +3.5us of it on the stock handler.
+-                       DD hedges the row itself ("supporting information, not
+-                       proof of hiding").
+-                       DO NOT RE-TUNE THIS NUMBER. The experiment is already
+-                       done. */
+-                    for (probe_i = 0; probe_i < 2; probe_i++)
+-                        security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx,
+-                                                            sizeof(ksu_probe_ctx) - 1, &probe_tmp_sid, SECSID_NULL,
+-                                                            GFP_KERNEL, &probe_sid, &probe_rc);
+-                new = prepare_creds();
+-                if (new)
+-                    abort_creds(new);
+-                return error2 ?: error;
+-            }
+-        } else if (error) {
+-            return error;
+-        }
+-    } else {
+-        /* #3981's restored guard routes every newline-prefixed payload here, plus
+-           an empty one on either shape. This is the cheap arm the detector times
+-           against the dual parse above, so it is the one that has to pay. */
+-        static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
+-        u32 probe_sid = 0, probe_tmp_sid = 0;
+-        int probe_rc = 0, probe_i;
+-
+-        for (probe_i = 0; probe_i < 2; probe_i++)
+-            security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
+-                                                &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
+-    }
+-
+-    new = prepare_creds();
+-    if (!new)
+-        return -ENOMEM;
+-
+-    /* Permission checking based on the specified context is
+-	   performed during the actual operation (execve,
+-	   open/mkdir/...), when we know the full context of the
+-	   operation.  See selinux_bprm_creds_for_exec for the execve
+-	   checks and may_create for the file creation checks. The
+-	   operation will then fail if the context is not permitted. */
+-    tsec = selinux_cred(new);
+-    error = -EINVAL;
+-    if (sid == 0)
+-        goto abort_change;
+-
+-    if (!current_is_single_threaded()) {
+-        error = ksu_security_bounded_transition_compat(tsec->sid, sid);
+-        if (error)
+-            goto abort_change;
+-    }
+-
+-    /* Check permissions for the transition. */
+-    error = ksu_avc_has_perm_compat(tsec->sid, sid, SECCLASS_PROCESS, PROCESS__DYNTRANSITION, NULL);
+-    if (error)
+-        goto abort_change;
+-
+-    /* Check for ptracing, and update the task SID if ok.
+-        Otherwise, leave SID unchanged and fail. */
+-    ptsid = ptrace_parent_sid();
+-    if (ptsid != 0) {
+-        error = ksu_avc_has_perm_compat(ptsid, sid, SECCLASS_PROCESS, PROCESS__PTRACE, NULL);
+-        if (error)
+-            goto abort_change;
+-    }
+-
+-    tsec->sid = sid;
+-
+-    commit_creds(new);
+-    return size;
+-
+-abort_change:
+-    abort_creds(new);
+-    return error;
+-
+-call_orig:
+-    return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
+-}
+-
+-static int (*inode_doinit_with_dentry_fn)(struct inode *inode, struct dentry *dentry);
+-static struct ksu_lsm_hook selinux_inode_setxattr_hook;
+-typedef typeof(((union security_list_options *)0)->inode_setxattr) inode_setxattr_fn;
+-
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+-static int __nocfi my_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry, const char *name,
+-                                     const void *value, size_t size, int flags)
+-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+-static int __nocfi my_inode_setxattr(struct user_namespace *mnt_userns, struct dentry *dentry, const char *name,
+-                                     const void *value, size_t size, int flags)
+-#else
+-static int __nocfi my_inode_setxattr(struct dentry *dentry, const char *name, const void *value, size_t size, int flags)
+-#endif
+-{
+-    struct inode *inode = d_backing_inode(dentry);
+-    struct inode_security_struct *isec;
+-    struct superblock_security_struct *sbsec;
+-    struct common_audit_data ad;
+-    u32 sid = current_sid(), newsid, backup_sid;
+-    int rc, backup_rc;
+-
+-    if (likely(current_uid().val < 10000) || strcmp(name, XATTR_NAME_SELINUX))
+-        goto call_orig;
+-
+-    // Keep native force parsing for callers with CAP_MAC_ADMIN
+-    if (!cap_capable(current_cred(), &init_user_ns, CAP_MAC_ADMIN, CAP_OPT_NOAUDIT))
+-        goto call_orig;
+-
+-    sbsec = ksu_selinux_superblock(inode->i_sb);
+-    if (!(sbsec->flags & SBLABEL_MNT))
+-        return -EOPNOTSUPP;
+-
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+-    if (!inode_owner_or_capable(idmap, inode))
+-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+-    if (!inode_owner_or_capable(mnt_userns, inode))
+-#else
+-    if (!inode_owner_or_capable(inode))
+-#endif
+-        return -EPERM;
+-
+-    isec = ksu_selinux_inode(inode);
+-    if (IS_ERR(isec))
+-        return PTR_ERR(isec);
+-    // Match backing_inode_security: keep old label if reload fails
+-    if (READ_ONCE(isec->initialized) != LABEL_INITIALIZED)
+-        inode_doinit_with_dentry_fn(inode, dentry);
+-
+-    ad.type = LSM_AUDIT_DATA_DENTRY;
+-    ad.u.dentry = dentry;
+-    rc = ksu_avc_has_perm_compat(sid, isec->sid, isec->sclass, FILE__RELABELFROM, &ad);
+-    if (rc)
+-        return rc;
+-
+-    // Keep context parsing after native relabelfrom check
+-    rc = security_context_to_sid_live(value, size, &newsid);
+-    if (rc == -EAGAIN) {
+-        backup_rc = security_context_to_sid_with_policy(backup_sepolicy, value, size, &backup_sid, SECSID_NULL,
+-                                                        GFP_KERNEL, &newsid, &rc);
+-        rc = backup_rc ?: rc;
+-    }
+-
+-    if (rc == -EINVAL) {
+-        struct audit_buffer *ab;
+-        size_t audit_size = value ? size : 0;
+-
+-        // Strip only final NUL so embedded NUL bytes remain in audit log
+-        if (audit_size && ((const char *)value)[audit_size - 1] == '\0')
+-            audit_size--;
+-        ab = audit_log_start(audit_context(), GFP_ATOMIC, AUDIT_SELINUX_ERR);
+-        if (ab) {
+-            audit_log_format(ab, "op=setxattr invalid_context=");
+-            audit_log_n_untrustedstring(ab, value, audit_size);
+-            audit_log_end(ab);
+-        }
+-    }
+-    if (rc)
+-        return rc;
+-
+-    rc = ksu_avc_has_perm_compat(sid, newsid, isec->sclass, FILE__RELABELTO, &ad);
+-    if (rc)
+-        return rc;
+-    rc = ksu_security_validate_transition_compat(isec->sid, newsid, sid, isec->sclass);
+-    if (rc)
+-        return rc;
+-    return ksu_avc_has_perm_compat(newsid, sbsec->sid, SECCLASS_FILESYSTEM, FILESYSTEM__ASSOCIATE, &ad);
+-
+-call_orig:
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+-    return ((inode_setxattr_fn)selinux_inode_setxattr_hook.original)(idmap, dentry, name, value, size, flags);
+-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+-    return ((inode_setxattr_fn)selinux_inode_setxattr_hook.original)(mnt_userns, dentry, name, value, size, flags);
+-#else
+-    return ((inode_setxattr_fn)selinux_inode_setxattr_hook.original)(dentry, name, value, size, flags);
+-#endif
+-}
+-
+-static struct ksu_lsm_hook selinux_inode_setxattr_hook =
+-    KSU_LSM_HOOK_INIT(inode_setxattr, "selinux_inode_setxattr", my_inode_setxattr, 0);
+-
+-static int selinux_hide_init_setxattr()
+-{
+-    int ret;
+-
+-    ret = ksu_selinux_superblock_init();
+-    if (ret)
+-        return ret;
+-
+-    inode_doinit_with_dentry_fn = ksu_resolve_symbol_for_functable_hook("inode_doinit_with_dentry");
+-    // Set original before publishing callback to other CPUs
+-    selinux_inode_setxattr_hook.original = ksu_resolve_symbol_for_functable_hook("selinux_inode_setxattr");
+-    if (!inode_doinit_with_dentry_fn || !selinux_inode_setxattr_hook.original)
+-        return -ENOENT;
+-    return 0;
+-}
+-
+-static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
+-static struct page *fake_status = NULL;
+-
+-static void initialize_fake_status()
++void initialize_fake_status()
+ {
+     mutex_lock(&selinux_state.status_lock);
+     if (fake_status)
+         goto out;
+     if (!selinux_state.status_page) {

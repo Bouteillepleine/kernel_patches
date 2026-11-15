@@ -56,7 +56,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 <all|hookless|record-version|hook|seqno|pathhide|ghost|assert-config>" >&2
+    echo "usage: $0 <all|hookless|record-version|hook|seqno|postsusfs|pathhide|ghost|assert-config>" >&2
     echo "       $0 seqno-form <KernelSU tree>   (prints zero|upstream|split:N|none|missing)" >&2
     echo "       $0 verify [hookless] [hook] [pathhide] [ghost]   (default: all four)" >&2
     exit 2
@@ -439,6 +439,41 @@ awk_abort_creds_arm() {
     ' "$1"
 }
 
+# The kernel-side twin of the selinux_hide.c probe checks below. susfs 9b0b13f
+# moved KernelSU's setprocattr hook into security/selinux/hooks.c as
+# susfs_selinux_lsm_setattr(), a copy of the mainline hook that uid>=10000 reaches
+# while selinux_hide runs -- and the reduction it applies to selinux_hide.c deletes
+# the function the KernelSU-side probe lived in. Fewer checks here because the
+# shape is simpler: susfs's copy keeps mainline's SINGLE parse and its
+# `str[0] != '\n'` guard, so there is one cheap arm and one expensive one, and the
+# cheap one is a plain else. The two checks that encode measurements still apply.
+#
+# The loop COUNT is not transferable from the KernelSU-side probe: that one was
+# calibrated against a dual parse (3 ticks -> 1 with one parse, 0 with two, at
+# 52ns a tick). Against a single parse the right count is an open measurement --
+# re-read DuckDetector's A/B row on device before trusting it.
+verify_hook_probe_susfs() {
+    local f="$1" nfs="$2" probe_ctx probe_type probe_range probe_loop needle
+    infn "$f" '^static int susfs_selinux_lsm_setattr' 'ksu_probe_ctx' \
+        "_hook: the timing probe is not inside susfs_selinux_lsm_setattr(). susfs moved the setprocattr hook kernel-side and deleted KernelSU's copy with it, so without this the newline-prefixed payload skips susfs_security_context_to_sid() while an invalid type pays for it -- the 'App Zygote attr/current timing' DANGER, straight back."
+    probe_ctx=$(sed -n 's/.*static const char ksu_probe_ctx\[\] = "\([^"]*\)".*/\1/p' "$f" | head -n1)
+    [ -n "$probe_ctx" ] ||
+        die "_hook: could not read ksu_probe_ctx out of $f, so the probe string cannot be checked."
+    probe_type=$(printf '%s' "$probe_ctx" | cut -d: -f3)
+    probe_range=$(printf '%s' "$probe_ctx" | cut -d: -f4)
+    needle="\":$probe_type:\""
+    case "$nfs" in
+    *"$needle"*) ;;
+    *) die "_hook: the probe context '$probe_ctx' uses type '$probe_type', which is NOT in the hidden-type list [$nfs]. susfs resolves it through susfs_string_to_context_struct(), which only treats a type as absent while susfs_is_sus_type_rcu() claims it -- a type this cloak does not hide resolves normally and the probe goes cheap." ;;
+    esac
+    [ -n "$probe_range" ] ||
+        die "_hook: the probe context '$probe_ctx' carries no MLS range. The detector's payload does, and the range parse is the larger half of what the policy charges for it."
+    probe_loop=$(awk '/^static int susfs_selinux_lsm_setattr/,/^}/' "$f" 2>/dev/null |
+        grep -c 'probe_i < [2-9]') || true
+    [ "${probe_loop:-0}" -ge 1 ] ||
+        die "_hook: the kernel-side timing probe parses the context fewer than twice. If you meant to retune this, change the count -- do not remove the loop."
+}
+
 verify_hook() {
     local d="$COMMON_KERNEL_FOLDER"
     has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
@@ -582,6 +617,19 @@ verify_hook() {
     # (KSUN, SukiSU-Ultra, BakaSU), and the function it patches is my_setprocattr
     # on two of them and ksu_handle_selinux_setprocattr on the third -- hence the
     # name-agnostic assertions below.
+    # Exactly one of the two hooks has to carry the equalisation. susfs 9b0b13f
+    # moved setprocattr into security/selinux/hooks.c and reduced selinux_hide.c
+    # to a shell, so on such a tree the KernelSU-side assertions below have no
+    # function to find; on an older susfs the kernel-side one does not exist.
+    # Neither arm carrying a probe is the state that silently ships the DANGER
+    # row, which is why this is an if/else and not a pair of soft checks.
+    if grep -q 'susfs_selinux_lsm_setattr' "$d/security/selinux/hooks.c" 2>/dev/null; then
+        verify_hook_probe_susfs "$d/security/selinux/hooks.c" "$nfs"
+        assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
+        echo "_hook: verified (setprocattr timing equalised kernel-side)"
+        return 0
+    fi
+
     [ -f "$KSU_FOLDER/kernel/feature/selinux_hide.c" ] ||
         die "_hook: $KSU_FOLDER/kernel/feature/selinux_hide.c does not exist, so equalise_setprocattr_timing cannot be verified. If this fork keeps the setprocattr hook elsewhere, the patch did not land and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other."
     infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'ksu_probe_ctx' \
@@ -951,6 +999,26 @@ do_seqno() {
     seqno_apply "$HOOK"
     verify_seqno
     seqno_mark decided
+    echo "::endgroup::"
+}
+
+# susfs 9b0b13f moved KernelSU's setprocattr hook kernel-side, so the probe that
+# equalises its two arms has to be re-applied there -- the reduction susfs applies
+# to selinux_hide.c deletes the function the KernelSU-side probe lived in. On a
+# susfs that predates the move susfs_selinux_lsm_setattr() does not exist and this
+# is a no-op; verify_hook then still requires the KernelSU-side probe, so neither
+# world can ship without one.
+do_postsusfs() {
+    need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER
+    echo "::group::Equalise setprocattr timing (after SUSFS)"
+    local HOOK="$BOUTEILLE_KERNEL_PATCHES_FOLDER/common/_hook"
+    if grep -q 'susfs_selinux_lsm_setattr' "$COMMON_KERNEL_FOLDER/security/selinux/hooks.c"; then
+        normalise "$HOOK/equalise_setprocattr_timing_susfs.patch"
+        apply_or_die "$HOOK/equalise_setprocattr_timing_susfs.patch"
+        echo "postsusfs: equalised the susfs kernel-side setprocattr arms"
+    else
+        echo "postsusfs: no susfs_selinux_lsm_setattr in this tree; the KernelSU-side probe still owns setprocattr timing"
+    fi
     echo "::endgroup::"
 }
 
@@ -1375,6 +1443,11 @@ hook)
 seqno)
     need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER KSU_FOLDER
     do_seqno
+    ;;
+postsusfs)
+    need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER
+    resolve_kv
+    do_postsusfs
     ;;
 # Read-only, and the reason the CI job that measures the patch's fit against every
 # KSU fork does not carry its own copy of these greps: one classifier, one answer.

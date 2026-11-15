@@ -1,0 +1,3 @@
+# sha256 of kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch this set fits.
+16dd557a9d480397f50de6b79418d6ccc5bed9bc9f2234ed4aa07d36b067a69d  # susfs 1f59001, 2026-11-15 (sus_path_uid_filter)
+95360453752d7fd94b2d7f9af484a7b223fa725854dca16d88a99e5eb3560c27  # susfs 395a8c0, 2026-11-09

@@ -1,0 +1,87 @@
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -45,64 +45,83 @@
+ 		}
+ 		error = susfs_security_context_to_sid(value, size,
+ 						&sid, GFP_KERNEL);
+ 		if (error == -EINVAL && attr == LSM_ATTR_FSCREATE) {
+ 			if (!has_cap_mac_admin(true)) {
+ 				struct audit_buffer *ab;
+ 				size_t audit_size;
+ 
+ 				/* We strip a nul only if it is at the end,
+ 				 * otherwise the context contains a nul and
+ 				 * we should audit that */
+ 				if (str[size - 1] == '\0')
+ 					audit_size = size - 1;
+ 				else
+ 					audit_size = size;
+ 				ab = audit_log_start(audit_context(),
+ 						     GFP_ATOMIC,
+ 						     AUDIT_SELINUX_ERR);
+ 				if (!ab)
+ 					return error;
+ 				audit_log_format(ab, "op=fscreate invalid_context=");
+ 				audit_log_n_untrustedstring(ab, value,
+ 							    audit_size);
+ 				audit_log_end(ab);
+ 
+ 				return error;
+ 			}
+ 			error = security_context_to_sid_force(value, size,
+ 							&sid);
+ 		}
+ 		if (error)
+ 			return error;
++	} else {
++		/* susfs 9b0b13f moved the setprocattr hook kernel-side, so the arm the
++		 * detector times is this one: a newline-prefixed or empty payload skips
++		 * susfs_security_context_to_sid() entirely while an invalid type pays for
++		 * it. Charge the cheap arm, as equalise_setprocattr_timing_live did in
++		 * KernelSU's my_setprocattr before the hook moved out of selinux_hide.c.
++		 * The loop count is a measured quantity, not a guess: the expensive arm
++		 * here is a SINGLE susfs_security_context_to_sid(), not the dual parse the
++		 * KernelSU-side probe was calibrated against, so re-read DuckDetector's
++		 * A/B row on device before trusting this number.
++		 */
++		static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
++		u32 probe_sid;
++		int probe_i;
++
++		for (probe_i = 0; probe_i < 2; probe_i++)
++			susfs_security_context_to_sid(ksu_probe_ctx,
++						sizeof(ksu_probe_ctx) - 1,
++						&probe_sid, GFP_KERNEL);
+ 	}
+ 
+ 	new = prepare_creds();
+ 	if (!new)
+ 		return -ENOMEM;
+ 
+ 	/* Permission checking based on the specified context is
+ 	   performed during the actual operation (execve,
+ 	   open/mkdir/...), when we know the full context of the
+ 	   operation.  See selinux_bprm_creds_for_exec for the execve
+ 	   checks and may_create for the file creation checks. The
+ 	   operation will then fail if the context is not permitted. */
+ 	tsec = selinux_cred(new);
+ 	if (attr == LSM_ATTR_EXEC) {
+ 		tsec->exec_sid = sid;
+ 	} else if (attr == LSM_ATTR_FSCREATE) {
+ 		tsec->create_sid = sid;
+ 	} else if (attr == LSM_ATTR_KEYCREATE) {
+ 		if (sid) {
+ 			error = avc_has_perm(mysid, sid,
+ 					     SECCLASS_KEY, KEY__CREATE, NULL);
+ 			if (error)
+ 				goto abort_change;
+ 		}
+ 		tsec->keycreate_sid = sid;
+ 	} else if (attr == LSM_ATTR_SOCKCREATE) {
+ 		tsec->sockcreate_sid = sid;
+ 	} else if (attr == LSM_ATTR_CURRENT) {
+ 		error = -EINVAL;
+ 		if (sid == 0)
+ 			goto abort_change;
+ 

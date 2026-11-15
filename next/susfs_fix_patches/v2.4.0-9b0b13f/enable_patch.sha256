@@ -1,0 +1,4 @@
+# sha256 of kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch this set fits.
+# SUSFS_VERSION does not move when susfs regenerates that patch, so the sum is
+# the key; see the selector in .github/actions/build-kernel/action.yml.
+601de796e5e63d4a87808e5199738c6623c4190004baafa904338b5d837b2837  # susfs 9b0b13f, 2026-11-15: selinux_hide reduced to a shell, hooks moved kernel-side
