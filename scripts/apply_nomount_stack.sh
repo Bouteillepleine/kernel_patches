@@ -1074,20 +1074,32 @@ do_postsusfs() {
     need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER
     echo "::group::Equalise setprocattr timing (after SUSFS)"
     local HOOK="$BOUTEILLE_KERNEL_PATCHES_FOLDER/common/_hook"
+    # The two hooks are NOT exclusive and verify_hook requires a probe in EVERY
+    # one that exists, so this places a probe in every one that exists -- not the
+    # first that matches. On SukiSU and KSUN the reduction deletes KernelSU's hook
+    # and only the kernel-side arm is left; BakaSU keeps a selinux_hide.c the
+    # reduction does not fit (1837 lines, its hunks reject) and ends up with BOTH.
+    # An either/or here would have left BakaSU's hook unprobed and failed the
+    # post-SUSFS verify -- which is what do_hook used to cover by applying the
+    # KernelSU-side probe up front, at the cost of breaking the reduction.
+    local placed=0
     if grep -q 'susfs_selinux_lsm_setattr' "$COMMON_KERNEL_FOLDER/security/selinux/hooks.c"; then
         normalise "$HOOK/equalise_setprocattr_timing_susfs.patch"
         apply_or_die "$HOOK/equalise_setprocattr_timing_susfs.patch"
         echo "postsusfs: equalised the susfs kernel-side setprocattr arms"
-    elif [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
+        placed=1
+    fi
+    if [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
         grep -qE '__nocfi [a-z_]*setprocattr\(' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
-        # This SUSFS does not move the hook kernel-side, and its reduction left
-        # KernelSU's one standing. The probe belongs there -- applied now, on the
-        # shape SUSFS actually produced, rather than on a guess made before it ran.
+        # SUSFS left KernelSU's hook standing, so the probe belongs there too --
+        # applied now, on the shape SUSFS actually produced, rather than before it
+        # had its say about the file.
         setprocattr_apply "$HOOK"
         echo "postsusfs: equalised the KernelSU-side setprocattr arms"
-    else
-        die "postsusfs: after SUSFS neither security/selinux/hooks.c nor KernelSU's selinux_hide.c carries a setprocattr hook, so nothing can equalise the attr/current timing -- and the _hook step deferred the probe on the promise that this step would place it. The DANGER Duck Detector reports this as 'App Zygote attr/current timing'."
+        placed=1
     fi
+    [ "$placed" = 1 ] ||
+        die "postsusfs: after SUSFS neither security/selinux/hooks.c nor KernelSU's selinux_hide.c carries a setprocattr hook, so nothing can equalise the attr/current timing -- and the _hook step deferred the probe on the promise that this step would place it. The DANGER Duck Detector reports this as 'App Zygote attr/current timing'."
     setprocattr_mark decided
     echo "::endgroup::"
 }
