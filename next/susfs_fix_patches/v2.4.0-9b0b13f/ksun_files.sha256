@@ -1,0 +1,15 @@
+# sha256 of the PRISTINE KernelSU-Next files this fix set patches, taken
+# BEFORE 10_enable_susfs_for_ksu.patch is applied. The set is keyed on the
+# susfs enable patch (enable_patch.sha256) but also depends on KSUN content;
+# this is that second key. A mismatch is a WARNING, not an error -- it only
+# matters if the matching fix patch then fails.
+# taken from KernelSU-Next 7ccf61479621f240c0d968ef46f1b167b6ceb500 (origin/dev, 2026-11-15)
+87651a9a520e858b0dac295e7cc5bf15f4e43ed9a34ca1f1472164ddb517de78  kernel/Kbuild
+9479d53a5e1e7f66680682c3db2152f661dbec11f75b90279897c850c40a1f6c  kernel/core/init.c
+84d6add16c11d4906a51a92c95055a65f2cc801f99ed1b0a9c2667b61f25b439  kernel/feature/kernel_umount.c
+30de2610ada01233cd9ab4521716416951be623e710863e8c9bdcbd9e6e69dfb  kernel/feature/selinux_hide.c
+64e62654643e3d3e73e0fcb1849aa3f2bf33728624347293491ec4b16e9fbab4  kernel/feature/sucompat.c
+df977f1ac5d26c61dbdec70d46967ff25e7f8b55c0a62aede7b8a90a0d2b1336  kernel/hook/setuid_hook.c
+505c60b655e3fd9c8779dea3bca627cdab0ccce7e39d7af9e07205aa8a5f37ca  kernel/selinux/rules.c
+6cfefc9a8b739a5fd954e564b1ce21b9dae31fbbfc595f65aa9bfee2e0c3ae8b  kernel/supercall/dispatch.c
+056e1c276b06570dfebb254cfca9df3d077bb3f1ca79f4986e40d12b47a66c0c  kernel/supercall/supercall.c
