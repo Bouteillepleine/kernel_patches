@@ -280,12 +280,14 @@ jobs:
           mkdir -p tree
           # Manifest layout: modules/devicetree at "./", common at
           # "kernel_platform/common". The common tree's kernel/oplus_cpu symlink
-          # (../../../vendor/oplus/kernel/cpu) only resolves with both in place.
+          # (../../../vendor or ../../../../vendor) only resolves with both in place.
           if [ -n "${{ steps.src.outputs.durl }}" ]; then
             git clone --depth=1 -b "${{ steps.src.outputs.drev }}" "${{ steps.src.outputs.durl }}" tree
           fi
           mkdir -p tree/kernel_platform
           git clone --depth=1 -b "${{ steps.src.outputs.crev }}" "${{ steps.src.outputs.curl_ }}" tree/kernel_platform/common
+          # MediaTek trees target ../../vendor, Qualcomm ../../../vendor; bridge the shallow form.
+          ln -sfn ../vendor tree/kernel_platform/vendor
           K="$PWD/tree/kernel_platform/common"
           echo "KDIR=$K" >> "$GITHUB_ENV"
           awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' "$K/Makefile"
@@ -741,6 +743,8 @@ jobs:
           fi
           mkdir -p tree/kernel_platform
           git clone --depth=1 -b "${{ steps.src.outputs.crev }}" "${{ steps.src.outputs.curl_ }}" tree/kernel_platform/common
+          # MediaTek trees target ../../vendor, Qualcomm ../../../vendor; bridge the shallow form.
+          ln -sfn ../vendor tree/kernel_platform/vendor
           K="$PWD/tree/kernel_platform/common"
           echo "KDIR=$K" >> "$GITHUB_ENV"
           awk '/^VERSION/{a=$3}/^PATCHLEVEL/{b=$3}/^SUBLEVEL/{c=$3}END{print "tree kernel: "a"."b"."c}' "$K/Makefile"
