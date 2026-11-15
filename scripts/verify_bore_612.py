@@ -22,7 +22,7 @@ SITES = [
     ("kernel/fork.c",            "p_bore(tsk) = NULL;",                      ["dup_task_struct"]),
     ("kernel/fork.c",            "sched_bore_free(tsk);",                    ["free_task"]),
     ("kernel/exit.c",            "list_del_rcu(&p->sibling);",               ["__unhash_process"]),
-    ("kernel/sched/core.c",      "sched_init_bore();",                       ["sched_init"]),
+    ("kernel/sched/core.c",      "sched_bore_init();",                       ["sched_init"]),
     ("kernel/sched/fair.c",      "update_curr_bore(",                        ["update_curr"]),
     ("kernel/sched/fair.c",      "bore_futex_waiting(task_of(curr))",        ["__pick_eevdf", "pick_eevdf"]),
     ("kernel/sched/fair.c",      "bore_futex_waiting(task_of(se))",          ["place_entity"]),

@@ -1,6 +1,6 @@
 diff --git a/include/linux/sched/bore.h b/include/linux/sched/bore.h
 new file mode 100644
-index 0000000..9c1288a
+index 0000000..02f6fc3
 --- /dev/null
 +++ b/include/linux/sched/bore.h
 @@ -0,0 +1,99 @@
@@ -87,7 +87,7 @@ index 0000000..9c1288a
 +extern void restart_burst_rescale_deadline_bore(struct task_struct *p);
 +extern void task_fork_bore(struct task_struct *p, struct task_struct *parent,
 +													u64 clone_flags, u64 now);
-+extern void sched_init_bore(void);
++extern void sched_bore_init(void);
 +extern void reset_task_bore(struct task_struct *p);
 +
 +extern int  sched_bore_update_handler(const struct ctl_table *table,
@@ -278,7 +278,7 @@ index 012d8c7..4335239 100644
  obj-$(CONFIG_SCHED_RT_INVARIANT_TEST) += test_ksched_football.o
 diff --git a/kernel/sched/bore.c b/kernel/sched/bore.c
 new file mode 100644
-index 0000000..b255ebe
+index 0000000..86c35aa
 --- /dev/null
 +++ b/kernel/sched/bore.c
 @@ -0,0 +1,586 @@
@@ -688,7 +688,7 @@ index 0000000..b255ebe
 +	}
 +}
 +
-+void __init sched_init_bore(void) {
++void __init sched_bore_init(void) {
 +	printk(KERN_INFO "%s %s by %s\n",
 +		SCHED_BORE_PROGNAME, SCHED_BORE_VERSION, SCHED_BORE_AUTHOR);
 +
@@ -884,7 +884,7 @@ index 80a3df4..1d60357 100644
  
  #ifdef CONFIG_CGROUP_CPUACCT
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 3caa543..3da792b 100644
+index 3caa543..ec62101 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -102,6 +102,10 @@
@@ -915,7 +915,7 @@ index 3caa543..3da792b 100644
  #endif
  
 +#ifdef CONFIG_SCHED_BORE
-+	sched_init_bore();
++	sched_bore_init();
 +#endif /* CONFIG_SCHED_BORE */
 +
  	wait_bit_init();
