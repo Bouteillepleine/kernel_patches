@@ -68,6 +68,20 @@ jobs:
           if [ "$K" = "6.12" ]; then
             sed -i -E 's/^([[:space:]]*)u64 slice = normalized_sysctl_sched_base_slice;/\1u64 slice = sysctl_sched_base_slice;/' common/kernel/sched/fair.c || true
           fi
+          # BORE 7.0.x additionally ships the pick-eevdf guard outside the patch,
+          # because 6 of the 11 OnePlus 6.12 trees carry GKI's run-to-parity rework
+          # and 5 do not, so one hunk cannot match both. Run the same script here so
+          # the pristine-GKI check matches shipped behaviour. Gated on a 7.0.x-only
+          # symbol, so it is a no-op while main still carries BORE 5.9.6.
+          if [ "$K" = "6.12" ] && grep -q 'sched_burst_protect_slice_cond_key' common/kernel/sched/bore.c 2>/dev/null; then
+            SRAW="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/scripts"
+            curl -fsSL "$SRAW/bore_612_surgery.py" -o /tmp/bore_surgery.py
+            curl -fsSL "$SRAW/verify_bore_612.py"  -o /tmp/bore_verify.py
+            ( cd common && python3 -I /tmp/bore_surgery.py ) \
+              || { echo "::error::BORE 6.12 surgery failed"; exit 1; }
+            python3 -I /tmp/bore_verify.py common \
+              || { echo "::error::BORE hook placement verification failed"; exit 1; }
+          fi
           # 5.10: the dequeue_task_fair BORE block was removed from bore_5.10.patch.
           # OnePlus 5.10 trees put an OPLUS_SCHED_TUNE block where the patch expects a
           # blank line, so patch -F3 applied the hunk with fuzz 3 into the function
