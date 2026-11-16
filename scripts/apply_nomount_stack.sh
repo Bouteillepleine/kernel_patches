@@ -320,6 +320,21 @@ setprocattr_mark() { # setprocattr_mark deferred|decided
 # they differ only in the shape they are cut against. Probed on the tree rather
 # than on the fork name, so SukiSU and BakaSU keep the pre-#3981 one until they
 # take the same change, and a KSUN pinned to an older hash still builds.
+# Deferring is only correct where SUSFS brings its OWN setprocattr hook.
+# susfs_selinux_lsm_setattr exists ONLY in 50_add_susfs_in_gki-android16-6.12
+# (measured 2026-11-16: 6.12 -> 2 hits, 6.6 / 6.1 / 5.15 -> 0). On the older
+# branches KernelSU's hook is the ONLY home a probe can have, and the enable
+# patch's reduction deletes it -- so there the probe has to go on BEFORE susfs,
+# where its own lines make that reduction reject and the hook survives to carry
+# it. That reject is load-bearing on <=6.6. Deferring everywhere instead took
+# out 62 of the 64 devices in release run 43760524264 while leaving 6.12 green.
+susfs_owns_setprocattr() {
+    local maj="${KV%%.*}" min="${KV#*.}"
+    [ -n "${KV:-}" ] || return 1
+    [ "$maj" -gt 6 ] 2>/dev/null && return 0
+    [ "$maj" -eq 6 ] 2>/dev/null && [ "$min" -ge 12 ] 2>/dev/null
+}
+
 setprocattr_apply() { # setprocattr_apply <hook dir>
     need KSU_FOLDER
     if grep -q 'security_context_to_sid_live' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
@@ -1089,13 +1104,23 @@ do_postsusfs() {
         echo "postsusfs: equalised the susfs kernel-side setprocattr arms"
         placed=1
     fi
-    if [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
+    if [ "$(setprocattr_state)" = deferred ] &&
+        [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
         grep -qE '__nocfi [a-z_]*setprocattr\(' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
         # SUSFS left KernelSU's hook standing, so the probe belongs there too --
         # applied now, on the shape SUSFS actually produced, rather than before it
-        # had its say about the file.
+        # had its say about the file. Gated on the deferral: when do_hook already
+        # placed it (every branch SUSFS does not own), re-applying would fail as
+        # an already-applied patch.
         setprocattr_apply "$HOOK"
         echo "postsusfs: equalised the KernelSU-side setprocattr arms"
+        placed=1
+    fi
+    # Not deferred means do_hook placed the KernelSU-side probe before SUSFS, and
+    # the pre-SUSFS verify already asserted it in full. Say so rather than going
+    # silent: a step that prints nothing is how a skipped probe hides.
+    if [ "$(setprocattr_state)" != deferred ]; then
+        echo "postsusfs: the KernelSU-side probe went on before SUSFS (${KV:-this tree} has no kernel-side hook to re-place it in); nothing to do here"
         placed=1
     fi
     [ "$placed" = 1 ] ||
@@ -1160,9 +1185,9 @@ do_hook() {
     else
         seqno_apply "$HOOK"
     fi
-    if [ "${SUSFS_ON:-}" = true ]; then
+    if [ "${SUSFS_ON:-}" = true ] && susfs_owns_setprocattr; then
         setprocattr_mark deferred
-        echo "  deferred: equalise_setprocattr_timing (SUSFS reduces selinux_hide.c; the postsusfs step owns it afterwards)"
+        echo "  deferred: equalise_setprocattr_timing (SUSFS reduces selinux_hide.c and owns the hook on $KV; the postsusfs step places the probe)"
     else
         setprocattr_apply "$HOOK"
         setprocattr_mark decided
