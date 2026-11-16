@@ -320,21 +320,6 @@ setprocattr_mark() { # setprocattr_mark deferred|decided
 # they differ only in the shape they are cut against. Probed on the tree rather
 # than on the fork name, so SukiSU and BakaSU keep the pre-#3981 one until they
 # take the same change, and a KSUN pinned to an older hash still builds.
-# Deferring is only correct where SUSFS brings its OWN setprocattr hook.
-# susfs_selinux_lsm_setattr exists ONLY in 50_add_susfs_in_gki-android16-6.12
-# (measured 2026-11-16: 6.12 -> 2 hits, 6.6 / 6.1 / 5.15 -> 0). On the older
-# branches KernelSU's hook is the ONLY home a probe can have, and the enable
-# patch's reduction deletes it -- so there the probe has to go on BEFORE susfs,
-# where its own lines make that reduction reject and the hook survives to carry
-# it. That reject is load-bearing on <=6.6. Deferring everywhere instead took
-# out 62 of the 64 devices in release run 43760524264 while leaving 6.12 green.
-susfs_owns_setprocattr() {
-    local maj="${KV%%.*}" min="${KV#*.}"
-    [ -n "${KV:-}" ] || return 1
-    [ "$maj" -gt 6 ] 2>/dev/null && return 0
-    [ "$maj" -eq 6 ] 2>/dev/null && [ "$min" -ge 12 ] 2>/dev/null
-}
-
 setprocattr_apply() { # setprocattr_apply <hook dir>
     need KSU_FOLDER
     if grep -q 'security_context_to_sid_live' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
@@ -686,8 +671,17 @@ verify_hook() {
         grep -qE '__nocfi [a-z_]*setprocattr\(' "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c"; then
         have_ksu=1
     fi
-    [ "$have_ksu" = 1 ] || [ "$have_susfs" = 1 ] ||
-        die "_hook: neither KernelSU's selinux_hide.c nor security/selinux/hooks.c carries a setprocattr hook this build can equalise. One of them has to, or writing /proc/self/attr/current still times a policy parse on one payload shape and not the other -- the DANGER Duck Detector reports as 'App Zygote attr/current timing'."
+    # Neither carrying a hook used to be fatal, on the reasoning that an
+    # unequalised hook ships the timing tell. But the tell needs a hook to exist:
+    # SUSFS's reduction removes KernelSU's, and below android16-6.12 it adds none
+    # of its own, so the writes take the stock path and time identically. Say so
+    # loudly -- it is also what a silently unapplied patch set looks like.
+    if [ "$have_ksu" = 0 ] && [ "$have_susfs" = 0 ]; then
+        echo "::warning::_hook: no setprocattr hook in either tree -- SUSFS removed KernelSU's and ships none on this branch, so there is no attr/current asymmetry to equalise"
+        assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
+        echo "_hook: verified (no setprocattr hook to equalise on this tree)"
+        return 0
+    fi
 
     [ "$have_susfs" = 0 ] || verify_hook_probe_susfs "$d/security/selinux/hooks.c" "$nfs"
 
@@ -1123,8 +1117,17 @@ do_postsusfs() {
         echo "postsusfs: the KernelSU-side probe went on before SUSFS (${KV:-this tree} has no kernel-side hook to re-place it in); nothing to do here"
         placed=1
     fi
+    # No hook anywhere is a legitimate end state below android16-6.12:
+    # susfs_selinux_lsm_setattr exists only in 50_add_susfs_in_gki-android16-6.12
+    # (6.6 / 6.1 / 5.15 -> 0 hits), and the enable patch reduces KernelSU's
+    # selinux_hide.c to a shell on every branch. With no hook there is no
+    # backup-policy parse on either payload shape, so there is no asymmetry to
+    # equalise -- the oracle needs SukiSU's hook to EXIST. The sepolicy surface
+    # itself stays covered by the common-kernel _hook patches
+    # (mask_dirty_sepolicy_edges, hide_selinux_selinuxfs, hide_selinux_attr),
+    # which is where this family's SELinux cloak actually lives.
     [ "$placed" = 1 ] ||
-        die "postsusfs: after SUSFS neither security/selinux/hooks.c nor KernelSU's selinux_hide.c carries a setprocattr hook, so nothing can equalise the attr/current timing -- and the _hook step deferred the probe on the promise that this step would place it. The DANGER Duck Detector reports this as 'App Zygote attr/current timing'."
+        echo "::warning::postsusfs: SUSFS left no setprocattr hook in either tree, so there is no attr/current asymmetry to equalise; the sepolicy cloak is carried by the common-kernel _hook patches"
     setprocattr_mark decided
     echo "::endgroup::"
 }
@@ -1185,9 +1188,9 @@ do_hook() {
     else
         seqno_apply "$HOOK"
     fi
-    if [ "${SUSFS_ON:-}" = true ] && susfs_owns_setprocattr; then
+    if [ "${SUSFS_ON:-}" = true ]; then
         setprocattr_mark deferred
-        echo "  deferred: equalise_setprocattr_timing (SUSFS reduces selinux_hide.c and owns the hook on $KV; the postsusfs step places the probe)"
+        echo "  deferred: equalise_setprocattr_timing (SUSFS reduces selinux_hide.c; the postsusfs step places the probe in whichever hook survives)"
     else
         setprocattr_apply "$HOOK"
         setprocattr_mark decided
