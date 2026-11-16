@@ -13,7 +13,15 @@
 # second key. A mismatch is a WARNING -- it only matters if the matching fix
 # patch then fails, and the builder quotes it back there by name.
 #
-# captured from run 43750141986 (builder fd860b89), all 9 fix patches applied,
+# RE-CAPTURED 2026-11-16 after kernel_patches@833de46. The first capture
+# (run 43750141986) predated c08306e/833de46, which moved the setprocattr probe
+# from before 10_enable_susfs_for_ksu.patch to after it -- so the old
+# selinux_hide.c sum was of a file that still carried the +57-line probe and
+# warned on every build with no upstream move behind it. The enable patch now
+# reduces selinux_hide.c cleanly: 8 rejects, not 9, and fix_selinux_hide.c.patch
+# goes unused on this pair.
+#
+# captured from run 43922322163 (builder ce9bb516), all 8 fix patches applied,
 # build green:
 #   KSU          7ccf61479621f240c0d968ef46f1b167b6ceb500 (dev)
 #   susfs        9b0b13f069673b9b07b713a5c66977de4d62b175 (gki-android16-6.12, v2.4.0)
@@ -23,7 +31,7 @@
 67a7fd6192ad6b293c3d59a8cf0989281f82abdf06e0bc9391938cacca417dda  kernel/Kbuild
 9479d53a5e1e7f66680682c3db2152f661dbec11f75b90279897c850c40a1f6c  kernel/core/init.c
 84d6add16c11d4906a51a92c95055a65f2cc801f99ed1b0a9c2667b61f25b439  kernel/feature/kernel_umount.c
-b5427bcb67fc21cf26a4a392e49e9b86129be35c6c543445a79b4a7c524498c3  kernel/feature/selinux_hide.c
+30de2610ada01233cd9ab4521716416951be623e710863e8c9bdcbd9e6e69dfb  kernel/feature/selinux_hide.c
 64e62654643e3d3e73e0fcb1849aa3f2bf33728624347293491ec4b16e9fbab4  kernel/feature/sucompat.c
 df977f1ac5d26c61dbdec70d46967ff25e7f8b55c0a62aede7b8a90a0d2b1336  kernel/hook/setuid_hook.c
 505c60b655e3fd9c8779dea3bca627cdab0ccce7e39d7af9e07205aa8a5f37ca  kernel/selinux/rules.c
