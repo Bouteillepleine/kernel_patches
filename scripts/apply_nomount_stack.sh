@@ -674,10 +674,13 @@ verify_hook() {
     # Neither carrying a hook used to be fatal, on the reasoning that an
     # unequalised hook ships the timing tell. But the tell needs a hook to exist:
     # SUSFS's reduction removes KernelSU's, and below android16-6.12 it adds none
-    # of its own, so the writes take the stock path and time identically. Say so
-    # loudly -- it is also what a silently unapplied patch set looks like.
+    # of its own, so the writes take the stock path and time identically. Say so in
+    # the log but NOT as an annotation -- see apply_first_of(): this outcome is
+    # correct on every build below android16-6.12. A silently unapplied patch set
+    # cannot land here; it would leave the hook PRESENT (have_ksu=1) and take the
+    # probe-assertion path below.
     if [ "$have_ksu" = 0 ] && [ "$have_susfs" = 0 ]; then
-        echo "::warning::_hook: no setprocattr hook in either tree -- SUSFS removed KernelSU's and ships none on this branch, so there is no attr/current asymmetry to equalise"
+        echo "_hook: no setprocattr hook in either tree -- SUSFS removed KernelSU's and ships none on this branch, so there is no attr/current asymmetry to equalise"
         assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
         echo "_hook: verified (no setprocattr hook to equalise on this tree)"
         return 0
@@ -1126,8 +1129,9 @@ do_postsusfs() {
     # itself stays covered by the common-kernel _hook patches
     # (mask_dirty_sepolicy_edges, hide_selinux_selinuxfs, hide_selinux_attr),
     # which is where this family's SELinux cloak actually lives.
+    # Plain log line, not an annotation: legitimate on every build below 6.12.
     [ "$placed" = 1 ] ||
-        echo "::warning::postsusfs: SUSFS left no setprocattr hook in either tree, so there is no attr/current asymmetry to equalise; the sepolicy cloak is carried by the common-kernel _hook patches"
+        echo "postsusfs: SUSFS left no setprocattr hook in either tree, so there is no attr/current asymmetry to equalise; the sepolicy cloak is carried by the common-kernel _hook patches"
     setprocattr_mark decided
     echo "::endgroup::"
 }
