@@ -891,6 +891,13 @@ verify_ghost() {
     esac
     hasnt "$d/fs/proc/ghost.c" 'proc_create' \
         "_ghost: ghost.c owns a /proc node -- a file whose job is concealing files must not own a name no stock kernel has"
+    # Both PRIO_USER arms or neither. The patch is one file, so grepping
+    # kernel/sys.c for the helper passes with the setpriority half missing --
+    # and setpriority alone is the writable direction of the same oracle.
+    infn "$d/kernel/sys.c" '^SYSCALL_DEFINE3\(setpriority' 'ghost_uid_task_hidden(from_kuid' \
+        "_ghost: the task-visibility guard is not inside setpriority() -- PRIO_USER still reports a concealed uid as owning tasks, which contradicts every /proc surface that says it owns none"
+    infn "$d/kernel/sys.c" '^SYSCALL_DEFINE2\(getpriority' 'ghost_uid_task_hidden(from_kuid' \
+        "_ghost: the task-visibility guard is not inside getpriority() -- this is the arm a detector actually reads, and it skipped silently on 5.10 and 5.15 for as long as it was applied with apply_optional"
     infn "$d/fs/statfs.c" '^int vfs_statfs' 'ghost_hidden_path(path))' \
         "_ghost: the statfs(2) guard is not inside vfs_statfs() -- statfs, statfs64 and both fstatfs forms reach the hidden object through this one function and read its real f_type and f_blocks, while stat(2), access(2) and open(2) all answer ENOENT for the same path"
     # The mountinfo family had no assertion at all until 2026-11-18, which is
@@ -1358,7 +1365,7 @@ do_ghost() {
     normalise "$d/fs/proc/ghost.c" "$d/fs/proc/ghost.h"
     normalise "$GH"/*.patch
 
-    local REQ_XATTR REQ_LINKAT REQ_CHMOD REQ_UNIXSOCK REQ_MOUNTINFO
+    local REQ_XATTR REQ_LINKAT REQ_CHMOD REQ_UNIXSOCK REQ_MOUNTINFO REQ_GETPRIO
     case "$KERNEL_VER" in
     6.12)
         REQ_XATTR=ghost_xattr_6_12.patch
@@ -1366,6 +1373,7 @@ do_ghost() {
         REQ_CHMOD=ghost_chmod.patch
         REQ_UNIXSOCK=ghost_unixsock.patch
         REQ_MOUNTINFO=ghost_mountinfo_6_12.patch
+        REQ_GETPRIO=ghost_getpriority.patch
         ;;
     # 6.6 agrees with 6.12 on every row but the mountinfo one, which is why this
     # arm is split where it used to pair the two versions up. 6.12 replaced the
@@ -1380,6 +1388,7 @@ do_ghost() {
         REQ_CHMOD=ghost_chmod.patch
         REQ_UNIXSOCK=ghost_unixsock.patch
         REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
+        REQ_GETPRIO=ghost_getpriority.patch
         ;;
     # 6.1 and 5.15 agree on every row but the socket one: unix_find_abstract()
     # was split out of unix_find_other() in 6.1, so 6.1 joins 6.6/6.12 there
@@ -1391,6 +1400,7 @@ do_ghost() {
         REQ_CHMOD=ghost_chmod_5_10.patch
         REQ_UNIXSOCK=ghost_unixsock.patch
         REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
+        REQ_GETPRIO=ghost_getpriority.patch
         ;;
     5.15)
         REQ_XATTR=ghost_xattr_5_15.patch
@@ -1398,6 +1408,7 @@ do_ghost() {
         REQ_CHMOD=ghost_chmod_5_10.patch
         REQ_UNIXSOCK=ghost_unixsock_5_15.patch
         REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
+        REQ_GETPRIO=ghost_getpriority_5_10.patch
         ;;
     5.10)
         REQ_XATTR=ghost_xattr.patch
@@ -1405,6 +1416,7 @@ do_ghost() {
         REQ_CHMOD=ghost_chmod_5_10.patch
         REQ_UNIXSOCK=ghost_unixsock_5_10.patch
         REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
+        REQ_GETPRIO=ghost_getpriority_5_10.patch
         ;;
     esac
 
@@ -1428,7 +1440,16 @@ do_ghost() {
     # -ESRCH for a concealed uid, which is what the kernel already answers for
     # a user that owns no task, so a concealed uid reads as idle rather than
     # special. Inert until userspace pushes a `c` list through ghost_ctl().
-    apply_optional "$GH/ghost_getpriority.patch"
+    #
+    # Two variants, pinned by version. The guard goes in ahead of the PRIO_USER
+    # loop in both syscalls, and that loop is the hunks' trailing context: 6.1
+    # carries for_each_process_thread(), 5.10 and 5.15 still spell it
+    # do_each_thread(). This was apply_optional until 2026-11-18 and so skipped
+    # silently on those two -- 20 of the 84 a16 configs shipped with the guard
+    # absent, and this is a MEASURED oracle (DuckDetector reads it off a running
+    # app), not a reasoned one.
+    apply_first_of ghost-getpriority "$REQ_GETPRIO" \
+        "$GH/ghost_getpriority.patch" "$GH/ghost_getpriority_5_10.patch"
     # The abstract-socket guard. A hidden @name answers -ECONNREFUSED, which is
     # what an app already gets when nothing is listening, so a service that is
     # spoofed as stopped cannot be caught still holding its control socket.
