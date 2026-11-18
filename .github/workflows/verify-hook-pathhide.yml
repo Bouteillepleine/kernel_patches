@@ -325,14 +325,35 @@ jobs:
           # path_parentat() on 5.10/5.15/6.1/6.6 with every check in this job
           # green. This is the check that would have caught it on day one.
           mkdir -p "$RUNNER_TEMP/pitrees/$KVER"
-          ln -sfn "$KDIR/fs" "$RUNNER_TEMP/pitrees/$KVER/fs"
-          ln -sfn "$KDIR/security" "$RUNNER_TEMP/pitrees/$KVER/security"
+          for d in fs security kernel mm net; do
+            ln -sfn "$KDIR/$d" "$RUNNER_TEMP/pitrees/$KVER/$d"
+          done
           python3 "$GITHUB_WORKSPACE/scripts/check_preimages.py" \
             --trees "$RUNNER_TEMP/pitrees" \
             "$P"/_ghost/*.patch "$P"/_hook/hide_selinux_attr*.patch \
             "$P"/_hook/hide_selinux_selinuxfs*.patch "$P"/_hook/quiet*.patch \
             "$P"/_pathhide/*.patch
           echo "pre-images: no dangerous ambiguity on $KVER"
+
+          # ---- does a cloak take a junction SUSFS wants? ---------------------
+          # Our stack applies first and SUSFS lands two stages later, so a
+          # contested junction shows up as SUSFS rejecting a file WE edited --
+          # which reads like SUSFS drift and is not. ghost_statfs took
+          # vfs_statfs()'s only gap and killed all five jobs of run 44303124210
+          # in the SUSFS stage, ~4 minutes of runner time each, with every check
+          # in this job green beforehand. Cross-applies against a baseline, so
+          # SUSFS's own standing rejects are not blamed on a cloak.
+          if python3 "$GITHUB_WORKSPACE/scripts/check_susfs_collisions.py" \
+               --fetch-susfs "$RUNNER_TEMP/susfs-patches"; then
+            python3 "$GITHUB_WORKSPACE/scripts/check_susfs_collisions.py" \
+              --trees "$RUNNER_TEMP/pitrees" \
+              --susfs "$RUNNER_TEMP/susfs-patches" \
+              --stack "$GITHUB_WORKSPACE/scripts/apply_nomount_stack.sh" \
+              "$P"/_ghost/*.patch "$P"/_hook/*.patch "$P"/_pathhide/*.patch
+          else
+            echo "::warning::could not fetch the SUSFS gki patches from GitLab; \
+          the collision gate did not run on $KVER"
+          fi
 
           cp "$P/_pathhide/pathhide.c" fs/proc/pathhide.c
           cp "$P/_pathhide/pathhide.h" fs/proc/pathhide.h
