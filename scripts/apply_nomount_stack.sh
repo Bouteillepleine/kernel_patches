@@ -820,7 +820,7 @@ infn() {
 }
 
 verify_ghost() {
-    local d="$COMMON_KERNEL_FOLDER" n seg
+    local d="$COMMON_KERNEL_FOLDER" n seg f
     [ -f "$d/fs/proc/ghost.c" ] || die "_ghost: fs/proc/ghost.c missing"
     [ -f "$d/fs/proc/ghost.h" ] || die "_ghost: fs/proc/ghost.h missing"
     objy "$d/fs/proc/Makefile" 'ghost.o' "_ghost"
@@ -891,6 +891,17 @@ verify_ghost() {
     esac
     hasnt "$d/fs/proc/ghost.c" 'proc_create' \
         "_ghost: ghost.c owns a /proc node -- a file whose job is concealing files must not own a name no stock kernel has"
+    infn "$d/fs/statfs.c" '^int vfs_statfs' 'ghost_hidden_path(path))' \
+        "_ghost: the statfs(2) guard is not inside vfs_statfs() -- statfs, statfs64 and both fstatfs forms reach the hidden object through this one function and read its real f_type and f_blocks, while stat(2), access(2) and open(2) all answer ENOENT for the same path"
+    # The mountinfo family had no assertion at all until 2026-11-18, which is
+    # exactly how it went unnoticed that the 6.12-only variant fails hunk 2 on
+    # every older tree and apply_optional swallowed it. Name all three handlers:
+    # the patch is one file, so "fs/proc_namespace.c mentions ghost_hidden_mount"
+    # would pass with two of the three guards missing.
+    for f in show_vfsmnt show_mountinfo show_vfsstat; do
+        infn "$d/fs/proc_namespace.c" "^static int $f" 'ghost_hidden_mount(mnt))' \
+            "_ghost: the mount guard is not inside $f() -- /proc/self/{mounts,mountinfo} and /proc/self/mountstats are three renderings of the same mount list, and a module bind hidden from one of them while another still names it is a contradiction, not a cloak"
+    done
     # statmount(2)/listmount(2) exist from 6.8 and reach none of the three
     # fs/proc_namespace.c show handlers the mountinfo guard patches. apply_optional is
     # non-fatal by design, so when 6.12.58 moved `root` into struct kstatmount and the
@@ -1347,13 +1358,28 @@ do_ghost() {
     normalise "$d/fs/proc/ghost.c" "$d/fs/proc/ghost.h"
     normalise "$GH"/*.patch
 
-    local REQ_XATTR REQ_LINKAT REQ_CHMOD REQ_UNIXSOCK
+    local REQ_XATTR REQ_LINKAT REQ_CHMOD REQ_UNIXSOCK REQ_MOUNTINFO
     case "$KERNEL_VER" in
-    6.12 | 6.6)
+    6.12)
         REQ_XATTR=ghost_xattr_6_12.patch
         REQ_LINKAT=ghost_linkat_5_15.patch
         REQ_CHMOD=ghost_chmod.patch
         REQ_UNIXSOCK=ghost_unixsock.patch
+        REQ_MOUNTINFO=ghost_mountinfo_6_12.patch
+        ;;
+    # 6.6 agrees with 6.12 on every row but the mountinfo one, which is why this
+    # arm is split where it used to pair the two versions up. 6.12 replaced the
+    # inline `if (sb->s_op->show_path)` branch in show_mountinfo() with a call to
+    # show_path(), and that line is hunk 2's trailing context -- so on 6.6 and
+    # below the 6.12 variant fails that one hunk, and `patch` then applies none
+    # of the three. The other two handlers, show_vfsmnt() and show_vfsstat(),
+    # are byte-identical from 5.10 to 6.12 and were being dropped with it.
+    6.6)
+        REQ_XATTR=ghost_xattr_6_12.patch
+        REQ_LINKAT=ghost_linkat_5_15.patch
+        REQ_CHMOD=ghost_chmod.patch
+        REQ_UNIXSOCK=ghost_unixsock.patch
+        REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
         ;;
     # 6.1 and 5.15 agree on every row but the socket one: unix_find_abstract()
     # was split out of unix_find_other() in 6.1, so 6.1 joins 6.6/6.12 there
@@ -1364,18 +1390,21 @@ do_ghost() {
         REQ_LINKAT=ghost_linkat_5_15.patch
         REQ_CHMOD=ghost_chmod_5_10.patch
         REQ_UNIXSOCK=ghost_unixsock.patch
+        REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
         ;;
     5.15)
         REQ_XATTR=ghost_xattr_5_15.patch
         REQ_LINKAT=ghost_linkat_5_15.patch
         REQ_CHMOD=ghost_chmod_5_10.patch
         REQ_UNIXSOCK=ghost_unixsock_5_15.patch
+        REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
         ;;
     5.10)
         REQ_XATTR=ghost_xattr.patch
         REQ_LINKAT=ghost_linkat.patch
         REQ_CHMOD=ghost_chmod_5_10.patch
         REQ_UNIXSOCK=ghost_unixsock_5_10.patch
+        REQ_MOUNTINFO=ghost_mountinfo_5_10.patch
         ;;
     esac
 
@@ -1441,9 +1470,14 @@ do_ghost() {
     # the mount's SOURCE ROOT (mountinfo field 4) against the same hidden-path
     # table, not its d_path: d_path renders the mountpoint (/apex/.../dex2oat64),
     # a path the binary still has to resolve, so matching that would over-hide.
-    # Anchored on the three show_* bodies of 6.12 and skipped elsewhere until
-    # those have variants.
-    apply_optional "$GH/ghost_mountinfo_6_12.patch"
+    # Two variants, pinned by version and never by "first that applies": they
+    # differ only in hunk 2's trailing context, so neither fits the other's tree
+    # and a fallback would silently ship a kernel with all three handlers open.
+    # This was apply_optional until 2026-11-18, which is a non-fatal skip -- so
+    # 5.10 through 6.6 built green with no mountinfo, /proc/mounts or mountstats
+    # guard at all, and nothing said so. That is 73 of the 84 a16 configs.
+    apply_first_of ghost-mountinfo "$REQ_MOUNTINFO" \
+        "$GH/ghost_mountinfo_6_12.patch" "$GH/ghost_mountinfo_5_10.patch"
     # The same mount, through the syscalls that reach none of those three handlers.
     # statmount(2)/listmount(2) are 6.8 and newer and walk the namespace rbtree in
     # kernel code, so the SEQ_SKIP guard above is simply not on their path. Measured
@@ -1454,6 +1488,14 @@ do_ghost() {
     # answers -ENOENT, the same as for an id that never existed. Optional because
     # nothing below 6.8 has the syscalls for the anchors to fit.
     apply_optional "$GH/ghost_statmount_6_12.patch"
+    # statfs(2)/statfs64(2) and their fstatfs forms, through vfs_statfs(), which
+    # is byte-identical from 5.10 to 6.12 and is the one function both reach.
+    # Every other ghost surface answers ENOENT for a hidden path while this one
+    # handed back a real f_type and f_blocks -- one caller, two answers, which is
+    # the contradiction the stat(2) guard exists to prevent. NoMount patches
+    # user_statfs() one frame up and only rewrites f_type for INJECTED paths, so
+    # it closes nothing here and the two hunks do not share a pre-image.
+    apply_or_die "$GH/ghost_statfs.patch"
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file
