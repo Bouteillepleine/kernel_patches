@@ -1,0 +1,16 @@
+--- a/fs/statfs.c
++++ b/fs/statfs.c
+@@ -135,6 +135,13 @@
+ {
+ 	int error;
+ 
++	{
++		extern bool ghost_hidden_path(const struct path *gp);
++
++		if (unlikely(ghost_hidden_path(path)))
++			return -ENOENT;
++	}
++
+ #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+ 	if (susfs_is_current_app_uid()) {
+ 		struct inode *inode = d_backing_inode(path->dentry);

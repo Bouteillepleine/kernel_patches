@@ -302,6 +302,29 @@ seqno_mark() { # seqno_mark deferred|decided
 # SUSFS have its say about the file, then put the probe where the hook ended up.
 setprocattr_stamp() { printf '%s/.nomount_setprocattr_state' "${COMMON_KERNEL_FOLDER:-}"; }
 
+# vfs_statfs() is a slot SUSFS wants too: 50_add_susfs_in_gki inserts its
+# sus_kstat and sus_mount arms between `int error;` and the statfs_by_dentry()
+# call, which is the same three lines of pre-image the ghost guard takes. Applied
+# up front, the guard wins the slot and SUSFS's hunk rejects -- measured, run
+# 44303124210, all five trees. So the guard is deferred past SUSFS and placed on
+# whichever shape the tree ended up with, ahead of SUSFS's early returns: ghost
+# answers "absent", which is the stronger reply and must not be reached through a
+# sus_kstat spoof. See do_postsusfs().
+statfs_stamp() { printf '%s/.nomount_statfs_state' "${COMMON_KERNEL_FOLDER:-}"; }
+
+statfs_state() {
+    local f
+    f="$(statfs_stamp)"
+    if [ -f "$f" ]; then cat "$f"; else echo none; fi
+}
+
+statfs_mark() { # statfs_mark deferred|decided
+    [ -n "${COMMON_KERNEL_FOLDER:-}" ] ||
+        die "statfs: COMMON_KERNEL_FOLDER is not set, so the '$1' state cannot be recorded -- and an unrecorded deferral is how the statfs(2) oracle ships unasserted"
+    printf '%s\n' "$1" >"$(statfs_stamp)"
+}
+
+
 setprocattr_state() {
     local f
     f="$(setprocattr_stamp)"
@@ -898,8 +921,15 @@ verify_ghost() {
         "_ghost: the task-visibility guard is not inside setpriority() -- PRIO_USER still reports a concealed uid as owning tasks, which contradicts every /proc surface that says it owns none"
     infn "$d/kernel/sys.c" '^SYSCALL_DEFINE2\(getpriority' 'ghost_uid_task_hidden(from_kuid' \
         "_ghost: the task-visibility guard is not inside getpriority() -- this is the arm a detector actually reads, and it skipped silently on 5.10 and 5.15 for as long as it was applied with apply_optional"
-    infn "$d/fs/statfs.c" '^int vfs_statfs' 'ghost_hidden_path(path))' \
-        "_ghost: the statfs(2) guard is not inside vfs_statfs() -- statfs, statfs64 and both fstatfs forms reach the hidden object through this one function and read its real f_type and f_blocks, while stat(2), access(2) and open(2) all answer ENOENT for the same path"
+    # Deferred past SUSFS, so the PRE-SUSFS verify cannot assert it yet. The
+    # post-SUSFS one can and must; assert-config refuses to end a build that
+    # never reached it, which is what stops the deferral becoming a skip.
+    if [ "$(statfs_state)" = deferred ]; then
+        echo "_ghost: statfs(2) guard deferred to the postsusfs step"
+    else
+        infn "$d/fs/statfs.c" '^int vfs_statfs' 'ghost_hidden_path(path))' \
+            "_ghost: the statfs(2) guard is not inside vfs_statfs() -- statfs, statfs64 and both fstatfs forms reach the hidden object through this one function and read its real f_type and f_blocks, while stat(2), access(2) and open(2) all answer ENOENT for the same path"
+    fi
     # The mountinfo family had no assertion at all until 2026-11-18, which is
     # exactly how it went unnoticed that the 6.12-only variant fails hunk 2 on
     # every older tree and apply_optional swallowed it. Name all three handlers:
@@ -1102,6 +1132,26 @@ do_seqno() {
 # world can ship without one.
 do_postsusfs() {
     need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER
+    local GH="$BOUTEILLE_KERNEL_PATCHES_FOLDER/common/_ghost"
+    # The statfs(2) guard, on the shape SUSFS actually produced. Probed on the
+    # tree and never on whether susfs_ref was set: a build can ask for SUSFS and
+    # still get a tree without this hunk, because 50_add_susfs_in_gki's statfs
+    # arm is one of the hunks the fix sets are allowed to reject. Either variant
+    # is fatal if the one the tree calls for does not fit -- a silent skip here
+    # is the whole failure this stack keeps relearning.
+    if [ "$(statfs_state)" = deferred ]; then
+        echo "::group::Place the statfs(2) guard (after SUSFS)"
+        normalise "$GH/ghost_statfs.patch" "$GH/ghost_statfs_susfs.patch"
+        if grep -q 'CONFIG_KSU_SUSFS_SUS_KSTAT' "$COMMON_KERNEL_FOLDER/fs/statfs.c"; then
+            apply_or_die "$GH/ghost_statfs_susfs.patch"
+            echo "postsusfs: statfs guard placed ahead of the SUSFS sus_kstat arm"
+        else
+            apply_or_die "$GH/ghost_statfs.patch"
+            echo "postsusfs: statfs guard placed on a tree SUSFS did not touch"
+        fi
+        statfs_mark decided
+        echo "::endgroup::"
+    fi
     echo "::group::Equalise setprocattr timing (after SUSFS)"
     local HOOK="$BOUTEILLE_KERNEL_PATCHES_FOLDER/common/_hook"
     # The two hooks are NOT exclusive and verify_hook requires a probe in EVERY
@@ -1509,14 +1559,17 @@ do_ghost() {
     # answers -ENOENT, the same as for an id that never existed. Optional because
     # nothing below 6.8 has the syscalls for the anchors to fit.
     apply_optional "$GH/ghost_statmount_6_12.patch"
-    # statfs(2)/statfs64(2) and their fstatfs forms, through vfs_statfs(), which
-    # is byte-identical from 5.10 to 6.12 and is the one function both reach.
-    # Every other ghost surface answers ENOENT for a hidden path while this one
-    # handed back a real f_type and f_blocks -- one caller, two answers, which is
-    # the contradiction the stat(2) guard exists to prevent. NoMount patches
-    # user_statfs() one frame up and only rewrites f_type for INJECTED paths, so
-    # it closes nothing here and the two hunks do not share a pre-image.
-    apply_or_die "$GH/ghost_statfs.patch"
+    # statfs(2)/statfs64(2) and their fstatfs forms all reach vfs_statfs(), which
+    # is byte-identical from 5.10 to 6.12. Every other ghost surface answers
+    # ENOENT for a hidden path while this one handed back a real f_type and
+    # f_blocks -- one caller, two answers, the contradiction the stat(2) guard
+    # exists to prevent. NoMount patches user_statfs() one frame up and only
+    # rewrites f_type for INJECTED paths, so it closes nothing here.
+    #
+    # DEFERRED past SUSFS, which wants the same slot -- see statfs_stamp() above
+    # and do_postsusfs(). Marked rather than silently skipped so the pre-SUSFS
+    # verify can tell "not placed yet" from "never placed".
+    statfs_mark deferred
     # access(W_OK), and the write-intent and O_CREAT forms of open(2): the
     # sb_permission() short-circuit inside inode_permission(), which answers
     # -EROFS before do_inode_permission() dispatches to the engine. One file
@@ -1651,6 +1704,9 @@ assert-config)
     fi
     if [ "$(setprocattr_state)" = deferred ]; then
         die "the _hook step deferred equalise_setprocattr_timing to the post-SUSFS postsusfs step, and that step never ran: nothing equalises the two attr/current arms and the timing asymmetry ships unasserted. Add 'apply_nomount_stack.sh postsusfs' after the SUSFS enable patch."
+    fi
+    if [ "$(statfs_state)" = deferred ]; then
+        die "the _ghost step deferred ghost_statfs to the post-SUSFS postsusfs step, and that step never ran: vfs_statfs() has no guard, so statfs(2) reports a real f_type and f_blocks for a path stat(2) and open(2) both answer ENOENT for. Add 'apply_nomount_stack.sh postsusfs' after the SUSFS enable patch."
     fi
     CONFIG_STRICT=1
     assert_config CONFIG_NOMOUNT "the engine is behind CONFIG_NOMOUNT; without it fs/nomount.o is not built at all"
