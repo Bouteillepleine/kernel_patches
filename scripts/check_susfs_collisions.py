@@ -207,10 +207,14 @@ def main():
                 continue
             allowed = expected_rejects(args.susfs_script, v)
             if allowed is None:
-                print("  warning: could not read expected_rejects() from %s; "
-                      "registered collisions will be reported as new"
-                      % args.susfs_script)
-                allowed = set()
+                sys.exit(
+                    "cannot read expected_rejects() from %s -- refusing to "
+                    "report.\nWithout it every deliberate collision reads as "
+                    "new (22 of them on the current tree), so the gate would "
+                    "fail the build on patches that are correct. Pass "
+                    "--susfs-script an ABSOLUTE path: callers that cd into "
+                    "the kernel tree do not resolve the relative default."
+                    % args.susfs_script)
             baseline = {}
             for fname, sdiff in sfiles.items():
                 src = os.path.join(tree, fname)

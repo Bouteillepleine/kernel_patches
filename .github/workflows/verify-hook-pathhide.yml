@@ -349,6 +349,7 @@ jobs:
               --trees "$RUNNER_TEMP/pitrees" \
               --susfs "$RUNNER_TEMP/susfs-patches" \
               --stack "$GITHUB_WORKSPACE/scripts/apply_nomount_stack.sh" \
+              --susfs-script "$GITHUB_WORKSPACE/scripts/apply_susfs_kernel.sh" \
               "$P"/_ghost/*.patch "$P"/_hook/*.patch "$P"/_pathhide/*.patch
           else
             echo "::warning::could not fetch the SUSFS gki patches from GitLab; \
