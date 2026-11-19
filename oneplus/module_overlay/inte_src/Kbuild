@@ -1,0 +1,2 @@
+obj-m += inte.o
+inte-y := oplus_kernel_security_check.o

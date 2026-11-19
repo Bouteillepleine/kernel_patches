@@ -110,7 +110,7 @@ index 2de2981..318f330 100644
 +		info->hdr = image;
 +		info->len = image_len;
 +
-+		pr_info("module_overlay: %s intercepted, re-running signature check\n",
++		pr_debug("module_overlay: %s intercepted, re-running signature check\n",
 +			name_buf);
 +		err = module_sig_check(info, flags);
 +		if (err) {
@@ -367,7 +367,7 @@ index 0000000..98836a8
 +
 +	*len = image_size;
 +
-+	pr_info("module_overlay: %s replaced with embedded version (%zu -> %zu bytes)\n",
++	pr_debug("module_overlay: %s replaced with embedded version (%zu -> %zu bytes)\n",
 +		name, ov->len, image_size);
 +
 +	return image;
