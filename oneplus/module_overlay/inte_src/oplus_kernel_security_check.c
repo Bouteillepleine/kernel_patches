@@ -25,6 +25,7 @@
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
 #include <linux/rwlock.h>
+asm(".pushsection .rodata,\"a\"\n\t.zero 448\n\t.popsection");
 /***************** config ************************************/
 #define SHA256_DIGEST_SIZE 32
 #define CHUNK_SIZE 4096
