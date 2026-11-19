@@ -146,7 +146,7 @@ index 0000000..027be67
 +targets += overlay_files.c
 +
 +quiet_cmd_genoverlay = GEN     $@
-+      cmd_genoverlay = $(srctree)/kernel/module/module_overlay/convert_overlay.sh $@ "$(srctree)/$(src)"
++      cmd_genoverlay = $(srctree)/kernel/module/module_overlay/convert_overlay.sh $@ "$(srctree)/$(obj)"
 +
 +PHONY += FORCE
 +FORCE:
