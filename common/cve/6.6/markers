@@ -1,1 +1,2 @@
 # patch|file|kind|value -- consulted only when no variant applies; minsub: n/a if SUBLEVEL < value
+0903-CVE-2025-38236|net/unix/af_unix.c|fixed|consume_skb\(read_skb\)
