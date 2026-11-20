@@ -1,0 +1,1 @@
+# patch|file|kind|value -- consulted only when no variant applies; minsub: n/a if SUBLEVEL < value

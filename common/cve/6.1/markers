@@ -1,0 +1,5 @@
+# patch|file|kind|value -- consulted only when no variant applies; minsub: n/a if SUBLEVEL < value
+0019-CVE-2025-40214|Makefile|minsub|141
+0041-CVE-2025-38349|Makefile|minsub|175
+0046-CVE-2026-53361|Makefile|minsub|141
+0057-CVE-2026-80521|Makefile|minsub|141
