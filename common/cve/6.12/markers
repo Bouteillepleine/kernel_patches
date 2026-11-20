@@ -1,6 +1,2 @@
 # patch|file|fixed (skip if regex found)|requires (n/a if regex absent) -- consulted only when no variant applies
-0002-CVE-2026-43178|fs/proc/task_mmu.c|fixed|^out_file:
-0002-CVE-2026-43178|fs/proc/task_mmu.c|requires|fput\(vm_file\)
-0004-CVE-2026-31648|mm/filemap.c|fixed|Recalculate end_pgoff based on file_end
-0004-CVE-2026-31648|mm/filemap.c|requires|can_map_large
 0012-CVE-2026-64469|drivers/android/binder.c|fixed|^\ttarget_proc = t->to_proc;$
