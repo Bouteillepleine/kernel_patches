@@ -1,2 +1,5 @@
 # patch|file|kind|value -- consulted only when no variant applies; minsub: n/a if SUBLEVEL < value
 0903-CVE-2025-38236|net/unix/af_unix.c|fixed|consume_skb\(read_skb\)
+0910-CVE-2026-43499|kernel/locking/rtmutex.c|fixed|raw_spin_lock\(&waiter_task->pi_lock\)
+0913-CVE-2024-50154|net/ipv4/inet_connection_sock.c|fixed|^static bool __inet_csk_reqsk_queue_drop\(
+0914-CVE-2024-53206|net/ipv4/inet_connection_sock.c|fixed|^\treqsk_put\(oreq\);$
