@@ -27,6 +27,8 @@
 #   susfs        9b0b13f069673b9b07b713a5c66977de4d62b175 (gki-android16-6.12, v2.4.0)
 #   nomount_ref  main @ 6e5560dcbd494b23d5f118a1326d304429e792ae (NMVER 1.36.0)
 #   patches_ref  main
+# rules.c re-captured from run 44997845922 (KSU 32e25d58fc1a187e1abe7278904c31571235fc83,
+# dev moved it 3 lines; fix_rules.c.patch applied, build green).
 # Refresh from the block the builder prints on mismatch -- never from upstream.
 67a7fd6192ad6b293c3d59a8cf0989281f82abdf06e0bc9391938cacca417dda  kernel/Kbuild
 9479d53a5e1e7f66680682c3db2152f661dbec11f75b90279897c850c40a1f6c  kernel/core/init.c
@@ -34,6 +36,6 @@
 30de2610ada01233cd9ab4521716416951be623e710863e8c9bdcbd9e6e69dfb  kernel/feature/selinux_hide.c
 64e62654643e3d3e73e0fcb1849aa3f2bf33728624347293491ec4b16e9fbab4  kernel/feature/sucompat.c
 df977f1ac5d26c61dbdec70d46967ff25e7f8b55c0a62aede7b8a90a0d2b1336  kernel/hook/setuid_hook.c
-505c60b655e3fd9c8779dea3bca627cdab0ccce7e39d7af9e07205aa8a5f37ca  kernel/selinux/rules.c
+998a5c231363f38bfd2f85be029b27169dc1a299af249ca89b80620c9ccc349a  kernel/selinux/rules.c
 6cfefc9a8b739a5fd954e564b1ce21b9dae31fbbfc595f65aa9bfee2e0c3ae8b  kernel/supercall/dispatch.c
 056e1c276b06570dfebb254cfca9df3d077bb3f1ca79f4986e40d12b47a66c0c  kernel/supercall/supercall.c
