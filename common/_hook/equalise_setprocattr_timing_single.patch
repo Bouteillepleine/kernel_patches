@@ -1,0 +1,29 @@
+--- a/kernel/feature/selinux_hide/selinux_hide_auto.c
++++ b/kernel/feature/selinux_hide/selinux_hide_auto.c
+@@ -417,2 +417,5 @@
+-            return error;
++            new = prepare_creds();
++            if (new)
++                abort_creds(new);
++            return error;
+         }
+@@ -419,5 +419,18 @@
+-    }
++    } else {
++        /* BakaSU 2b558ca collapsed #3981's live+EAGAIN pair into one call, so the
++           parse is unconditional inside security_context_to_sid_live() and this
++           else -- upstream's restored `str[0] != '\n'` guard -- is the cheap arm. */
++        static const char ksu_probe_ctx[] = "u:r:ksu:s0:c0,c1";
++        u32 probe_sid = 0, probe_tmp_sid = 0;
++        int probe_rc = 0, probe_i;
++
++        /* Count UNMEASURED on a single parse: the dual-parse "do not re-tune" note
++           does not carry over. Re-read DuckDetector's A-B row before changing it. */
++        for (probe_i = 0; probe_i < 2; probe_i++)
++            security_context_to_sid_with_policy(backup_sepolicy, ksu_probe_ctx, sizeof(ksu_probe_ctx) - 1,
++                                                &probe_tmp_sid, SECSID_NULL, GFP_KERNEL, &probe_sid, &probe_rc);
++    }
+ 
+     new = prepare_creds();
+     if (!new)
+         return -ENOMEM;

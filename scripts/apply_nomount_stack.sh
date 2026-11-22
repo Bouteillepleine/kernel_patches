@@ -337,19 +337,65 @@ setprocattr_mark() { # setprocattr_mark deferred|decided
     printf '%s\n' "$1" >"$(setprocattr_stamp)"
 }
 
+# Where the fork keeps the setprocattr hook. BakaSU 2b558ca (2026-11-22) moved
+# kernel/feature/selinux_hide.c into kernel/feature/selinux_hide/ and split it
+# three ways, so the filename alone now picks the WRONG half: the new
+# selinux_hide.c is the fake_status plumbing and carries no hook at all, while
+# the old 1837-line file became selinux_hide_auto.c. Resolve on the hook being
+# present, never on the path existing, and keep the candidates in one list so a
+# failure can say where it looked. Newest layout last.
+KSU_HIDE_CANDIDATES='kernel/feature/selinux_hide.c
+kernel/feature/selinux_hide/selinux_hide_auto.c
+kernel/feature/selinux_hide/selinux_hide.c'
+
+ksu_selinux_hide_file() {
+    local rel f
+    while IFS= read -r rel; do
+        f="${KSU_FOLDER:-}/$rel"
+        [ -f "$f" ] || continue
+        grep -qE '__nocfi [a-z_]*setprocattr\(' "$f" || continue
+        printf '%s\n' "$f"
+        return 0
+    done <<<"$KSU_HIDE_CANDIDATES"
+    return 1
+}
+
+ksu_selinux_hide_tried() {
+    printf '%s\n' "$KSU_HIDE_CANDIDATES" | sed "s|^|${KSU_FOLDER:-}/|" | tr '\n' ' '
+}
+
+# The hook's own body. Every shape test below reads THIS and not the file:
+# KernelSU#3996 added a second hook to the same file that also calls
+# security_context_to_sid_live(), so a file-wide grep can be answered by the
+# wrong function.
+ksu_setprocattr_body() { awk '/__nocfi [a-z_]*setprocattr\(/,/^}/' "$1"; }
+
 # KernelSU#3981 split the parse into a live attempt plus an -EAGAIN fallback, so
 # the dual parse this probe compensates for moved one block deeper and the old
-# anchor stopped fitting. Both variants carry the same probes on the same arms;
-# they differ only in the shape they are cut against. Probed on the tree rather
-# than on the fork name, so SukiSU and BakaSU keep the pre-#3981 one until they
-# take the same change, and a KSUN pinned to an older hash still builds.
+# anchor stopped fitting. BakaSU 2b558ca then collapsed it again: the hook calls
+# security_context_to_sid_live() with NO -EAGAIN arm, because the fallback moved
+# INSIDE that helper, which parses the backup policy once for every payload the
+# guard lets through and not at all for the ones it does not. Three shapes, then,
+# and all three put the probe on the arm that skips the parse; they differ only in
+# the pre-image they are cut against. Probed on the tree rather than on the fork
+# name, so a fork pinned to an older hash still builds.
 setprocattr_apply() { # setprocattr_apply <hook dir>
     need KSU_FOLDER
-    if grep -q 'security_context_to_sid_live' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
-        apply_or_die "$1/equalise_setprocattr_timing_live.patch" "$KSU_FOLDER"
-    else
+    local f body
+    f="$(ksu_selinux_hide_file)" ||
+        die "setprocattr: no setprocattr hook in any known selinux_hide location, so equalise_setprocattr_timing cannot be placed and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other. Tried: $(ksu_selinux_hide_tried). If the fork moved it again, add the path to KSU_HIDE_CANDIDATES and cut a variant against its shape."
+    body="$(ksu_setprocattr_body "$f")"
+    case "$body" in
+    *"security_context_to_sid_live"*)
+        case "$body" in
+        *"error == -EAGAIN"*) apply_or_die "$1/equalise_setprocattr_timing_live.patch" "$KSU_FOLDER" ;;
+        *) apply_or_die "$1/equalise_setprocattr_timing_single.patch" "$KSU_FOLDER" ;;
+        esac
+        ;;
+    *)
         apply_or_die "$1/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
-    fi
+        ;;
+    esac
 }
 
 objy() { # objy <makefile> <object> <what>
@@ -494,6 +540,23 @@ awk_abort_creds_arm() {
         fn {
             gsub(/^[ \t]+/, "")
             if (prev == "abort_creds(new);" && $0 == "return error2 ?: error;") ok = 1
+            prev = $0
+        }
+        END { exit ok ? 0 : 1 }
+    ' "$1"
+}
+
+# Same assertion on the single-parse shape, where the failure arm returns a bare
+# `return error;` because there is no error2 to fold in. Split rather than
+# widened: a regex matching either would also pass a tree that lost the dual
+# parse without anyone noticing which shape was actually verified.
+awk_abort_creds_arm_single() {
+    awk '
+        /__nocfi [a-z_]*setprocattr\(/ { fn = 1 }
+        fn && /^}/                     { fn = 0 }
+        fn {
+            gsub(/^[ \t]+/, "")
+            if (prev == "abort_creds(new);" && $0 == "return error;") ok = 1
             prev = $0
         }
         END { exit ok ? 0 : 1 }
@@ -688,12 +751,9 @@ verify_hook() {
     # placement check -- on a hook that was still present and still patched.
     # Check each one that exists, and require at least one: neither carrying a
     # probe is the state that ships the DANGER row.
-    local have_ksu=0 have_susfs=0
+    local have_ksu=0 have_susfs=0 hide=
     grep -q 'susfs_selinux_lsm_setattr' "$d/security/selinux/hooks.c" 2>/dev/null && have_susfs=1
-    if [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
-        grep -qE '__nocfi [a-z_]*setprocattr\(' "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c"; then
-        have_ksu=1
-    fi
+    hide="$(ksu_selinux_hide_file)" && have_ksu=1
     # Neither carrying a hook used to be fatal, on the reasoning that an
     # unequalised hook ships the timing tell. But the tell needs a hook to exist:
     # SUSFS's reduction removes KernelSU's, and below android16-6.12 it adds none
@@ -727,9 +787,9 @@ verify_hook() {
         return 0
     fi
 
-    [ -f "$KSU_FOLDER/kernel/feature/selinux_hide.c" ] ||
-        die "_hook: $KSU_FOLDER/kernel/feature/selinux_hide.c does not exist, so equalise_setprocattr_timing cannot be verified. If this fork keeps the setprocattr hook elsewhere, the patch did not land and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other."
-    infn "$KSU_FOLDER/kernel/feature/selinux_hide.c" '__nocfi .*setprocattr' 'ksu_probe_ctx' \
+    [ -n "$hide" ] ||
+        die "_hook: no setprocattr hook in any known selinux_hide location, so equalise_setprocattr_timing cannot be verified. Tried: $(ksu_selinux_hide_tried). If this fork moved or renamed it, the patch did not land and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other."
+    infn "$hide" '__nocfi .*setprocattr' 'ksu_probe_ctx' \
         "_hook: the timing probe is not inside the setprocattr hook. Without it the newline-prefixed payload skips security_context_to_sid_with_policy() while the bare one pays for it, and the difference is measurable from app_zygote -- the DANGER Duck Detector reports as 'App Zygote attr/current timing'."
 
     # The probe exists to cost what the REAL parse costs, and that cost is not a
@@ -752,9 +812,9 @@ verify_hook() {
     # Both failures are silent -- the kernel builds, boots and hides exactly as
     # well, and only a detector sees the difference.
     probe_ctx=$(sed -n 's/.*static const char ksu_probe_ctx\[\] = "\([^"]*\)".*/\1/p' \
-        "$KSU_FOLDER/kernel/feature/selinux_hide.c" | head -n1)
+        "$hide" | head -n1)
     [ -n "$probe_ctx" ] ||
-        die "_hook: could not read ksu_probe_ctx out of selinux_hide.c, so the probe string cannot be checked. It is the only thing that makes the two paths cost the same; an unchecked one is how the 104ns residual survived a green build."
+        die "_hook: could not read ksu_probe_ctx out of $hide, so the probe string cannot be checked. It is the only thing that makes the two paths cost the same; an unchecked one is how the 104ns residual survived a green build."
     probe_type=$(printf '%s' "$probe_ctx" | cut -d: -f3)
     probe_range=$(printf '%s' "$probe_ctx" | cut -d: -f4)
     needle="\":$probe_type:\""
@@ -776,16 +836,30 @@ verify_hook() {
     # paired median to 0 or below, which is the only state the card treats as
     # clean. Drop back to one and the asymmetry returns at a tick the detector
     # can still see, with nothing else failing.
-    probe_loop=$(awk "/__nocfi .*setprocattr/,/^}/" "$KSU_FOLDER/kernel/feature/selinux_hide.c" 2>/dev/null |
+    probe_loop=$(awk "/__nocfi .*setprocattr/,/^}/" "$hide" 2>/dev/null |
         grep -c 'probe_i < [2-9]') || true
     [ "${probe_loop:-0}" -ge 1 ] ||
         die "_hook: the timing probe parses the context fewer than twice. One parse only moves the paired median by a tick and leaves it positive, which is still 'Positive A-B timing asymmetry' to the detector. If you meant to retune this, change the count -- do not remove the loop."
-    awk_probe_failure_arm "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
-        die "_hook: the timing probe is only on the else arm of the setprocattr hook. Whatever upstream's condition is now, the newline-prefixed payload reaches the parse and dies in it early while the well-formed one pays for the live type and range lookup -- and nothing charges that back. That is 'Positive A-B timing asymmetry', i.e. a DANGER SELinux card, on any core slow enough to resolve 52ns."
-
-    awk_abort_creds_arm "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
-        die "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
-    awk_probe_placement "$KSU_FOLDER/kernel/feature/selinux_hide.c" ||
+    # Both of the next two encode the TWO-ARM shape: a probe inside the
+    # `if (error2 || error)` fallback, and an abort_creds pair ahead of
+    # `return error2 ?: error;`. BakaSU 2b558ca has neither, because the fallback
+    # moved inside security_context_to_sid_live() -- one unconditional parse and a
+    # bare `return error;`. Assert the shape that is THERE, which is what
+    # verify_hook_probe_susfs() already does for susfs's single-parse copy; running
+    # the two-arm pair against it would red-line a correctly patched tree.
+    case "$(ksu_setprocattr_body "$hide")" in
+    *"error == -EAGAIN"*)
+        awk_probe_failure_arm "$hide" ||
+            die "_hook: the timing probe is only on the else arm of the setprocattr hook. Whatever upstream's condition is now, the newline-prefixed payload reaches the parse and dies in it early while the well-formed one pays for the live type and range lookup -- and nothing charges that back. That is 'Positive A-B timing asymmetry', i.e. a DANGER SELinux card, on any core slow enough to resolve 52ns."
+        awk_abort_creds_arm "$hide" ||
+            die "_hook: the parse-failure arm still returns before prepare_creds(). The probe alone only moves the asymmetry: the payload that skips the parse would then pay a prepare_creds()/abort_creds() pair the other one does not, and the timing gap comes back with the sign flipped."
+        ;;
+    *)
+        awk_abort_creds_arm_single "$hide" ||
+            die "_hook: the parse-failure arm still returns before prepare_creds(). On this single-parse shape the arm is a bare 'if (error) { return error; }' and the probe arm falls through to prepare_creds(), so without the pair the payload that SKIPS the parse is the only one paying for a cred allocation -- the same timing gap with the sign flipped."
+        ;;
+    esac
+    awk_probe_placement "$hide" ||
         die "_hook: the timing probe sits BEFORE the setprocattr hook's PROCESS__SETCURRENT check, so every app can reach a backup-policy parse instead of only the domains allowed SETCURRENT. That is a wider oracle than the one this patch closes."
 
     assert_config CONFIG_SECURITY_SELINUX "every _hook guard lives in security/selinux/, which is built only under CONFIG_SECURITY_SELINUX -- without it the whole family is dead code"
@@ -1169,9 +1243,7 @@ do_postsusfs() {
         echo "postsusfs: equalised the susfs kernel-side setprocattr arms"
         placed=1
     fi
-    if [ "$(setprocattr_state)" = deferred ] &&
-        [ -f "${KSU_FOLDER:-}/kernel/feature/selinux_hide.c" ] &&
-        grep -qE '__nocfi [a-z_]*setprocattr\(' "$KSU_FOLDER/kernel/feature/selinux_hide.c"; then
+    if [ "$(setprocattr_state)" = deferred ] && ksu_selinux_hide_file >/dev/null; then
         # SUSFS left KernelSU's hook standing, so the probe belongs there too --
         # applied now, on the shape SUSFS actually produced, rather than before it
         # had its say about the file. Gated on the deferral: when do_hook already
