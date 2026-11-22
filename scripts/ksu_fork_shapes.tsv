@@ -2,6 +2,20 @@
 # reconciliations require it. Recorded on 2026-11-06, after the forks took
 # tiann/KernelSU#3969.
 #
+# BakaSU re-recorded 2026-11-22: it took #3964/#3969/#4019 at 11:38Z (7ae9786,
+# 2ca3db9, e2a9264), so its rules.c threads the generation now. Its #3964
+# adaptation calls reset_avc_cache(seqno) through a local, to unify its three
+# latest_granting arms (pol->, selinux_state.ss->, *latest_granting_ptr), and
+# NOT reset_avc_cache(pol->latest_granting) as KSUN and SukiSU do -- so anchor
+# and seqno_calls stay 0 here and no rules.c reconciliation moved. Verified on
+# re-record: ksu_seqno_form() now reads 'upstream' and skips fix_selinux_seqno,
+# that patch rejects at F0-F3 against the new file (which is what the seqno job
+# asserts on the upstream arm), and verify_seqno()'s two
+# selinux_status_update_policyload(0) checks pass -- all three publishers take
+# the real seqno. The same push MOVED kernel/feature/selinux_hide.c into
+# kernel/feature/selinux_hide/ and took #3981 with a third hook shape; that is
+# a separate re-fit and this gate does not see it.
+#
 # anchor       occurrences of "reset_avc_cache(pol->latest_granting);" directly
 #              followed by "out_unlock:" -- the insertion point both
 #              next/susfs_fix_patches/*/fix_rules.c.patch and the SukiSu
@@ -19,4 +33,4 @@
 # fork	repo	ref	anchor	bumps	seqno_calls	legacy_calls
 KernelSU-Next	KernelSU-Next/KernelSU-Next	dev	1	2	2	0
 SukiSU-Ultra	SukiSU-Ultra/SukiSU-Ultra	main	1	2	2	0
-BakaSU	Baka-SU/BakaSU	main	0	0	0	4
+BakaSU	Baka-SU/BakaSU	main	0	2	0	0
