@@ -583,7 +583,7 @@ verify_hook() {
     # The dirty-edge mask lives in security_compute_av_user() in ss/services.c,
     # the only function that has the policy which answered the query. It carries
     # no type name of its own, so the hidden-type cross-check further down cannot
-    # see it, and the per-write-node loop only asserts sel_ctx_hidden(). Assert
+    # see it, and the per-write-node loop only asserts sel_poison_ctx(). Assert
     # it directly: without it /sys/fs/selinux/access tells any app that
     # system_server may execmem on itself -- the DirtySepolicy anomaly this
     # closes -- and nothing else here would notice it had gone.
@@ -640,7 +640,7 @@ verify_hook() {
     has "$d/security/selinux/avc.c" 'current_uid()' "_hook: avc.c filter has lost its uid gate"
     has "$d/security/selinux/Makefile" 'selinuxfs.o' "_hook: selinuxfs.o is not in security/selinux/Makefile"
 
-    # Every selinuxfs WRITE NODE, by name. "selinuxfs.c contains sel_ctx_hidden"
+    # Every selinuxfs WRITE NODE, by name. "selinuxfs.c contains sel_poison_ctx"
     # is satisfied by the definition alone, so a refit that dropped a handler's
     # call site passed. Three of these handlers (access, relabel, member) have
     # character-identical bodies, which means their hunks have identical
@@ -650,8 +650,8 @@ verify_hook() {
     local w
     for w in sel_write_context sel_write_validatetrans sel_write_access \
              sel_write_create sel_write_relabel sel_write_user sel_write_member; do
-        infn "$d/security/selinux/selinuxfs.c" "^static ssize_t $w\(" 'sel_ctx_hidden' \
-            "_hook: $w() has no sel_ctx_hidden() gate -- that write node is an open hidden-type probe"
+        infn "$d/security/selinux/selinuxfs.c" "^static ssize_t $w\(" 'sel_poison_ctx' \
+            "_hook: $w() has no sel_poison_ctx() call -- that write node is an open hidden-type probe"
     done
 
     # The hidden-type list is mirrored in three files; assert they AGREE.
