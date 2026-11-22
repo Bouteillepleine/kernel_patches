@@ -1,16 +1,27 @@
 --- a/security/selinux/selinuxfs.c
 +++ b/security/selinux/selinuxfs.c
-@@ -674,6 +674,69 @@
+@@ -674,6 +674,80 @@
  	.llseek		= generic_file_llseek,
  };
  
 +static bool sel_hidden_bytes(const char *buf, size_t size)
 +{
++	bool hit;
++
 +	if (__kuid_val(current_uid()) < 2000)
 +		return false;
-+	return strnstr(buf, ":ksu:", size) || strnstr(buf, ":ksu_file:", size) ||
-+	       strnstr(buf, ":lsposed_file:", size) ||
-+	       strnstr(buf, ":zygisk_file:", size);
++	/* Accumulate; do NOT use `||`. That short-circuits, so a hidden context ran
++	 * ONE partial scan while everything else ran FOUR full ones, and once the
++	 * parser-skip gap was closed that difference was still readable: -52ns, one
++	 * tick of the 19.2MHz counter, on the 22-byte file contexts, consistently
++	 * negative on both of them while the true null controls alternated around 0.
++	 * Every caller pays all four lookups now, whatever the verdict.
++	 */
++	hit = strnstr(buf, ":ksu:", size) != NULL;
++	hit |= strnstr(buf, ":ksu_file:", size) != NULL;
++	hit |= strnstr(buf, ":lsposed_file:", size) != NULL;
++	hit |= strnstr(buf, ":zygisk_file:", size) != NULL;
++	return hit;
 +}
 +
 +/*
@@ -70,7 +81,7 @@
  static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
  {
  	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-@@ -688,6 +751,8 @@
+@@ -688,6 +762,8 @@
  	if (length)
  		goto out;
  
@@ -79,7 +90,7 @@
  	length = security_context_to_sid(state, buf, size, &sid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -823,6 +888,10 @@
+@@ -823,6 +899,10 @@
  	if (sscanf(req, "%s %s %hu %s", oldcon, newcon, &tclass, taskcon) != 4)
  		goto out;
  
@@ -90,7 +101,7 @@
  	rc = security_context_str_to_sid(state, oldcon, &osid, GFP_KERNEL);
  	if (rc)
  		goto out;
-@@ -883,6 +952,8 @@
+@@ -883,6 +963,8 @@
  		return PTR_ERR(data);
  
  	rv = write_op[ino](file, data, size);
@@ -99,7 +110,7 @@
  	if (rv > 0) {
  		simple_transaction_set(file, rv);
  		rv = size;
-@@ -933,6 +1004,9 @@
+@@ -933,6 +1015,9 @@
  	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
  		goto out;
  
@@ -109,7 +120,7 @@
  	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -993,6 +1067,10 @@
+@@ -993,6 +1078,10 @@
  	nargs = sscanf(buf, "%s %s %hu %s", scon, tcon, &tclass, namebuf);
  	if (nargs < 3 || nargs > 4)
  		goto out;
@@ -120,7 +131,7 @@
  	if (nargs == 4) {
  		/*
  		 * If and when the name of new object to be queried contains
-@@ -1090,6 +1168,9 @@
+@@ -1090,6 +1179,9 @@
  	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
  		goto out;
  
@@ -130,7 +141,7 @@
  	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -1151,6 +1232,8 @@
+@@ -1151,6 +1243,8 @@
  	if (sscanf(buf, "%s %s", con, user) != 2)
  		goto out;
  
@@ -139,7 +150,7 @@
  	length = security_context_str_to_sid(state, con, &sid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -1216,6 +1299,9 @@
+@@ -1216,6 +1310,9 @@
  	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
  		goto out;
  
