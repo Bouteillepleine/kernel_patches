@@ -1,50 +1,107 @@
 --- a/security/selinux/selinuxfs.c
 +++ b/security/selinux/selinuxfs.c
-@@ -608,6 +608,20 @@ static const struct file_operations sel_
+@@ -608,6 +608,80 @@
  	.llseek		= generic_file_llseek,
  };
  
 +static bool sel_hidden_bytes(const char *buf, size_t size)
 +{
++	bool hit;
++
 +	if (__kuid_val(current_uid()) < 2000)
 +		return false;
-+	return strnstr(buf, ":ksu:", size) || strnstr(buf, ":ksu_file:", size) ||
-+	       strnstr(buf, ":lsposed_file:", size) ||
-+	       strnstr(buf, ":zygisk_file:", size);
++	/* Accumulate; do NOT use `||`. That short-circuits, so a hidden context ran
++	 * ONE partial scan while everything else ran FOUR full ones, and once the
++	 * parser-skip gap was closed that difference was still readable: -52ns, one
++	 * tick of the 19.2MHz counter, on the 22-byte file contexts, consistently
++	 * negative on both of them while the true null controls alternated around 0.
++	 * Every caller pays all four lookups now, whatever the verdict.
++	 */
++	hit = strnstr(buf, ":ksu:", size) != NULL;
++	hit |= strnstr(buf, ":ksu_file:", size) != NULL;
++	hit |= strnstr(buf, ":lsposed_file:", size) != NULL;
++	hit |= strnstr(buf, ":zygisk_file:", size) != NULL;
++	return hit;
 +}
 +
-+static bool sel_ctx_hidden(const char *ctx)
++/*
++ * Rewrite a hidden type in place so the stock parser rejects it on its own.
++ *
++ * Returning -EINVAL from here used to skip security_context_to_sid() entirely,
++ * and skipping it is measurable. On an OP15 (6.12.69) from uid 10500, writing
++ * u:r:ksu:s0 to /sys/fs/selinux/context was rejected 208ns faster than any
++ * 10-byte type merely absent from policy -- seven different controls, same
++ * number every time -- and u:object_r:ksu_file:s0 312ns faster than a 22-byte
++ * control, on 99.9% of pairs, while unknown-against-unknown sat at exactly 0ns.
++ * The cost is entering the parser at all (the kmemdup_nul and the call), not
++ * the symtab walk: a context with no ':' at all, which dies at the first field,
++ * measured the same as one that walks to the type lookup. Duck Detector reads
++ * the gap as its "ksu_types timing with invalid types" row.
++ *
++ * Poisoning keeps the caller on the stock path, so a hidden type pays what an
++ * unknown type pays and the -EINVAL comes from the policy rather than from us.
++ *
++ * Length is preserved deliberately: the delta tracks the size handed to
++ * kmemdup_nul, so a shorter replacement would reopen the gap it closes. '#'
++ * cannot occur in a policy identifier, so a poisoned name can never collide
++ * with a real type.
++ *
++ * Do NOT fold this back into an early return, and do not move the test after
++ * the parse either: below the uid gate, where the hidden type is valid and
++ * takes the success path, the same measurement reads +364ns, so testing
++ * afterwards flips the sign instead of closing the gap.
++ */
++static bool sel_poison_ctx(char *ctx)
 +{
-+	return ctx && sel_hidden_bytes(ctx, strlen(ctx));
++	char *p;
++	int colons = 0;
++
++	if (!ctx || !sel_hidden_bytes(ctx, strlen(ctx)))
++		return false;
++
++	/* user:role:type:level -- poison the type, so the parse dies where an
++	 * unknown type dies.
++	 */
++	for (p = ctx; *p; p++) {
++		if (*p != ':')
++			continue;
++		if (++colons == 2 && p[1]) {
++			p[1] = '#';
++			return true;
++		}
++	}
++
++	/* Too malformed to have a type field. Poison the first byte so it still
++	 * cannot resolve, rather than handing it to the parser intact.
++	 */
++	*ctx = '#';
++	return true;
 +}
 +
  static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
  {
  	char *canon = NULL;
-@@ -619,6 +633,11 @@ static ssize_t sel_write_context(struct
+@@ -619,6 +693,8 @@
  	if (length)
  		goto out;
  
-+	if (sel_ctx_hidden(buf)) {
-+		length = -EINVAL;
-+		goto out;
-+	}
++	sel_poison_ctx(buf);
 +
  	length = security_context_to_sid(buf, size, &sid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -750,6 +769,10 @@ static ssize_t sel_write_validatetrans(s
+@@ -750,6 +826,10 @@
  	if (sscanf(req, "%s %s %hu %s", oldcon, newcon, &tclass, taskcon) != 4)
  		goto out;
  
-+	if (sel_ctx_hidden(oldcon) || sel_ctx_hidden(newcon) ||
-+	    sel_ctx_hidden(taskcon))
-+		goto out;
++	sel_poison_ctx(oldcon);
++	sel_poison_ctx(newcon);
++	sel_poison_ctx(taskcon);
 +
  	rc = security_context_str_to_sid(oldcon, &osid, GFP_KERNEL);
  	if (rc)
  		goto out;
-@@ -810,6 +833,8 @@ static ssize_t selinux_transaction_write
+@@ -810,6 +890,8 @@
  		return PTR_ERR(data);
  
  	rv = write_op[ino](file, data, size);
@@ -53,53 +110,52 @@
  	if (rv > 0) {
  		simple_transaction_set(file, rv);
  		rv = size;
-@@ -857,6 +882,9 @@ static ssize_t sel_write_access(struct f
+@@ -857,6 +939,9 @@
  	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
  		goto out;
  
-+	if (sel_ctx_hidden(scon) || sel_ctx_hidden(tcon))
-+		goto out;
++	sel_poison_ctx(scon);
++	sel_poison_ctx(tcon);
 +
  	length = security_context_str_to_sid(scon, &ssid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -914,6 +942,10 @@ static ssize_t sel_write_create(struct f
+@@ -914,6 +999,10 @@
  	nargs = sscanf(buf, "%s %s %hu %s", scon, tcon, &tclass, namebuf);
  	if (nargs < 3 || nargs > 4)
  		goto out;
 +
-+	if (sel_ctx_hidden(scon) || sel_ctx_hidden(tcon))
-+		goto out;
++	sel_poison_ctx(scon);
++	sel_poison_ctx(tcon);
 +
  	if (nargs == 4) {
  		/*
  		 * If and when the name of new object to be queried contains
-@@ -1008,6 +1040,9 @@ static ssize_t sel_write_relabel(struct
+@@ -1008,6 +1097,9 @@
  	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
  		goto out;
  
-+	if (sel_ctx_hidden(scon) || sel_ctx_hidden(tcon))
-+		goto out;
++	sel_poison_ctx(scon);
++	sel_poison_ctx(tcon);
 +
  	length = security_context_str_to_sid(scon, &ssid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -1066,6 +1101,9 @@ static ssize_t sel_write_user(struct fil
+@@ -1066,6 +1158,8 @@
  	if (sscanf(buf, "%s %s", con, user) != 2)
  		goto out;
  
-+	if (sel_ctx_hidden(con))
-+		goto out;
++	sel_poison_ctx(con);
 +
  	length = security_context_str_to_sid(con, &sid, GFP_KERNEL);
  	if (length)
  		goto out;
-@@ -1128,6 +1166,9 @@ static ssize_t sel_write_member(struct f
+@@ -1128,6 +1222,9 @@
  	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
  		goto out;
  
-+	if (sel_ctx_hidden(scon) || sel_ctx_hidden(tcon))
-+		goto out;
++	sel_poison_ctx(scon);
++	sel_poison_ctx(tcon);
 +
  	length = security_context_str_to_sid(scon, &ssid, GFP_KERNEL);
  	if (length)
