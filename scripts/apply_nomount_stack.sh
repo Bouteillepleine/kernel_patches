@@ -535,10 +535,51 @@ verify_hook_probe_susfs() {
         die "_hook: the kernel-side timing probe parses the context fewer than twice. If you meant to retune this, change the count -- do not remove the loop."
 }
 
+# The _hook selinuxfs cloak used to answer a hidden context with -EINVAL BEFORE
+# calling security_context_to_sid(), which skips the parser entirely -- and
+# skipping it is measurable from any app. Measured on an OP15 (6.12.69) from
+# uid 10500, writing /sys/fs/selinux/context, 9x800 ABBA pairs pinned per core,
+# only the write() timed, both payloads asserted to return EINVAL first:
+# u:r:ksu:s0 was rejected 208ns faster than SEVEN different 10-byte types that
+# are merely absent from policy (zsu/qsu/msu/bsu/abc/xyz/zzz -- same number for
+# every one), and u:object_r:ksu_file:s0 312ns faster than its 22-byte controls,
+# on 99.9% of pairs, while unknown-against-unknown measured exactly 0ns on four
+# different pairs. Duck Detector build 1118 reads it as the "ksu_types timing
+# with invalid types" DANGER row.
+#
+# The fix is poison-input: rewrite the hidden type in place and let the stock
+# parser reject it, so a hidden type costs what an unknown type costs. Two
+# things this guard exists to stop coming back:
+#   * the early return. It is the obvious "simplification" and it is the bug.
+#   * moving the test AFTER the parse. Below the uid gate the hidden type is
+#     valid and takes the success path, where the same measurement reads
+#     +364ns, so that flips the sign instead of closing the gap.
+# Both spellings route through sel_ctx_hidden(), so its absence is the check.
+verify_selinuxfs_poison() {
+    local f="$COMMON_KERNEL_FOLDER/security/selinux/selinuxfs.c" n
+    hasnt "$f" 'sel_ctx_hidden' \
+        "_hook: selinuxfs.c is back to the sel_ctx_hidden() form. That answers a hidden context without calling security_context_to_sid(), and an app can time the parse it skips -- 208ns on a 10-byte context, 312ns on a 22-byte one, which is the 'ksu_types timing with invalid types' DANGER row. Use sel_poison_ctx() and let the stock parser do the rejecting."
+    has "$f" 'sel_poison_ctx' \
+        "_hook: selinuxfs.c has no sel_poison_ctx(). Nothing rewrites a hidden type, so either the cloak is gone or it went back to returning -EINVAL early."
+    # One call per context argument across the seven write handlers: context 1,
+    # validatetrans 3, access 2, create 2, relabel 2, user 1, member 2 = 13,
+    # plus the definition line = 14. Partial reverts are the realistic failure
+    # and they leave the oracle on whichever node was missed.
+    n="$(grep -c 'sel_poison_ctx(' "$f" 2>/dev/null || true)"
+    [ "${n:-0}" -ge 14 ] ||
+        die "_hook: selinuxfs.c mentions sel_poison_ctx() on only ${n:-0} lines; the definition plus all 13 context arguments is 14. A handler left on the old form still separates a hidden type from an unknown one by its timing."
+}
+
 verify_hook() {
     local d="$COMMON_KERNEL_FOLDER"
-    has "$d/security/selinux/selinuxfs.c" 'sel_ctx_hidden' "_hook: selinuxfs.c gate missing"
     has "$d/security/selinux/selinuxfs.c" 'sel_hidden_bytes' "_hook: selinuxfs.c reply filter missing"
+    # Runs before the setprocattr branches below, not inside them: those return
+    # early on a tree where SUSFS reduced selinux_hide.c to a shell, and these
+    # write handlers are a separate entry point that is still standing when they
+    # do. An earlier version of this check read KernelSU's selinux_hide.c, which
+    # that reduction deletes, so it passed on every SUSFS build while the live
+    # code -- these handlers -- carried the oracle.
+    verify_selinuxfs_poison
     # The dirty-edge mask lives in security_compute_av_user() in ss/services.c,
     # the only function that has the policy which answered the query. It carries
     # no type name of its own, so the hidden-type cross-check further down cannot

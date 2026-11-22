@@ -394,7 +394,7 @@ jobs:
           patch -p1 -F0 < "$P/_hook/$REQ_SFS"; echo "selinuxfs: $REQ_SFS"
           # ---- _hook landing assertions -------------------------------------
           # Every selinuxfs WRITE NODE, by name. "selinuxfs.c contains
-          # sel_ctx_hidden" is satisfied by the DEFINITION alone, so a refit that
+          # sel_poison_ctx" is satisfied by the DEFINITION alone, so a refit that
           # dropped a call site passed. It matters more here than it looks:
           # sel_write_access, sel_write_relabel and sel_write_member have
           # character-identical bodies, so their hunks have identical pre-images
@@ -403,7 +403,14 @@ jobs:
           for w in sel_write_context sel_write_validatetrans sel_write_access \
                    sel_write_create sel_write_relabel sel_write_user sel_write_member; do
             SEG="$(awk "/^static ssize_t $w\(/,/^}/" security/selinux/selinuxfs.c 2>/dev/null)" || true
-            case "$SEG" in *sel_ctx_hidden*) ;; *) echo "::error::_hook: $w() has no sel_ctx_hidden() gate - that write node is an open hidden-type probe"; exit 1 ;; esac
+            case "$SEG" in *sel_poison_ctx*) ;; *) echo "::error::_hook: $w() has no sel_poison_ctx() call - that write node is an open hidden-type probe"; exit 1 ;; esac
+            # The gate used to answer hidden contexts with -EINVAL before the
+            # parser ran, which an app can time: 208ns on a 10-byte context,
+            # 312ns on a 22-byte one, measured on an OP15 against seven
+            # different controls. Poisoning the type instead keeps the stock
+            # parser on the path, so a hidden type costs what an unknown one
+            # costs. Refuse the old spelling anywhere in the file.
+            case "$SEG" in *sel_ctx_hidden*) echo "::error::_hook: $w() is back to the sel_ctx_hidden() early return - it skips security_context_to_sid() and the skipped parse is measurable"; exit 1 ;; esac
           done
           # The hidden-type list is mirrored in three files. common/_hook/README.md
           # says "adding a type means editing all three" and nothing enforced it:
