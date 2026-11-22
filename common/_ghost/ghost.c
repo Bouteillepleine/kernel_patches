@@ -297,27 +297,74 @@ static u32 ghost_utf8_next(const char **pp)
 	return c;
 }
 
+/* Every ignorable is above U+007F, and a real path is nearly all ASCII, so the
+ * early return is the branch that runs. */
+static bool ghost_cp_ignorable(u32 c)
+{
+	int i;
+
+	if (c < 0x80)
+		return false;
+	for (i = 0; i < (int)ARRAY_SIZE(ghost_ignorable); i++) {
+		if (c < ghost_ignorable[i].lo)
+			break;	/* table is sorted; no later range can match */
+		if (c <= ghost_ignorable[i].hi)
+			return true;
+	}
+	return false;
+}
+
 bool ghost_name_ignorable(const char *p)
 {
 	if (!p)
 		return false;
 
 	while (*p) {
-		u32 c = ghost_utf8_next(&p);
-		int i;
-
-		/* Every ignorable is above U+007F, and a real path is nearly all
-		 * ASCII, so this is the branch that runs. */
-		if (c < 0x80)
-			continue;
-		for (i = 0; i < (int)ARRAY_SIZE(ghost_ignorable); i++) {
-			if (c < ghost_ignorable[i].lo)
-				break;	/* table is sorted; no later range can match */
-			if (c <= ghost_ignorable[i].hi)
-				return true;
-		}
+		if (ghost_cp_ignorable(ghost_utf8_next(&p)))
+			return true;
 	}
 	return false;
+}
+
+/* Drop every ignorable code point, IN PLACE, and return the new length.
+ *
+ * In place is safe and is why there is no second buffer: stripping only ever
+ * shortens, so the write pointer never passes the read pointer. memmove, not
+ * memcpy, because the two do overlap. @p must be writable -- ghost_hidden_path()
+ * owns the per-CPU buffer d_path() rendered into, and ghost_hidden_name() copies
+ * its const input in first.
+ *
+ * This is what makes the class check rule-ANCHORED. It used to be a standalone
+ * verdict, so for a hide-listed uid EVERY path on the device carrying one of
+ * these code points read as -ENOENT, rule or no rule: a chat download named
+ * IMG<U+FE0F>.jpg could not be stat'ed or opened by the app that owns it while
+ * getdents64 still listed it, and open(O_CREAT) answered ENOENT in a directory
+ * the caller had just written to -- which cannot happen on a stock kernel, so
+ * one pair of syscalls inside the app's own sandbox proved an interposer. The
+ * bypass this was written for only exists where the filesystem folds names
+ * (the emulated-storage tree); on /data/data there is nothing to alias, so the
+ * refusal there was pure collateral. Testing the STRIPPED form against the rule
+ * table still closes the /sdcard/Android/data<U+200B> spelling, because that one
+ * strips to a path a rule names.
+ */
+static size_t ghost_strip_ignorable(char *p)
+{
+	const char *src = p;
+	char *dst = p;
+
+	while (*src) {
+		const char *start = src;
+		size_t n;
+
+		if (ghost_cp_ignorable(ghost_utf8_next(&src)))
+			continue;
+		n = src - start;
+		if (dst != start)
+			memmove(dst, start, n);
+		dst += n;
+	}
+	*dst = '\0';
+	return dst - p;
 }
 
 bool ghost_hidden_path(const struct path *path)
@@ -327,8 +374,11 @@ bool ghost_hidden_path(const struct path *path)
 	bool hit;
 	u32 uid;
 
-	/* No early return on an empty rule table: the invisible-character class
-	 * check below is not expressed as a rule and must still run.
+	/* No early return on an empty rule table. The class check below is now
+	 * rule-anchored, so an empty table does mean "nothing to hide" here -- but
+	 * ghost_path_rcu() already costs nothing with nrules == 0, and keeping the
+	 * shape means the uid-table reasoning below stays the only gate that can
+	 * make these guards dead code.
 	 */
 	/* An empty uid table means "no uid source" only when the engine is not
 	 * the source. Keeping the old combined test here would make every guard
@@ -350,13 +400,77 @@ bool ghost_hidden_path(const struct path *path)
 	if (!IS_ERR(p)) {
 		size_t plen = strlen(p);
 
-		/* the class check first: it needs no rule to be programmed */
-		hit = ghost_name_ignorable(p);
-		if (!hit) {
-			rcu_read_lock();
-			hit = ghost_path_rcu(p, plen);
-			rcu_read_unlock();
+		/* The rule table on the path as rendered, first and always. */
+		rcu_read_lock();
+		hit = ghost_path_rcu(p, plen);
+		rcu_read_unlock();
+
+		/* Then, only if the path actually carries an ignorable code point,
+		 * the same question about its stripped form: that is the aliased
+		 * spelling a folding filesystem would resolve to the same file. The
+		 * strip is in place in the buffer we own, which is why the original
+		 * is tested first -- after this it is gone. */
+		if (!hit && ghost_name_ignorable(p)) {
+			size_t slen = ghost_strip_ignorable(p);
+
+			if (slen) {
+				rcu_read_lock();
+				hit = ghost_path_rcu(p, slen);
+				rcu_read_unlock();
+			}
 		}
+	}
+	put_cpu_ptr(&ghost_pathbuf);
+
+	return hit;
+}
+
+/* The same rule-anchored question about a path STRING the kernel has not resolved.
+ *
+ * do_filp_open() is the only guard openat() passes through -- the vfs_getattr and
+ * user_path_at hooks never see it -- and at its entry the only thing that exists is
+ * struct filename's unresolved name, so this takes a string rather than a struct path.
+ *
+ * ABSOLUTE ONLY, deliberately. A relative name cannot be matched against a table of
+ * absolute rules, and guessing at the caller's cwd would be a second unmeasured claim,
+ * so this answers false and leaves the open alone. The residual is
+ * openat(AT_FDCWD, "a<U+200B>b") with a cwd inside a guarded tree, which is strictly
+ * narrower than what it replaces: a class check that refused EVERY path carrying one of
+ * these code points, for every hide-listed uid, anywhere on the device.
+ *
+ * No uid gate here. The caller holds one (nm_gp_open_entry tests nm_uid_blocked before
+ * asking), and ghost_hidden_path() keeps its own because it is reached from hooks that
+ * do not.
+ */
+bool ghost_hidden_name(const char *name)
+{
+	char (*bufp)[PATH_MAX];
+	size_t len;
+	bool hit;
+
+	if (!name || name[0] != '/')
+		return false;
+	if (!READ_ONCE(ghost_nrules))
+		return false;
+
+	len = strlen(name);
+	if (len >= PATH_MAX)
+		return false;
+
+	rcu_read_lock();
+	hit = ghost_path_rcu(name, len);
+	rcu_read_unlock();
+	if (hit || !ghost_name_ignorable(name))
+		return hit;
+
+	/* @name is kernel memory we do not own, so the strip needs a copy. */
+	bufp = get_cpu_ptr(&ghost_pathbuf);
+	memcpy(*bufp, name, len + 1);
+	len = ghost_strip_ignorable(*bufp);
+	if (len) {
+		rcu_read_lock();
+		hit = ghost_path_rcu(*bufp, len);
+		rcu_read_unlock();
 	}
 	put_cpu_ptr(&ghost_pathbuf);
 
@@ -482,6 +596,35 @@ static void ghost_drop_locked(struct gh_rule *r)
 	kfree_rcu(r, rcu);
 }
 
+/* Allocate and fill a rule without linking it. Split out of
+ * ghost_add_path_locked() so a REPLACE can build its whole new set before it destroys
+ * the old one -- see the staged pass in ghost_ctl(). */
+static struct gh_rule *gh_rule_new(const char *s, size_t slen)
+{
+	struct gh_rule *r = kzalloc(sizeof(*r) + slen + 1, GFP_KERNEL);
+
+	if (!r)
+		return NULL;
+	memcpy(r->path, s, slen);
+	r->path[slen] = '\0';
+	r->len = (u16)slen;
+	r->prefix = s[slen - 1] == '/';
+	r->hash = full_name_hash(NULL, s, slen);
+	return r;
+}
+
+/* Link a rule readers can already be walking past. Not sleeping, so a replace that
+ * stages first leaves no allocation inside its window. */
+static void gh_rule_link_locked(struct gh_rule *r)
+{
+	list_add_tail(&r->lnode, &ghost_all);
+	if (r->prefix)
+		hlist_add_head_rcu(&r->hnode, &ghost_prefixes);
+	else
+		hlist_add_head_rcu(&r->hnode, ghost_bucket(r->hash));
+	WRITE_ONCE(ghost_nrules, ghost_nrules + 1);
+}
+
 static int ghost_add_path_locked(const char *s, size_t slen)
 {
 	struct gh_rule *r;
@@ -490,20 +633,10 @@ static int ghost_add_path_locked(const char *s, size_t slen)
 		return 0;
 	if (ghost_nrules >= GH_MAX_RULES)
 		return -ENOSPC;
-	r = kzalloc(sizeof(*r) + slen + 1, GFP_KERNEL);
+	r = gh_rule_new(s, slen);
 	if (!r)
 		return -ENOMEM;
-	memcpy(r->path, s, slen);
-	r->path[slen] = '\0';
-	r->len = (u16)slen;
-	r->prefix = s[slen - 1] == '/';
-	r->hash = full_name_hash(NULL, s, slen);
-	list_add_tail(&r->lnode, &ghost_all);
-	if (r->prefix)
-		hlist_add_head_rcu(&r->hnode, &ghost_prefixes);
-	else
-		hlist_add_head_rcu(&r->hnode, ghost_bucket(r->hash));
-	WRITE_ONCE(ghost_nrules, ghost_nrules + 1);
+	gh_rule_link_locked(r);
 	return 0;
 }
 
@@ -693,10 +826,72 @@ int ghost_ctl(const char *buf, size_t count)
 	}
 
 	mutex_lock(&ghost_mutex);
+	/* A path REPLACE stages the whole new set before it destroys the old one.
+	 *
+	 * It used to clear first and then re-add entry by entry with kzalloc(GFP_KERNEL).
+	 * Readers never take ghost_mutex -- ghost_hidden_path() and
+	 * ghost_abstract_hidden() walk the lists under RCU -- so for the length of that
+	 * rebuild, every sleeping allocation included, they saw a table that was empty and
+	 * then partial and answered "not hidden". The direction is OPEN, not stale: a
+	 * hide-listed app polling access(), truncate() or the xattr entry points during
+	 * `nomount ghost sync` got the real answer. And an -ENOMEM partway through left the
+	 * table permanently short, with the error returned and the old set already gone.
+	 *
+	 * Staging removes every allocation from the window and makes failure harmless: on
+	 * -ENOMEM nothing has been unlinked, so the live table is still the old one. What
+	 * remains is the unlink-then-link sequence itself, which does not sleep. That is a
+	 * much smaller window, not zero -- closing it entirely means making ghost_ht and
+	 * ghost_prefixes a pointer swapped with rcu_assign_pointer(), which rewrites every
+	 * reader's dereference, and this file has never executed on any device. */
+	if (replace && op == 'p') {
+		/* Every token here is already known good: the validation pass above returns
+		 * on a malformed token or an insane rule, and bounds the count, all before
+		 * the mutex. So this only has to allocate -- and the one failure left,
+		 * -ENOMEM, now leaves the live table untouched instead of short. */
+		LIST_HEAD(staged);
+		struct gh_rule *r, *tmp;
+		const char *sp = p;
+		int nstaged = 0;
+
+		while ((len = ghost_next_token(&sp, end, line)) != 0) {
+			if (len < 0) {
+				/* Unreachable: the validation pass returns on this. Recorded
+				 * rather than skipped, so a future change that loosens that
+				 * pass cannot make this truncate the set in silence. */
+				first_err = len;
+				break;
+			}
+			r = gh_rule_new(line, len);
+			if (!r) {
+				first_err = -ENOMEM;
+				break;
+			}
+			list_add_tail(&r->lnode, &staged);
+			nstaged++;
+		}
+		if (first_err || !nstaged) {
+			list_for_each_entry_safe(r, tmp, &staged, lnode) {
+				list_del(&r->lnode);
+				kfree(r);
+			}
+			mutex_unlock(&ghost_mutex);
+			/* !nstaged keeps the old answer for an empty payload: the token
+			 * loop below would have run zero times and returned -EINVAL. */
+			return first_err ? first_err : -EINVAL;
+		}
+		ghost_clear_paths_locked();
+		list_for_each_entry_safe(r, tmp, &staged, lnode) {
+			list_del(&r->lnode);
+			if (ghost_find_locked(r->path, r->len))
+				kfree(r);          /* duplicate within the set */
+			else
+				gh_rule_link_locked(r);
+		}
+		mutex_unlock(&ghost_mutex);
+		return 0;
+	}
 	if (replace) {
-		if (op == 'p')
-			ghost_clear_paths_locked();
-		else if (op == 'c')
+		if (op == 'c')
 			WRITE_ONCE(ghost_ncuids, 0);
 		else
 			WRITE_ONCE(ghost_nuids, 0);
