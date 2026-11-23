@@ -58,6 +58,7 @@ set -euo pipefail
 usage() {
     echo "usage: $0 <all|hookless|record-version|hook|seqno|postsusfs|pathhide|ghost|assert-config>" >&2
     echo "       $0 seqno-form <KernelSU tree>   (prints zero|upstream|split:N|none|missing)" >&2
+    echo "       $0 setprocattr-form <KernelSU tree>   (prints '<form> <relpath> <patch>', or 'none')" >&2
     echo "       $0 verify [hookless] [hook] [pathhide] [ghost]   (default: all four)" >&2
     exit 2
 }
@@ -379,23 +380,44 @@ ksu_setprocattr_body() { awk '/__nocfi [a-z_]*setprocattr\(/,/^}/' "$1"; }
 # and all three put the probe on the arm that skips the parse; they differ only in
 # the pre-image they are cut against. Probed on the tree rather than on the fork
 # name, so a fork pinned to an older hash still builds.
-setprocattr_apply() { # setprocattr_apply <hook dir>
-    need KSU_FOLDER
-    local f body
-    f="$(ksu_selinux_hide_file)" ||
-        die "setprocattr: no setprocattr hook in any known selinux_hide location, so equalise_setprocattr_timing cannot be placed and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other. Tried: $(ksu_selinux_hide_tried). If the fork moved it again, add the path to KSU_HIDE_CANDIDATES and cut a variant against its shape."
-    body="$(ksu_setprocattr_body "$f")"
+# Which of the three pre-images this hook is in: live | single | base.
+#
+# Split out of setprocattr_apply so the CI gate that dry-runs this family
+# against every fork does not carry its own copy of these greps -- same reason
+# ksu_seqno_form exists, and the same contract: read-only, one classifier, one
+# answer. Reads the BODY, never the file (see ksu_setprocattr_body).
+ksu_setprocattr_form() { # ksu_setprocattr_form <selinux_hide file>
+    local body
+    body="$(ksu_setprocattr_body "$1")"
     case "$body" in
     *"security_context_to_sid_live"*)
         case "$body" in
-        *"error == -EAGAIN"*) apply_or_die "$1/equalise_setprocattr_timing_live.patch" "$KSU_FOLDER" ;;
-        *) apply_or_die "$1/equalise_setprocattr_timing_single.patch" "$KSU_FOLDER" ;;
+        *"error == -EAGAIN"*) echo live ;;
+        *) echo single ;;
         esac
         ;;
-    *)
-        apply_or_die "$1/equalise_setprocattr_timing.patch" "$KSU_FOLDER"
-        ;;
+    *) echo base ;;
     esac
+}
+
+# form -> patch basename. Also here rather than in the gate, so a new shape adds
+# one arm in one file instead of two that can disagree about which patch a form
+# selects.
+ksu_setprocattr_patch() { # ksu_setprocattr_patch <form>
+    case "$1" in
+    live) echo equalise_setprocattr_timing_live.patch ;;
+    single) echo equalise_setprocattr_timing_single.patch ;;
+    base) echo equalise_setprocattr_timing.patch ;;
+    *) return 1 ;;
+    esac
+}
+
+setprocattr_apply() { # setprocattr_apply <hook dir>
+    need KSU_FOLDER
+    local f
+    f="$(ksu_selinux_hide_file)" ||
+        die "setprocattr: no setprocattr hook in any known selinux_hide location, so equalise_setprocattr_timing cannot be placed and writing /proc/self/attr/current still times a backup-policy parse on one payload shape and not the other. Tried: $(ksu_selinux_hide_tried). If the fork moved it again, add the path to KSU_HIDE_CANDIDATES and cut a variant against its shape."
+    apply_or_die "$1/$(ksu_setprocattr_patch "$(ksu_setprocattr_form "$f")")" "$KSU_FOLDER"
 }
 
 objy() { # objy <makefile> <object> <what>
@@ -1792,6 +1814,23 @@ postsusfs)
 seqno-form)
     [ $# -ge 1 ] || die "seqno-form: pass the KernelSU tree root"
     ksu_seqno_form "$1/kernel/selinux/rules.c"
+    ;;
+# Read-only twin of the above for the setprocattr family, so the gate asks the
+# tree the same question the builder does. Prints the form and the path the hook
+# was actually found at, and the patch that form selects. The path matters
+# because BakaSU 2b558ca moved it and the filename alone resolves to the wrong
+# half of the split; the patch name is emitted here rather than mapped by the
+# caller so the gate cannot disagree with the builder about which variant a
+# shape selects.
+setprocattr-form)
+    [ $# -ge 1 ] || die "setprocattr-form: pass the KernelSU tree root"
+    KSU_FOLDER="$1"
+    if _spa_hide="$(ksu_selinux_hide_file)"; then
+        _spa_form="$(ksu_setprocattr_form "$_spa_hide")"
+        printf '%s %s %s\n' "$_spa_form" "${_spa_hide#"$KSU_FOLDER"/}" "$(ksu_setprocattr_patch "$_spa_form")"
+    else
+        echo none
+    fi
     ;;
 pathhide)
     need BOUTEILLE_KERNEL_PATCHES_FOLDER COMMON_KERNEL_FOLDER
