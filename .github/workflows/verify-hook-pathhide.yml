@@ -246,7 +246,7 @@ jobs:
       matrix:
         version: [android12-5.10, android13-5.15, android14-6.1, android15-6.6, android16-6.12]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Gate
         id: gate
         run: |
@@ -713,7 +713,7 @@ jobs:
       matrix:
         version: [android12-5.10, android13-5.15, android14-6.1, android15-6.6, android16-6.12]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Gate
         id: gate
         run: |
@@ -1034,7 +1034,7 @@ jobs:
     # the same gap, for the same reason, as the missing faithful SukiSu
     # reject-list job in the seqno half.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Resolve the hook and dry-run the selected variant
         run: |
           # -e is deliberately absent: grep -c and patch both exit non-zero on

@@ -48,7 +48,7 @@ jobs:
       MANIFEST_DIR: ${{ github.event.inputs.manifest_dir || 'manifests/a16' }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Collect every (tree, revision) the fleet pins
         run: |

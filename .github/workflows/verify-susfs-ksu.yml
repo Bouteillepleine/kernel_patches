@@ -56,7 +56,7 @@ jobs:
     name: rules.c shape vs what our reconciliations assume
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: KernelSU forks still have the shape we patch
         run: python3 scripts/verify_ksu_fork_shapes.py
@@ -76,7 +76,7 @@ jobs:
     # every trigger except the 3-hourly shapes-only cron
     if: github.event_name != 'schedule' || github.event.schedule == '47 6 * * *'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Fetch KernelSU-Next and susfs4ksu
         env:
