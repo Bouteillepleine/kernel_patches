@@ -496,6 +496,11 @@ verify_hookless() {
       END { exit !(a && b && c && a < b && b < c) }' "$d/fs/xattr.c" ||
         die "_hookless: the fs/xattr.c guard is missing or not between security_inode_getxattr() and the security.* branch -- a hidden app can still read security.selinux on a file it cannot open"
     fi
+    if grep -q 'nm_fionread_isize' "$d/fs/nomount.c" 2>/dev/null; then
+    awk '/^\tcase [A-Z_0-9]+:/ { c=$2 } /nm_fionread_isize\(filp, inode\)/ { n++; if (c != "FIONREAD:") bad=1 }
+         END { exit !(n == 1 && !bad) }' "$d/fs/ioctl.c" ||
+        die "_hookless: the fs/ioctl.c FIONREAD hook is missing, doubled or outside case FIONREAD -- a hidden app reads the module file's size through FIONREAD"
+    fi
     grep -qx 'CONFIG_NOMOUNT=y' "$(defconfig_path)" ||
         die "_hookless: CONFIG_NOMOUNT=y is not in $(defconfig_path)"
     assert_config CONFIG_NOMOUNT "the engine is behind CONFIG_NOMOUNT; without it fs/nomount.o is not built at all and every hookless hook is absent"
@@ -1180,6 +1185,17 @@ do_hookless() {
         echo "::warning::hookless integration patch does not apply at fuzz 0 on $KERNEL_VER; retrying at fuzz 1. A fuzzed hunk can land a hook in the wrong function -- check fs/proc/task_mmu.c and fs/Makefile in the build output before trusting this kernel."
         patch -p1 --forward --fuzz=1 -d "$COMMON_KERNEL_FOLDER" <"$NM_PATCH" ||
             die "NoMount hookless patch failed to apply for $KERNEL_VER, at fuzz 0 and at fuzz 1"
+    fi
+    # FIONREAD answers i_size off the engine inode before any of its ops run, so a
+    # caller served the stock file was told the module file's size. The hook ships
+    # with the engine as two variants, file_ioctl() for 4.9-5.4 and do_vfs_ioctl()
+    # for 5.10-6.18, and exactly one fits a tree. An engine ref without them is
+    # older than the fix and still a legitimate pairing.
+    set -- "$NM_SRC"/hookless/patches/nomount_fionread_*.patch
+    if [ -f "$1" ]; then
+        apply_first_of fionread - "$@"
+    else
+        echo "  fionread: engine ref ships no FIONREAD hook"
     fi
     sed -i '/^CONFIG_NOMOUNT=/d' "$DEFCONFIG"
     echo "CONFIG_NOMOUNT=y" >>"$DEFCONFIG"
