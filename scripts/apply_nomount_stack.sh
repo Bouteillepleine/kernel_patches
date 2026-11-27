@@ -501,6 +501,17 @@ verify_hookless() {
          END { exit !(n == 1 && !bad) }' "$d/fs/ioctl.c" ||
         die "_hookless: the fs/ioctl.c FIONREAD hook is missing, doubled or outside case FIONREAD -- a hidden app reads the module file's size through FIONREAD"
     fi
+    if grep -q 'nm_fioqsize_bytes' "$d/fs/nomount.c" 2>/dev/null; then
+    awk '/^\tcase [A-Z_0-9]+:/ { c=$2 } /nm_fioqsize_bytes\(filp, inode\)/ { n++; if (c != "FIOQSIZE:") bad=1 }
+         END { exit !(n == 1 && !bad) }' "$d/fs/ioctl.c" ||
+        die "_hookless: the fs/ioctl.c FIOQSIZE hook is missing, doubled or outside case FIOQSIZE -- a hidden caller reads the module file's blocks through FIOQSIZE"
+    fi
+    if grep -q 'nm_lock_eof' "$d/fs/nomount.c" 2>/dev/null; then
+    awk '/^\tcase SEEK_END:/ { s++; inside=1; next } /^\t(case |default:)/ { inside=0 }
+         /nm_lock_eof\(filp\)/ { n++; if (!inside) bad=1 }
+         END { exit !(s >= 1 && n == s && !bad) }' "$d/fs/locks.c" ||
+        die "_hookless: a fs/locks.c SEEK_END case has no nm_lock_eof() hook -- a SEEK_END lock range is measured from the module file's i_size"
+    fi
     grep -qx 'CONFIG_NOMOUNT=y' "$(defconfig_path)" ||
         die "_hookless: CONFIG_NOMOUNT=y is not in $(defconfig_path)"
     assert_config CONFIG_NOMOUNT "the engine is behind CONFIG_NOMOUNT; without it fs/nomount.o is not built at all and every hookless hook is absent"
