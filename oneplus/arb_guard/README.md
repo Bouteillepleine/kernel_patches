@@ -5,7 +5,7 @@ Stops OnePlus/OPPO's kernel-triggered anti-rollback (ARB) commit. Stock
 TrustZone SMC `svc=QCOM_SCM_SVC_BOOT cmd=0x1E` that blows the rollback fuses
 when userspace writes `update_arb`.
 
-`arb_guard-<android>-<kver>.patch` (android14-6.1, android15-6.6, android16-6.12)
+`arb_guard-<android>-<kver>.patch` (android14-6.1, android15-6.6; no 6.12 hook until a 6.12 firmware ships ARB, see git history for the parked patch)
 hooks `load_module()` just before `layout_and_allocate()`. For the module named `qcom_scm` only, it finds that
 function in the image the phone supplies and, if it starts with `PACIASP` and
 no relocation falls in the next 12 bytes, rewrites them to
